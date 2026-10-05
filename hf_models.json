@@ -1,0 +1,382 @@
+{
+  "_meta": {
+    "last_reviewed": "2026-08-20",
+    "review_after": "2026-11-18"
+  },
+  "models": {
+    "joelniklaus/legal-polish-roberta-base": {
+      "repo_id": "joelniklaus/legal-polish-roberta-base",
+      "label": "joelniklaus/legal-polish-roberta-base",
+      "pipeline_tag": "fill-mask",
+      "tags": [
+        "transformers",
+        "pytorch",
+        "tensorboard",
+        "roberta",
+        "fill-mask",
+        "generated_from_trainer",
+        "endpoints_compatible",
+        "region:us"
+      ],
+      "language": [],
+      "license": "",
+      "downloads": 6,
+      "likes": 2,
+      "provider_mapping": "",
+      "validation": {
+        "score": 0.15,
+        "reasons": [
+          "licence unspecified needs review",
+          "low downloads",
+          "low likes",
+          "has model card",
+          "needs self-hosting",
+          "not a task model (fill-mask)"
+        ],
+        "servable": false,
+        "task_model": false
+      }
+    },
+    "lexedit/herbert-polish-legal-ner": {
+      "repo_id": "lexedit/herbert-polish-legal-ner",
+      "label": "lexedit/herbert-polish-legal-ner",
+      "pipeline_tag": "token-classification",
+      "tags": [
+        "transformers",
+        "onnx",
+        "safetensors",
+        "bert",
+        "token-classification",
+        "named-entity-recognition",
+        "ner",
+        "pii",
+        "pii-detection",
+        "anonymization",
+        "privacy",
+        "gdpr",
+        "polish",
+        "legal",
+        "legal-nlp",
+        "herbert",
+        "pl",
+        "base_model:allegro/herbert-base-cased",
+        "base_model:finetune:allegro/herbert-base-cased",
+        "license:cc-by-4.0",
+        "model-index",
+        "endpoints_compatible",
+        "region:us"
+      ],
+      "language": [
+        "pl"
+      ],
+      "license": "cc-by-4.0",
+      "downloads": 143,
+      "likes": 0,
+      "provider_mapping": "",
+      "validation": {
+        "score": 0.55,
+        "reasons": [
+          "permissive licence (cc-by-4.0)",
+          "low downloads",
+          "low likes",
+          "has model card",
+          "needs self-hosting",
+          "not a task model (token-classification)",
+          "domain-specialised"
+        ],
+        "servable": false,
+        "task_model": false
+      }
+    },
+    "lexedit/herbert-polish-legal-ner-ocr": {
+      "repo_id": "lexedit/herbert-polish-legal-ner-ocr",
+      "label": "lexedit/herbert-polish-legal-ner-ocr",
+      "pipeline_tag": "token-classification",
+      "tags": [
+        "transformers",
+        "onnx",
+        "safetensors",
+        "bert",
+        "token-classification",
+        "named-entity-recognition",
+        "ner",
+        "pii",
+        "pii-detection",
+        "anonymization",
+        "privacy",
+        "gdpr",
+        "polish",
+        "legal",
+        "legal-nlp",
+        "ocr-robust",
+        "herbert",
+        "pl",
+        "base_model:allegro/herbert-base-cased",
+        "base_model:finetune:allegro/herbert-base-cased",
+        "license:cc-by-4.0",
+        "model-index",
+        "endpoints_compatible",
+        "region:us"
+      ],
+      "language": [
+        "pl"
+      ],
+      "license": "cc-by-4.0",
+      "downloads": 58,
+      "likes": 0,
+      "provider_mapping": "",
+      "validation": {
+        "score": 0.55,
+        "reasons": [
+          "permissive licence (cc-by-4.0)",
+          "low downloads",
+          "low likes",
+          "has model card",
+          "needs self-hosting",
+          "not a task model (token-classification)",
+          "domain-specialised"
+        ],
+        "servable": false,
+        "task_model": false
+      }
+    },
+    "mradermacher/Bielik-7B-polish-law-GGUF": {
+      "repo_id": "mradermacher/Bielik-7B-polish-law-GGUF",
+      "label": "mradermacher/Bielik-7B-polish-law-GGUF",
+      "pipeline_tag": "",
+      "tags": [
+        "transformers",
+        "gguf",
+        "polish",
+        "legal",
+        "qlora",
+        "lora",
+        "peft",
+        "fine-tuned",
+        "mistral",
+        "pl",
+        "dataset:custom",
+        "base_model:4x32/Bielik-7B-polish-law",
+        "base_model:adapter:4x32/Bielik-7B-polish-law",
+        "license:apache-2.0",
+        "endpoints_compatible",
+        "region:us",
+        "conversational"
+      ],
+      "language": [
+        "pl"
+      ],
+      "license": "apache-2.0",
+      "downloads": 173,
+      "likes": 1,
+      "provider_mapping": "",
+      "validation": {
+        "score": 0.6,
+        "reasons": [
+          "permissive licence (apache-2.0)",
+          "low downloads",
+          "low likes",
+          "has model card",
+          "needs self-hosting",
+          "text-generation (inferred)",
+          "domain-specialised"
+        ],
+        "servable": false,
+        "task_model": true
+      }
+    },
+    "4x32/Bielik-7B-polish-law": {
+      "repo_id": "4x32/Bielik-7B-polish-law",
+      "label": "4x32/Bielik-7B-polish-law",
+      "pipeline_tag": "",
+      "tags": [
+        "peft",
+        "safetensors",
+        "mistral",
+        "polish",
+        "legal",
+        "qlora",
+        "lora",
+        "fine-tuned",
+        "pl",
+        "dataset:custom",
+        "base_model:speakleash/Bielik-7B-Instruct-v0.1",
+        "base_model:adapter:speakleash/Bielik-7B-Instruct-v0.1",
+        "license:apache-2.0",
+        "region:us"
+      ],
+      "language": [
+        "pl"
+      ],
+      "license": "apache-2.0",
+      "downloads": 0,
+      "likes": 0,
+      "provider_mapping": "",
+      "validation": {
+        "score": 0.6,
+        "reasons": [
+          "permissive licence (apache-2.0)",
+          "low downloads",
+          "low likes",
+          "has model card",
+          "needs self-hosting",
+          "text-generation (inferred)",
+          "domain-specialised"
+        ],
+        "servable": false,
+        "task_model": true
+      }
+    },
+    "FinanceInc/auditor_sentiment_finetuned": {
+      "repo_id": "FinanceInc/auditor_sentiment_finetuned",
+      "label": "FinanceInc/auditor_sentiment_finetuned",
+      "pipeline_tag": "text-classification",
+      "tags": [
+        "transformers",
+        "pytorch",
+        "bert",
+        "text-classification",
+        "autotrain",
+        "DEV",
+        "en",
+        "dataset:rajistics/autotrain-data-auditor-sentiment",
+        "dataset:FinanceInc/auditor_sentiment",
+        "model-index",
+        "co2_eq_emissions",
+        "text-embeddings-inference",
+        "endpoints_compatible",
+        "region:us"
+      ],
+      "language": [
+        "en"
+      ],
+      "license": "",
+      "downloads": 1926,
+      "likes": 18,
+      "provider_mapping": "",
+      "validation": {
+        "score": 0.2,
+        "reasons": [
+          "licence unspecified needs review",
+          "1,926 downloads/mo",
+          "low likes",
+          "has model card",
+          "needs self-hosting",
+          "not a task model (text-classification)"
+        ],
+        "servable": false,
+        "task_model": false
+      }
+    },
+    "websystemspl/Bielik-11B-v3.0-Instruct-128k": {
+      "repo_id": "websystemspl/Bielik-11B-v3.0-Instruct-128k",
+      "label": "websystemspl/Bielik-11B-v3.0-Instruct-128k",
+      "pipeline_tag": "text-generation",
+      "tags": [
+        "transformers",
+        "safetensors",
+        "llama",
+        "text-generation",
+        "conversational",
+        "multilingual",
+        "pl",
+        "en",
+        "sq",
+        "bel",
+        "bs",
+        "bg",
+        "hr",
+        "cs",
+        "da",
+        "et",
+        "fi",
+        "fr",
+        "el",
+        "es",
+        "is",
+        "lt",
+        "nl",
+        "de",
+        "no",
+        "pt",
+        "ru",
+        "ro",
+        "sr",
+        "hbs",
+        "sv",
+        "sk",
+        "sl",
+        "tr",
+        "uk",
+        "hu",
+        "it",
+        "lv",
+        "arxiv:2505.02410",
+        "arxiv:2505.02550",
+        "arxiv:2402.13228",
+        "arxiv:2402.03300",
+        "arxiv:2503.20783",
+        "arxiv:2409.19256",
+        "arxiv:2601.11579",
+        "base_model:speakleash/Bielik-11B-v3-Base-20250730",
+        "base_model:finetune:speakleash/Bielik-11B-v3-Base-20250730",
+        "license:apache-2.0",
+        "text-generation-inference",
+        "endpoints_compatible",
+        "region:us"
+      ],
+      "language": [
+        "multilingual",
+        "pl",
+        "en",
+        "sq",
+        "bel",
+        "bs",
+        "bg",
+        "hr",
+        "cs",
+        "da",
+        "et",
+        "fi",
+        "fr",
+        "el",
+        "es",
+        "is",
+        "lt",
+        "nl",
+        "de",
+        "no",
+        "pt",
+        "ru",
+        "ro",
+        "sr",
+        "hbs",
+        "sv",
+        "sk",
+        "sl",
+        "tr",
+        "uk",
+        "hu",
+        "it",
+        "lv"
+      ],
+      "license": "apache-2.0",
+      "downloads": 4631,
+      "likes": 0,
+      "provider_mapping": "",
+      "validation": {
+        "score": 0.55,
+        "reasons": [
+          "permissive licence (apache-2.0)",
+          "4,631 downloads/mo",
+          "low likes",
+          "has model card",
+          "needs self-hosting",
+          "text-generation model"
+        ],
+        "servable": false,
+        "task_model": true
+      }
+    }
+  }
+}

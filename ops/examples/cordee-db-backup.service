@@ -1,0 +1,13 @@
+# Daily database backup, triggered by cordee-db-backup.timer.
+[Unit]
+Description=Cordée database backup (aingel.db + every project.db)
+After=network.target
+
+[Service]
+Type=oneshot
+User=cordee
+# Supplies AINGEL_PROJECTS_ROOT, AINGEL_BACKUP_DIR and the optional
+# AINGEL_BACKUP_RCLONE_REMOTE.
+EnvironmentFile=-/opt/cordee/.env
+ExecStart=/opt/cordee/ops/examples/backup.sh
+TimeoutStartSec=600

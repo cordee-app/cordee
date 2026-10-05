@@ -1,0 +1,3 @@
+# Dev-only dependencies (CI + local). Not required to run the service.
+-r requirements.txt
+pytest==8.3.4

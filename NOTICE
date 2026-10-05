@@ -1,0 +1,35 @@
+Cordée
+Copyright (C) 2026 Fabien Courtellemont
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, version 3 (see LICENSE).
+
+Cordée is also available under a commercial license, which removes the AGPL
+copyleft obligations. See docs/COMMERCIAL.md.
+
+"Cordée" is a name used by the project owner; the license grants no trademark
+rights.
+
+-------------------------------------------------------------------------------
+Third-party components
+-------------------------------------------------------------------------------
+Cordée depends on the following packages. They are installed separately
+(pip / npm), are not vendored in this repository, and remain under their own
+licenses, all of which are compatible with AGPL-3.0.
+
+Python (requirements.txt)
+  Flask, Werkzeug, Jinja2 ............ BSD-3-Clause
+  httpx, lxml, authlib ............... BSD-3-Clause
+  requests, tenacity, openai, boto3 .. Apache-2.0
+  mistralai, langdetect .............. Apache-2.0
+  cryptography ....................... Apache-2.0 OR BSD-3-Clause
+  beautifulsoup4, openpyxl ........... MIT
+  pdfplumber, python-docx ............ MIT
+  python-pptx, toml .................. MIT
+  waitress ........................... ZPL-2.1
+
+JavaScript (frontend/package.json, runtime dependencies)
+  react, react-dom, react-window ..... MIT
+  @tanstack/react-query, zustand ..... MIT
+  lucide-react ....................... ISC

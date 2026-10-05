@@ -1,0 +1,25 @@
+# Cordée main service. Copy to /etc/systemd/system/cordee.service and adjust
+# the install path (/opt/cordee) and service user (cordee) to your host.
+[Unit]
+Description=Cordée
+After=network.target
+
+[Service]
+Type=simple
+User=cordee
+Group=cordee
+WorkingDirectory=/opt/cordee
+EnvironmentFile=/opt/cordee/.env
+# The claude / vibe CLIs, if used, are looked up on PATH and keep their login
+# state under HOME.
+Environment=HOME=/home/cordee
+Environment=PATH=/home/cordee/.local/bin:/opt/cordee/venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/cordee/venv/bin/python3 agent_api.py
+# Marks executions still 'running' at shutdown as failed so they do not stay
+# stuck after a restart.
+ExecStop=/opt/cordee/venv/bin/python3 /opt/cordee/ops/stop_guard.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

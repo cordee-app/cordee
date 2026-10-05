@@ -1,0 +1,21 @@
+# Optional standalone WebDAV origin on 127.0.0.1:8002, for a dedicated
+# dav.<your-domain> host (see docs/WEBDAV_SETUP.md). The main service already
+# serves WebDAV under /dav/, so you only need this for cleaner OS mounts.
+[Unit]
+Description=Cordée WebDAV (standalone, port 8002)
+After=network.target
+Wants=cordee.service
+
+[Service]
+Type=simple
+User=cordee
+Group=cordee
+WorkingDirectory=/opt/cordee
+# Must provide AINGEL_DAV_TOKEN: without it every request is refused.
+EnvironmentFile=/opt/cordee/.env
+ExecStart=/opt/cordee/venv/bin/python3 agent_webdav.py --host 127.0.0.1 --port 8002
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
