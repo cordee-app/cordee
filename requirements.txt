@@ -25,7 +25,8 @@ openpyxl==3.1.5
 authlib==1.8.0
 # Production WSGI server (agent_api.py serves via waitress when installed,
 # falling back to Flask's dev server). Pure-Python, no build deps.
-waitress==3.0.2# Document text extraction (PDF, Word, PowerPoint) for prompts, attachments and
+waitress==3.0.2
+# Document text extraction (PDF, Word, PowerPoint) for prompts, attachments and
 # agent tools. Imported lazily: without them those files are silently skipped.
 pdfplumber==0.11.10
 python-docx==1.2.0
