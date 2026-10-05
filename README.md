@@ -43,7 +43,7 @@ A *cordée* is a rope team: climbers tied together behind a guide who checks eve
 
 <table>
   <tr>
-    <td><img src="docs/screenshots/execution-log.png" alt="Execution log"></td>
+    <td><img src="docs/screenshots/execution-log.png" alt="Execution log with the run's Git diff"></td>
     <td><img src="docs/screenshots/chat-panel.png" alt="Chat"></td>
   </tr>
   <tr>
