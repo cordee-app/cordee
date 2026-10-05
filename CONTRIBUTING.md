@@ -92,7 +92,13 @@ If your change touches anything in the EU-compliance path, mention it explicitly
 Cordée is licensed under [AGPL-3.0](LICENSE) and is also offered under a
 [commercial license](docs/COMMERCIAL.md). Before your first pull request can
 be merged, you need to accept the [Contributor License Agreement](CLA.md).
-The CLA Assistant bot posts a link on your PR, and accepting takes one click.
+On your first PR, the CLA Assistant bot posts a comment with a link to the
+CLA. To accept, reply on the PR with exactly:
+
+> I have read the CLA Document and I hereby sign the CLA
+
+You only sign once; it then covers all your future contributions. If the
+check doesn't update, comment `recheck`.
 Under the CLA you keep the copyright in your contribution. You license it
 under AGPL-3.0 and grant the maintainer the right to include it in commercial
 licenses.
