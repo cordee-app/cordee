@@ -628,6 +628,24 @@ export interface MemoryView {
 
 export type GitMode = 'auto' | 'on' | 'off';
 
+export interface ArchiveResult {
+  ok: true;
+  filename: string;
+  size: number;
+  download_url: string;
+  /** Server cap (bytes) on an uploaded archive. A zip larger than this can
+   *  never be re-imported through the app UI. */
+  import_limit: number;
+  /** Set when the pre-archive bucket sync ran but skipped some objects. */
+  sync_warning?: string;
+}
+
+export interface ImportResult {
+  ok: true;
+  /** Raw project row returned by the importer — no task stats joined. */
+  project: Pick<Project, 'id' | 'name' | 'slug' | 'path'> & Record<string, unknown>;
+}
+
 export interface GateQuestion {
   id: string;
   question: string;

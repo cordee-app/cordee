@@ -2,7 +2,7 @@ import { useStore } from '../store';
 import { cn } from '../utils/cn';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useProjectPermissions, roleAtLeast } from '../hooks/useProjectPermissions';
-import { Lock, Trash2, Users } from 'lucide-react';
+import { Lock, Trash2, Users, Archive, PackagePlus } from 'lucide-react';
 import type { CSSProperties } from 'react';
 
 function projectColor(name: string): string {
@@ -225,7 +225,7 @@ function ProjectDashboard({ p }: { p: ProjectStat }) {
 }
 
 export const Dashboard = () => {
-  const { dashboardData, activeProject, setActiveProject, setActiveMainTab, setShowNewProjectModal, setShowGpuWindowModal, setShowDeleteProjectModal, setDeleteProjectTarget, setShowMembersModal, setMembersProjectId, quotas } = useStore();
+  const { dashboardData, activeProject, setActiveProject, setActiveMainTab, setShowNewProjectModal, setShowGpuWindowModal, setShowDeleteProjectModal, setDeleteProjectTarget, setShowArchiveProjectModal, setArchiveProjectTarget, setShowImportProjectModal, setShowMembersModal, setMembersProjectId, quotas } = useStore();
   const isMobile = useIsMobile();
   const perms = useProjectPermissions(activeProject);
   if (!dashboardData) return <div className="p-4">Loading dashboard...</div>;
@@ -325,6 +325,16 @@ export const Dashboard = () => {
             <div className="new-project-label text-base font-semibold text-accent dark:text-accent-dark-DEFAULT uppercase tracking-wide">Start New Project</div>
           </div>
         )}
+        {canCreateProject && (
+          <div
+            className="dash-project-card clickable import-project-card bg-surface-raised dark:bg-surface-dark-raised border-2 border-dashed border-border-strong dark:border-border-dark-strong rounded-lg p-4 cursor-pointer transition-[box-shadow,border-color,background] hover:shadow-medium hover:border-accent dark:hover:border-accent-dark-DEFAULT hover:bg-accent-soft dark:hover:bg-accent-dark-soft flex flex-col items-center justify-center min-h-[140px]"
+            onClick={() => setShowImportProjectModal(true)}
+            title="Import a project from a .aingel.zip archive"
+          >
+            <PackagePlus size={28} className="text-accent dark:text-accent-dark-DEFAULT mb-1" />
+            <div className="new-project-label text-base font-semibold text-accent dark:text-accent-dark-DEFAULT uppercase tracking-wide">Import Project</div>
+          </div>
+        )}
         {d.projects.map((p) => {
           const accent = p.eu_only ? '#003399' : projectColor(p.name);
           const isRunning = p.running_tasks > 0;
@@ -370,6 +380,15 @@ export const Dashboard = () => {
                   onClick={(e) => { e.stopPropagation(); setMembersProjectId(p.id); setShowMembersModal(true); }}
                 >
                   <Users size={14} />
+                </button>
+              )}
+              {(perms.authOff || perms.isAdmin || roleAtLeast(p.current_user_role, 'owner')) && (
+                <button
+                  className="dash-project-archive ml-1.5 text-text-faint dark:text-text-dark-faint opacity-0 group-hover:opacity-100 hover:text-warning dark:hover:text-warning cursor-pointer inline-flex items-center p-0.5 rounded transition-opacity"
+                  data-tip="Archive this project to a zip, then remove it"
+                  onClick={(e) => { e.stopPropagation(); setArchiveProjectTarget(p.id); setShowArchiveProjectModal(true); }}
+                >
+                  <Archive size={14} />
                 </button>
               )}
               {(perms.authOff || perms.isAdmin || roleAtLeast(p.current_user_role, 'owner')) && (

@@ -104,6 +104,9 @@ interface Store {
   showGpuWindowModal: boolean;
   showDeleteProjectModal: boolean;
   deleteProjectTarget: number | null;
+  showArchiveProjectModal: boolean;
+  archiveProjectTarget: number | null;
+  showImportProjectModal: boolean;
   showMembersModal: boolean;
   membersProjectId: number | null;
   settingsTab: SettingsTab;
@@ -213,6 +216,9 @@ interface Store {
   setShowGpuWindowModal: (v: boolean) => void;
   setShowDeleteProjectModal: (v: boolean) => void;
   setDeleteProjectTarget: (id: number | null) => void;
+  setShowArchiveProjectModal: (v: boolean) => void;
+  setArchiveProjectTarget: (id: number | null) => void;
+  setShowImportProjectModal: (v: boolean) => void;
   setShowMembersModal: (v: boolean) => void;
   setMembersProjectId: (id: number | null) => void;
   setSettingsTab: (tab: SettingsTab) => void;
@@ -233,17 +239,27 @@ interface Store {
 const QUOTA_REFRESH_MS = 4000;
 let _lastQuotaRefresh = 0;
 
-function _refreshQuotasThrottled() {
-  const now = Date.now();
-  if (now - _lastQuotaRefresh < QUOTA_REFRESH_MS) return;
-  _lastQuotaRefresh = now;
-  api.auth.me()
+/**
+ * Refresh the user row and quota counters from /api/me. Unthrottled — call
+ * after a mutation that changes account state (project import or removal) so
+ * the Dashboard create/import cards and the QuotaBar update immediately.
+ * Swallows errors: the 30s loadAll poll is the backstop.
+ */
+export function refreshQuotas(): Promise<void> {
+  _lastQuotaRefresh = Date.now();
+  return api.auth.me()
     .then((me) => {
       const store = useStore.getState();
       store.setUser(me.user);
       store.setQuotas(me.quotas);
     })
     .catch(() => { /* transient; the 30s loadAll poll catches up */ });
+}
+
+function _refreshQuotasThrottled() {
+  const now = Date.now();
+  if (now - _lastQuotaRefresh < QUOTA_REFRESH_MS) return;
+  refreshQuotas();
 }
 
 export const useStore = create<Store>()(
@@ -339,6 +355,9 @@ export const useStore = create<Store>()(
       showGpuWindowModal: false,
       showDeleteProjectModal: false,
       deleteProjectTarget: null,
+      showArchiveProjectModal: false,
+      archiveProjectTarget: null,
+      showImportProjectModal: false,
       showMembersModal: false,
       membersProjectId: null,
       settingsTab: 'general',
@@ -539,6 +558,9 @@ export const useStore = create<Store>()(
       setShowGpuWindowModal: (showGpuWindowModal) => set({ showGpuWindowModal }),
       setShowDeleteProjectModal: (showDeleteProjectModal) => set({ showDeleteProjectModal }),
       setDeleteProjectTarget: (deleteProjectTarget) => set({ deleteProjectTarget }),
+      setShowArchiveProjectModal: (showArchiveProjectModal) => set({ showArchiveProjectModal }),
+      setArchiveProjectTarget: (archiveProjectTarget) => set({ archiveProjectTarget }),
+      setShowImportProjectModal: (showImportProjectModal) => set({ showImportProjectModal }),
       setShowMembersModal: (showMembersModal) => set({ showMembersModal }),
       setMembersProjectId: (membersProjectId) => set({ membersProjectId }),
       setSettingsTab: (settingsTab) => set({ settingsTab }),

@@ -108,6 +108,46 @@ A task can have multiple executions (retries, resumes, re-runs), so the "Task #"
 
 **Definition file resolution:** `agent_config.resolve_def_filename(project_path)` prefers `READMEFIRST.md`, falls back to `CLAUDE.md`. The frontend resolves the def file name via the `def_filename` field returned by `/api/projects`.
 
+## Project Archive & Restore
+
+A project can be exported to a single `.aingel.zip`, removed, and later re-imported. Implementation: `agent_archive.py` (build/restore/reaper) + central-row helpers in `agent_db.py` + three routes in `agent_api.py`.
+
+**Archive zip layout**
+
+```
+<slug>-<YYYYMMDD-HHMMSS>.aingel.zip
+├─ manifest.json     ← projects row, roles, project_hf_models, project_members,
+│                       task_dependencies, task/exec/chat registries, scw_* spend
+│                       rows, format + version + original path/name/slug
+└─ project/          ← the project tree
+   ├─ project.db     ← WAL-safe snapshot (SQLite online backup API — NOT a copy)
+   ├─ Artifacts/, Working Documents/, .git/ (full history), READMEFIRST.md, ...
+Excluded: .uploads/, project.db-wal/-shm, project.db.bak-*, legacy .trash/
+```
+
+**Endpoints**
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/api/projects/<pid>/archive` | Owner. Non-destructive build (syncs SCW bucket → Working Documents first). Returns `{filename, size, download_url, import_limit[, sync_warning]}`; 409 on running/queued work. |
+| GET | `/api/projects/<pid>/archive/<filename>` | Owner. Serves the built zip `as_attachment`, but only from **that pid's** subdirectory. |
+| POST | `/api/projects/import` | multipart `file`. `check_project_create` quota first; returns `{ok, project}`. |
+
+Built zips live in `<PROJECTS_ROOT>/.archives/<pid>/<slug>-<ts>-<rand4>.aingel.zip` — the per-pid subdirectory is what stops one project owner from downloading another project's archive by guessing its filename (the GET route authorizes on `pid` and resolves only inside that pid's dir). The directory is outside every project tree so quota storage walks don't count it, and entries are reaped after 7 days by `_reap_archives()`, next to `_reap_trash()`.
+
+**Invariants baked into restore**
+
+- **WAL:** export snapshots `project.db` via `Connection.backup()`. A plain copy would miss committed pages still in `-wal`.
+- **Global IDs:** registry ids (and every task/exec/chat PK) are re-inserted **verbatim** with explicit `INSERT ... (id, ...)`; SQLite bumps `sqlite_sequence` to the new max. No new ids are invented.
+- **v1 is same-instance only:** a *fatal* collision (project name/slug/folder/id, roles, HF models, deployments, session costs, registries) is a hard 409 before a single write (`ArchiveConflictError`). Two row classes are **skippable** instead of fatal: `task_dependencies` and `scw_deployment_calls`, because a dependency edge or a shared-window call can legitimately appear in two projects' archives — they are re-inserted with `INSERT OR IGNORE` and skips are logged, so archiving and restoring two linked projects both succeed. Cross-instance moves remain the job of `scripts/import_vault_into_laptop.py`.
+- **Path/name validation:** restore enforces the same `^[A-Za-z0-9 _\-]+$` project-name regex as `create_project` and a realpath containment check under `PROJECTS_ROOT`; the sanitized name/slug are written back into the manifest so the folder, conflict checks and DB row all agree.
+- **Paths repointed:** `projects.path` + the 3 registry `project_path` columns + `chats.file_path` (which also self-heals by basename).
+- **SCW sessions:** `scw_*` columns are cleared at export and restore (the existing DELETE route crypto-shreds the bucket/KMS, irreversibly). A restore starts session-less; open a fresh session after.
+- **Restore safety:** entries are validated **before** the manifest is read (so a small zip cannot force a large manifest allocation; the manifest is capped at 1 MiB). Zip-slip, absolute paths, symlink/device/fifo entries, tree conflicts, entry-count and uncompressed-size caps are all rejected before extraction (no `extractall`). The extracted `project.db` is probed for SQLite validity before anything is moved or committed, and the central insert is tracked so a failed restore never leaves half-committed rows. Restores are serialized by a lock and use `os.rename` (no clobbering). Symlinks and special files in the **source** tree are skipped at export too.
+- **Removal:** archive then remove reuses the existing `DELETE /api/projects/<pid>` route (guards, SCW shred, GPU windows, trash, audit) unchanged. The frontend uses a **two-step** flow — build + download in step 1, then a separate "Remove project" confirmation in step 2 — so a cancelled/failed save can never delete a project whose zip was not written; if the zip exceeds the import limit the modal warns it cannot be restored through the app until acknowledged.
+
+**Known limits:** cross-instance restore refused (use the import scripts); out-of-tree soft-delete trash (`TRASH_ROOT/<project_id>`) is not in the zip; SCW bucket sync caps at 1000 objects (`list_objects_v2`); import upload is capped by `MAX_CONTENT_LENGTH` (surfaced as `import_limit` so the UI can warn); archives are unencrypted — treat them as confidential. Tests: `test_agent_archive.py`.
+
 ## Chat Architecture
 
 Chats are the primary conversation unit, scoped to project / phase / task.

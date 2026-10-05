@@ -66,6 +66,7 @@ import agent_chats as chats_mod
 import agent_git as agit
 import agent_filecat as fcat
 import agent_files
+import agent_archive
 import agent_scw_session
 import agent_scw_deploy
 import hf_catalog
@@ -1228,6 +1229,20 @@ def auto_chain_project_deps(pid):
 
 _TRASH_DIR = os.path.join(PROJECTS_ROOT, '.trash')
 _TRASH_RETENTION_DAYS = 7
+# Built project archives live outside every project tree (so quota storage
+# walks do not count them), one subdir per project: `.archives/<pid>/<file>`.
+# The per-pid nesting is what scopes the download route (IDOR fix). Kept beside
+# .trash for operator symmetry; reaped by _reap_archives() after
+# _ARCHIVE_RETENTION_DAYS (the reaper also cleans any legacy flat zip).
+_ARCHIVES_DIR = os.path.join(PROJECTS_ROOT, '.archives')
+_ARCHIVE_RETENTION_DAYS = 7
+# Cap on an uploaded archive body. Flask's MAX_CONTENT_LENGTH already rejects
+# oversized multipart bodies with 413; this is the explicit import-level guard
+# (and the value chunked import will eventually replace). Chunked import is
+# future work — a single 5 GiB upload is impractical over HTTP, so importing a
+# larger project is a known limitation rather than a silent failure.
+_MAX_IMPORT_BYTES = int(getattr(agent_config, 'MAX_CONTENT_LENGTH', 128 * 1024 * 1024)) \
+    or 128 * 1024 * 1024
 
 
 def _trash_path(slug, ts):
@@ -1307,6 +1322,17 @@ def _reap_trash():
         return reaped
     except Exception as e:
         print(f'[startup] WARNING: trash reaper failed, continuing anyway: {e}')
+        return 0
+
+
+def _reap_archives():
+    """Hard-delete built archives older than _ARCHIVE_RETENTION_DAYS. Runs at
+    startup and daily (next to _reap_trash). Delegates to agent_archive so the
+    retention constant lives with the code that writes the zips. Never raises."""
+    try:
+        return agent_archive.reap_archives(_ARCHIVES_DIR, _ARCHIVE_RETENTION_DAYS)
+    except Exception as e:
+        print(f'[startup] WARNING: archives reaper failed, continuing anyway: {e}')
         return 0
 
 
@@ -1578,6 +1604,167 @@ def delete_project_route(pid):
         _audit_delete(project, hard_deleted, archived_until)
 
     return jsonify({'ok': True, 'hard_deleted': hard_deleted, 'archived_until': archived_until})
+
+
+@app.route('/api/projects/<int:pid>/archive', methods=['POST'])
+@require_project_access('owner')
+def archive_project_route(pid):
+    """Build a non-destructive .aingel.zip archive of a project.
+
+    Non-destructive: syncs bucket-only files into Working Documents first, then
+    snapshots the folder + central rows. It does NOT close the Scaleway session
+    and does NOT delete anything — the existing DELETE route performs the
+    crypto-shred afterwards.
+
+    Reuses the delete route's guards (running executions / confirmed tasks /
+    unreadable project.db) so an archive is never taken out from under live
+    work, and returns the same 409 shapes for those cases.
+    """
+    project = db.get_project(pid)
+    if not project:
+        return jsonify({'error': 'Project not found'}), 404
+
+    running = _project_running_executions(project)
+    if running is None:
+        return jsonify({
+            'error': 'Could not read project database — refusing to archive (it may be locked or corrupt)',
+        }), 409
+    if running:
+        return jsonify({
+            'error': 'Project has running executions — stop them before archiving',
+            'running': running,
+        }), 409
+
+    confirmed = _project_confirmed_tasks(project)
+    if confirmed is None:
+        return jsonify({
+            'error': 'Could not read project database — refusing to archive (it may be locked or corrupt)',
+        }), 409
+    if confirmed:
+        return jsonify({
+            'error': 'Project has confirmed (queued) tasks — cancel them before archiving',
+            'confirmed': confirmed,
+        }), 409
+
+    try:
+        result = agent_archive.build_archive(project)
+    except Exception as e:
+        app.logger.exception('archive build failed for project %s', pid)
+        return jsonify({'error': f'archive build failed: {e}'}), 500
+
+    return jsonify({
+        'ok': True,
+        'filename': result['filename'],
+        'size': result['size'],
+        'download_url': f"/api/projects/{pid}/archive/{result['filename']}",
+        # Expose the import cap so the frontend can warn before letting the user
+        # upload an archive the server will reject with 413.
+        'import_limit': _MAX_IMPORT_BYTES,
+        **({'sync_warning': result['sync_warning']} if result.get('sync_warning') else {}),
+    })
+
+
+@app.route('/api/projects/<int:pid>/archive/<path:filename>', methods=['GET'])
+@require_project_access('owner')
+def download_project_archive_route(pid, filename):
+    """Serve a built archive as an attachment.
+
+    Each project's built zips live in their own `<.archives>/<pid>/` subdir, so
+    this resolves the filename ONLY inside the requested pid's directory. That
+    closes the IDOR where any project that could authorize a download URL could
+    fish out another project's archive by its predictable name.
+
+    Hardened like the other project-file routes: the filename must be a bare
+    basename (no separators) with no '..' and no NUL, and the resolved path must
+    stay strictly inside the per-pid directory. Any miss returns 404 without
+    leaking path details.
+    """
+    # 404 (not 400) for any invalid name per the frozen contract, and to avoid
+    # leaking whether a differently-named archive exists. NUL is rejected
+    # explicitly because os.path.realpath() raises ValueError on it (a 500).
+    if (not filename or filename != os.path.basename(filename)
+            or '..' in filename or '\x00' in filename):
+        return jsonify({'error': 'archive not found'}), 404
+    # A leading/trailing separator would escape/confuse the join; basename
+    # equality already excludes them, but be explicit.
+    if filename in ('.', '') or os.sep in filename or '/' in filename:
+        return jsonify({'error': 'archive not found'}), 404
+    pdir = os.path.join(_ARCHIVES_DIR, str(pid))
+    path = os.path.join(pdir, filename)
+    real_dir = os.path.realpath(pdir)
+    real_path = os.path.realpath(path)
+    if not (real_path.startswith(real_dir + os.sep)):
+        return jsonify({'error': 'archive not found'}), 404
+    if not os.path.isfile(real_path):
+        return jsonify({'error': 'archive not found'}), 404
+    resp = send_file(real_path, mimetype='application/zip', as_attachment=True,
+                     download_name=filename, conditional=True)
+    resp.headers['X-Content-Type-Options'] = 'nosniff'
+    resp.headers['Content-Security-Policy'] = "default-src 'none'; sandbox"
+    return resp
+
+
+@app.route('/api/projects/import', methods=['POST'])
+@require_auth
+def import_project_route():
+    """Restore a project from an uploaded .aingel.zip archive.
+
+    Auth required. Enforces the free-tier project-count quota before touching
+    disk. The upload is buffered to a temp file (MAX_CONTENT_LENGTH caps the
+    request body; chunked import is future work) and deleted in a finally.
+    """
+    upload = request.files.get('file')
+    if upload is None or not upload.filename:
+        return jsonify({'error': 'file field required (multipart .aingel.zip)'}), 400
+
+    # Body-size guard. Flask already rejects > MAX_CONTENT_LENGTH with 413, but a
+    # client that streams/chunks can still hand us a large file; cap explicitly.
+    max_import = _MAX_IMPORT_BYTES
+    cl = request.content_length
+    if cl is not None and cl > max_import:
+        return jsonify({
+            'error': f'archive too large ({cl} bytes > {max_import} byte limit); '
+                     'chunked import is not yet supported',
+        }), 413
+
+    uploader = g.get('current_user') if auth_enabled() else None
+    uploader_id = uploader['id'] if uploader else None
+
+    # Free-tier project-count quota. check_project_create is a no-op when
+    # quotas_applicable() is False (auth off, admin, or no user), so calling it
+    # unconditionally keeps the auth-off path zero-behavior-change.
+    try:
+        import agent_quotas
+        agent_quotas.check_project_create(uploader_id)
+    except agent_quotas.QuotaError as e:
+        return jsonify({'error': str(e), 'quota': e.field, 'limit': e.limit}), 507
+
+    import tempfile
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix='aingel-import-', suffix='.zip')
+        os.close(fd)
+        upload.save(tmp_path)
+        if os.path.getsize(tmp_path) > max_import:
+            return jsonify({'error': 'archive exceeds the size limit'}), 413
+
+        project = agent_archive.restore_archive(
+            tmp_path, uploader_id, uploader_user=uploader,
+            write_aingel_json=_write_aingel_json)
+        return jsonify({'ok': True, 'project': project})
+    except agent_archive.ArchiveValidationError as e:
+        return jsonify({'error': str(e)}), 400
+    except db.ArchiveConflictError as e:
+        return jsonify({'error': str(e)}), 409
+    except Exception as e:
+        app.logger.exception('project import failed')
+        return jsonify({'error': f'import failed: {e}'}), 500
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def _preflight_dep_skips(task_ids):
@@ -7206,6 +7393,7 @@ def _slot_scheduler_loop():
     _trash_counter = 0
     _uploads_counter = 0
     _ptrash_counter = 0
+    _archive_counter = 0
     while True:
         try:
             _slot_scheduler_tick()
@@ -7241,6 +7429,15 @@ def _slot_scheduler_loop():
                         print(f'[trash-reaper] reaped {_reaped} expired trash entr(ies)')
                 except Exception as _te:
                     print(f'[trash-reaper] error: {_te}', file=sys.stderr)
+            # Built archives past retention (daily). Same cadence as .trash.
+            _archive_counter += 1
+            if _archive_counter % 1440 == 0:
+                try:
+                    _areaped = _reap_archives()
+                    if _areaped:
+                        print(f'[archive-reaper] reaped {_areaped} expired archive(s)')
+                except Exception as _ae:
+                    print(f'[archive-reaper] error: {_ae}', file=sys.stderr)
             # R2: reap stale .uploads/ chunk dirs older than 24h (daily)
             _uploads_counter += 1
             if _uploads_counter % 1440 == 0:
@@ -7897,6 +8094,13 @@ if __name__ == '__main__':
             print(f'[startup] Reaped {_reaped} expired trash entr(ies)')
     except Exception as _e:
         print(f'[startup] WARNING: trash reaper failed, continuing anyway: {_e}')
+    # Reap built archives past their retention window.
+    try:
+        _areaped = _reap_archives()
+        if _areaped:
+            print(f'[startup] Reaped {_areaped} expired archive(s)')
+    except Exception as _e:
+        print(f'[startup] WARNING: archive reaper failed, continuing anyway: {_e}')
     # Reap stale .uploads/ chunk dirs older than 24h.
     try:
         _ureaped = _reap_uploads()

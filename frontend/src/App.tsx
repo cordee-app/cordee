@@ -26,6 +26,8 @@ import { ScaffoldProgress } from './components/ScaffoldProgress';
 import SettingsModal from './components/SettingsModal';
 import { GpuWindowModal } from './components/GpuWindowModal';
 import { DeleteProjectModal } from './components/DeleteProjectModal';
+import { ArchiveProjectModal } from './components/ArchiveProjectModal';
+import { ImportProjectModal } from './components/ImportProjectModal';
 import { MembersModal } from './components/MembersModal';
 import ChatModal from './components/ChatModal';
 import DependenciesModal from './components/DependenciesModal';
@@ -368,6 +370,8 @@ const App = () => {
       <SettingsModal />
       <GpuWindowModal />
       <DeleteProjectModal />
+      <ArchiveProjectModal />
+      <ImportProjectModal />
       <MembersModal />
       <ChatModal />
       <DependenciesModal />

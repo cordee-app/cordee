@@ -6,6 +6,7 @@ import type {
   ScwSessionStatus, Deployment, FilesCatalog, ProjectHfModel, HfSearchResult, HfCandidate,
   HfQueueGroup, GpuWindow, GpuWindowModel, GpuRunStatus,
   MeResponse, ProjectMember, MemberRole, AdminUser, DirectoryUser,
+  ArchiveResult, ImportResult,
 } from './types';
 
 const BASE = '';
@@ -155,6 +156,44 @@ export const api = {
     }) => post<{ project: Project; chat: Chat; reply: string }>('/api/projects', data),
     update: (pid: number, data: Record<string, unknown>) => patch<{ ok: true }>(`/api/projects/${pid}`, data),
     delete: (pid: number) => del<{ ok: true; hard_deleted?: boolean; archived_until?: string | null }>(`/api/projects/${pid}`),
+    archive: (pid: number) => post<ArchiveResult>(`/api/projects/${pid}/archive`),
+    importProject: async (
+      file: File,
+      onProgress?: (msg: string) => void,
+    ): Promise<ImportResult> => {
+      const form = new FormData();
+      form.append('file', file, file.name);
+      onProgress?.(`Uploading ${file.name}…`);
+      const res = await fetch(BASE + '/api/projects/import', { method: 'POST', body: form });
+      if (!res.ok) return fail(res);
+      onProgress?.(`Importing ${file.name}…`);
+      return res.json();
+    },
+    // Fetch the archive as a blob so completion is reliable, then trigger a
+    // browser download. Resolves once the blob has been handed to the browser
+    // — NOT once the file is on disk — so callers must treat this as the
+    // download *handoff*, never as proof the zip was saved.
+    downloadArchive: async (pid: number, filename: string): Promise<void> => {
+      const res = await fetch(BASE + `/api/projects/${pid}/archive/${encodeURIComponent(filename)}`);
+      if (!res.ok) return fail(res);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      // Keep the object URL alive long enough for a large download to finish;
+      // revoking too early aborts an in-flight save. Also revoke on unload so
+      // a cancelled/navigated-away download does not pin the blob.
+      const revoke = () => URL.revokeObjectURL(url);
+      window.addEventListener('beforeunload', revoke, { once: true });
+      try {
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      } finally {
+        window.setTimeout(revoke, 60000);
+      }
+    },
 
     budget: {
       get: (pid: number) => get<BudgetInfo>(`/api/projects/${pid}/budget`),

@@ -2005,6 +2005,440 @@ def delete_project(project_id):
     conn.close()
 
 
+# ── Archive / restore: central-row export + import ───────────────────────────
+# A project is a folder under PROJECTS_ROOT plus a handful of central aingel.db
+# rows. The archive feature snapshots both: the folder becomes the zip tree
+# (project/) and these rows become manifest.json. Restore re-creates the rows
+# with their ORIGINAL ids so GLOBAL registry ids (task/exec/chat) keep matching
+# the per-project project.db primary keys, which are the same numbers.
+#
+# Design invariants, encoded here so a future edit does not silently break them:
+#   * scw_* project columns are exported CLEARED (None). The existing DELETE
+#     route crypto-shreds the Scaleway bucket/KMS key irreversibly, so a
+#     restored project can never re-attach to the old session — it must start
+#     session-less. The manifest therefore carries no secret material.
+#   * scw_deployments / scw_deployment_calls / scw_session_costs ARE exported,
+#     per product decision, to preserve spend history even though delete_project
+#     removes them (agent_db.py delete_project, ~1992-2001).
+#   * task_dependencies has no project_id column — it is scoped exactly like
+#     delete_project scopes it: task_id OR depends_on_id in this project's
+#     task_registry. Restore relies on the ids being globally unique so the
+#     same filter is correct on the way back in.
+#   * The registries store the GLOBAL ids; project.db task/exec/chat PKs equal
+#     these. Restore inserts the registry ids VERBATIM and rewrites project_path;
+#     it never invents new ids.
+# All ids in a v1 archive are same-instance only — restore refuses when any id
+# or name already exists (ArchiveConflictError).
+
+
+class ArchiveConflictError(Exception):
+    """Raised when an archive restore would collide with existing instance
+    state (name, slug, folder, or any globally-unique id). The message is
+    caller-facing and safe to return verbatim in a JSON {"error": ...} body."""
+
+
+# The central-DB transaction is ordered parents-before-children (FKs are ON):
+# projects -> roles/project_hf_models -> project_members -> registries ->
+# task_dependencies -> scw_deployments -> scw_deployment_calls ->
+# scw_session_costs. The registry sections are positional tuples and the calls
+# section needs FK-aware filtering, so the loop is written out explicitly in
+# restore_project_central_rows rather than driven by a table list constant.
+
+
+def _table_columns(conn, table):
+    """Column names of `table` in declaration order (empty if it does not exist)."""
+    try:
+        return [r[1] for r in conn.execute(f'PRAGMA table_info({table})').fetchall()]
+    except Exception:
+        return []
+
+
+def export_project_central_rows(project_id):
+    """Read-only snapshot of a project's central aingel.db rows.
+
+    Returns a dict shaped exactly like the manifest sections consumed by
+    restore_project_central_rows (see agent_archive.py's manifest schema). Opens
+    its own connection and closes it; never writes. The `project` row has every
+    scw_* column forced to None (see module comment above).
+    """
+    conn = get_db()
+    try:
+        out = {}
+        row = conn.execute('SELECT * FROM projects WHERE id=?', (project_id,)).fetchone()
+        if not row:
+            return {}
+        proj = dict(row)
+        for col in list(proj.keys()):
+            if col.startswith('scw_'):
+                proj[col] = None
+        out['project'] = proj
+
+        out['roles'] = [dict(r) for r in conn.execute(
+            'SELECT * FROM roles WHERE project_id=? ORDER BY id', (project_id,)).fetchall()]
+        out['project_hf_models'] = [dict(r) for r in conn.execute(
+            'SELECT * FROM project_hf_models WHERE project_id=? ORDER BY id',
+            (project_id,)).fetchall()]
+        out['project_members'] = [dict(r) for r in conn.execute(
+            'SELECT project_id, user_id, role FROM project_members WHERE project_id=?',
+            (project_id,)).fetchall()]
+
+        # task_dependencies has no project_id — scope exactly like delete_project.
+        out['task_dependencies'] = [dict(r) for r in conn.execute(
+            'SELECT * FROM task_dependencies WHERE task_id IN '
+            '(SELECT id FROM task_registry WHERE project_id=?) OR '
+            'depends_on_id IN (SELECT id FROM task_registry WHERE project_id=?) '
+            'ORDER BY id', (project_id, project_id)).fetchall()]
+
+        # Registries: global ids, emitted as positional tuples (id, project_id,
+        # project_path) so a compact manifest cannot lose a column name.
+        regs = {}
+        for reg, key in (('task_registry', 'tasks'), ('exec_registry', 'execs'),
+                         ('chat_registry', 'chats')):
+            regs[key] = [list(r) for r in conn.execute(
+                f'SELECT id, project_id, project_path FROM {reg} '
+                'WHERE project_id=? ORDER BY id', (project_id,)).fetchall()]
+        out['registries'] = regs
+
+        # Spend history. scw_deployment_calls includes rows attributed to this
+        # project on SHARED windows (project_id match) AND rows on windows this
+        # project OWNS (non-shared) even when project_id is NULL — mirroring the
+        # two delete_project branches so a restore does not lose any call row.
+        out['scw_deployments'] = [dict(r) for r in conn.execute(
+            'SELECT * FROM scw_deployments WHERE project_id=? AND is_shared=0 '
+            'ORDER BY id', (project_id,)).fetchall()]
+        out['scw_deployment_calls'] = [dict(r) for r in conn.execute(
+            'SELECT * FROM scw_deployment_calls WHERE project_id=? OR deployment_id IN '
+            '(SELECT id FROM scw_deployments WHERE project_id=? AND is_shared=0) '
+            'ORDER BY id', (project_id, project_id)).fetchall()]
+        out['scw_session_costs'] = [dict(r) for r in conn.execute(
+            'SELECT * FROM scw_session_costs WHERE project_id=? ORDER BY id',
+            (project_id,)).fetchall()]
+        return out
+    finally:
+        conn.close()
+
+
+def _manifest_registry_rows(manifest):
+    """Flatten manifest['registries'] into [(table, [rows...]), ...]."""
+    regs = (manifest or {}).get('registries') or {}
+    return (
+        ('task_registry', regs.get('tasks') or []),
+        ('exec_registry', regs.get('execs') or []),
+        ('chat_registry', regs.get('chats') or []),
+    )
+
+
+def check_archive_id_collisions(manifest):
+    """Return {'fatal': [...], 'skippable': [...]} id collisions for `manifest`,
+    or None if every globally-unique id is free. Read-only.
+
+    `fatal` collisions refuse the restore (409): projects id/slug/name; every
+    role / project_hf_model / scw_deployments / scw_session_cost row id; and
+    every task/exec/chat registry id. All of those are same-instance-only ids
+    whose reuse would corrupt or duplicate rows.
+
+    `skippable` collisions are reported separately and do NOT refuse the
+    restore. `task_dependencies` has no project_id and is OR-scoped across
+    projects, and `scw_deployment_calls` can be attributed to a shared window;
+    the SAME row can therefore legitimately appear in two different projects'
+    archives. restore_project_central_rows inserts both with INSERT OR IGNORE
+    and counts the skips, so re-restoring a second project that shares a row
+    does not permanently 409.
+
+    Note: this intentionally does NOT check project_members (a (project_id,
+    user_id) clash is harmless and filtered at restore), despite what an earlier
+    revision of this docstring claimed.
+    """
+    if not manifest:
+        return {'fatal': ['manifest is empty'], 'skippable': []}
+    project = manifest.get('project') or {}
+    fatal = []
+    skippable = []
+    conn = get_db()
+    try:
+        pid = project.get('id')
+        if pid is not None:
+            if conn.execute('SELECT 1 FROM projects WHERE id=?', (pid,)).fetchone():
+                fatal.append(f'project id {pid}')
+            if conn.execute('SELECT 1 FROM projects WHERE slug=?',
+                            (project.get('slug'),)).fetchone():
+                fatal.append(f'project slug {project.get("slug")!r}')
+            if conn.execute('SELECT 1 FROM projects WHERE name=?',
+                            (project.get('name'),)).fetchone():
+                fatal.append(f'project name {project.get("name")!r}')
+
+        def _check_rows(table, rows, bucket, require_project_match=True):
+            if not rows:
+                return
+            for r in rows:
+                if not isinstance(r, dict):
+                    # Registry rows are (id, project_id, project_path) tuples; their
+                    # project_id is overwritten at restore, so only the id matters.
+                    rid = r[0] if isinstance(r, (list, tuple)) and r else None
+                    if rid is None:
+                        continue
+                    if conn.execute(f'SELECT 1 FROM {table} WHERE id=?',
+                                    (rid,)).fetchone():
+                        bucket.append(f'{table} id {rid}')
+                    continue
+                rid = r.get('id')
+                if rid is not None and conn.execute(
+                        f'SELECT 1 FROM {table} WHERE id=?', (rid,)).fetchone():
+                    bucket.append(f'{table} id {rid}')
+                # A child row whose project_id is neither this project's id nor
+                # NULL would be planted into ANOTHER tenant's project (the
+                # manifest is attacker-controlled). The id check above cannot
+                # catch it when the id is free, so refuse the mismatch outright —
+                # this is what makes "fatal" mean "cannot restore". NULL is
+                # allowed: scw_deployment_calls legitimately stores NULL for calls
+                # on a project-owned non-shared window (see export query).
+                if require_project_match and 'project_id' in r and pid is not None \
+                        and r.get('project_id') not in (pid, None):
+                    bucket.append(
+                        f'{table} project_id {r.get("project_id")} != archive '
+                        f'project id {pid}')
+
+        _check_rows('roles', manifest.get('roles'), fatal)
+        _check_rows('project_hf_models', manifest.get('project_hf_models'), fatal)
+        _check_rows('scw_deployments', manifest.get('scw_deployments'), fatal)
+        _check_rows('scw_session_costs', manifest.get('scw_session_costs'), fatal)
+        # Cross-project rows: a hit means the row is shared, not that the archive
+        # is from another instance. Restore OR-IGNOREs them — so an id collision
+        # is skippable. A project_id mismatch is still fatal, though: a call row
+        # pointing at another tenant must not be accepted. task_dependencies has
+        # no project_id, so every id hit there is genuinely skippable.
+        _check_rows('task_dependencies', manifest.get('task_dependencies'), skippable,
+                    require_project_match=False)
+        _check_rows('scw_deployment_calls', manifest.get('scw_deployment_calls'),
+                    skippable)
+        for table, rows in _manifest_registry_rows(manifest):
+            _check_rows(table, rows, fatal)
+    finally:
+        conn.close()
+    if fatal or skippable:
+        return {'fatal': fatal, 'skippable': skippable}
+    return None
+
+
+def restore_project_central_rows(manifest, target_path, owner_id=None,
+                                 allowed_user_ids=None):
+    """Insert a manifest's central rows in ONE transaction, parents first.
+
+    Uses explicit INSERT statements so the ORIGINAL ids are preserved (SQLite
+    bumps sqlite_sequence to the new max after an explicit-id insert, so later
+    AUTOINCREMENT rows are safe). FKs are ON: project_members rows are filtered
+    to user ids that exist in `users` (dropping the rest rather than aborting),
+    and the uploader is (re)installed as owner when auth/multi-tenancy is on.
+
+    Raises ArchiveConflictError if the project row or any checked id already
+    exists — the caller should have pre-checked with check_archive_id_collisions,
+    but this re-check makes the write itself atomic/self-protecting.
+
+    Returns the restored projects row as a dict.
+    """
+    project = dict((manifest or {}).get('project') or {})
+    if not project:
+        raise ArchiveConflictError('manifest has no project row')
+    pid = project.get('id')
+    if pid is None:
+        raise ArchiveConflictError('manifest project has no id')
+
+    conn = get_db()
+    try:
+        if conn.execute('SELECT 1 FROM projects WHERE id=?', (pid,)).fetchone():
+            raise ArchiveConflictError(
+                f'project id {pid} already exists — archive was created on another '
+                'instance or IDs were reused; restore refused')
+        if conn.execute('SELECT 1 FROM projects WHERE slug=?',
+                        (project.get('slug'),)).fetchone():
+            raise ArchiveConflictError(
+                f'project slug {project.get("slug")!r} already exists')
+
+        # Existing user ids for FK-safe membership insert. allowed_user_ids (when
+        # supplied by the route) narrows this further, but we always intersect
+        # with the live users table so a stale manifest can never violate the FK.
+        try:
+            existing_users = {r[0] for r in conn.execute('SELECT id FROM users').fetchall()}
+        except Exception:
+            existing_users = set()
+
+        # ── projects (parents first) ─────────────────────────────────────────
+        proj_cols = _table_columns(conn, 'projects')
+        proj_vals = dict(project)
+        # scw_* is already cleared at export; clear again defensively so a
+        # hand-edited manifest cannot smuggle a session back in.
+        for col in proj_cols:
+            if col.startswith('scw_'):
+                proj_vals[col] = None
+        proj_vals['path'] = target_path
+        if owner_id is not None and 'owner_id' in proj_cols:
+            proj_vals['owner_id'] = owner_id
+        cols = [c for c in proj_cols if c in proj_vals]
+        placeholders = ','.join('?' for _ in cols)
+        conn.execute(
+            f'INSERT INTO projects ({",".join(chr(34)+c+chr(34) for c in cols)}) '
+            f'VALUES ({placeholders})', [proj_vals[c] for c in cols])
+
+        # ── simple child tables, explicit ids ────────────────────────────────
+        def _insert_rows(table, rows, or_ignore=False):
+            """INSERT manifest rows verbatim. With or_ignore=True an existing id
+            is silently skipped; returns the number of skipped rows so the
+            caller can log shared cross-project rows rather than 409."""
+            if not rows:
+                return 0
+            tcols = _table_columns(conn, table)
+            if not tcols:
+                return 0
+            skipped = 0
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                use = [c for c in tcols if c in r]
+                ph = ','.join('?' for _ in use)
+                verb = 'INSERT OR IGNORE' if or_ignore else 'INSERT'
+                cur = conn.execute(
+                    f'{verb} INTO {table} ({",".join(chr(34)+c+chr(34) for c in use)}) '
+                    f'VALUES ({ph})', [r[c] for c in use])
+                if or_ignore and cur.rowcount == 0:
+                    skipped += 1
+            return skipped
+
+        _insert_rows('roles', (manifest.get('roles') or []))
+        _insert_rows('project_hf_models', (manifest.get('project_hf_models') or []))
+
+        # ── project_members: FK-safe filter + uploader-as-owner ──────────────
+        allowed = existing_users if allowed_user_ids is None else (
+            existing_users & set(allowed_user_ids))
+        for r in (manifest.get('project_members') or []):
+            if not isinstance(r, dict):
+                continue
+            uid = r.get('user_id')
+            if uid not in allowed:
+                continue
+            role = r.get('role') if r.get('role') in _MEMBER_ROLES else 'member'
+            conn.execute(
+                'INSERT OR IGNORE INTO project_members (project_id, user_id, role) '
+                'VALUES (?,?,?)', (pid, uid, role))
+        if owner_id is not None and owner_id in existing_users:
+            conn.execute(
+                'INSERT INTO project_members (project_id, user_id, role) VALUES (?,?,?) '
+                'ON CONFLICT(project_id, user_id) DO UPDATE SET role=excluded.role',
+                (pid, owner_id, 'owner'))
+
+        # ── registries (verbatim global ids, new absolute project_path) ──────
+        for table, rows in _manifest_registry_rows(manifest):
+            for r in rows or []:
+                if isinstance(r, dict):
+                    rid = r.get('id'); rpath = target_path
+                elif isinstance(r, (list, tuple)) and len(r) >= 3:
+                    rid = r[0]; rpath = target_path
+                else:
+                    continue
+                if rid is None:
+                    continue
+                conn.execute(
+                    f'INSERT INTO {table} (id, project_id, project_path) VALUES (?,?,?)',
+                    (rid, pid, rpath))
+
+        # ── dependencies (global task ids) ───────────────────────────────────
+        # task_dependencies has no project_id and is OR-scoped across projects, so
+        # the SAME dependency row can appear in two projects' archives. OR IGNORE
+        # so restoring the second project does not 409 on the shared id; log the
+        # count instead. (id is the PK and UNIQUE(task_id,depends_on_id) covers
+        # the other collision shape.)
+        skipped_deps = _insert_rows(
+            'task_dependencies', (manifest.get('task_dependencies') or []),
+            or_ignore=True)
+        if skipped_deps:
+            _log.info('restore: skipped %d task_dependency row(s) already present '
+                      '(shared across projects)', skipped_deps)
+
+        # ── spend history ────────────────────────────────────────────────────
+        _insert_rows('scw_deployments', (manifest.get('scw_deployments') or []))
+
+        # scw_deployment_calls.deployment_id is NOT NULL + FK to scw_deployments.
+        # The manifest includes calls attributed to this project on SHARED
+        # windows, but shared deployments belong to no single project and are
+        # deliberately NOT archived (delete_project leaves is_shared=1 rows
+        # alone). On a SAME-instance restore the shared parent still exists, so
+        # every call restores. On a fresh/lost instance it does not — inserting
+        # such a call would raise a FK violation and abort the whole restore, so
+        # we skip only those orphaned call rows and log them. (Exporting the
+        # shared parent is NOT an option: it would collide on same-instance
+        # restore and is a global infra row, not project data.)
+        existing_deps = {r[0] for r in conn.execute('SELECT id FROM scw_deployments').fetchall()}
+        skipped_calls = 0
+        ignored_calls = 0
+        calls = manifest.get('scw_deployment_calls') or []
+        call_cols = _table_columns(conn, 'scw_deployment_calls')
+        for r in calls:
+            if not isinstance(r, dict):
+                continue
+            if r.get('deployment_id') not in existing_deps:
+                skipped_calls += 1
+                continue
+            # Force the attribution to THIS project (or NULL, the legitimate
+            # owned-window case) rather than trusting the manifest value; the
+            # collision pre-check already refuses a foreign non-NULL project_id,
+            # but this keeps the write self-protecting against a manifest that
+            # was never pre-checked.
+            vals = {c: r[c] for c in call_cols if c in r}
+            if 'project_id' in vals:
+                vals['project_id'] = pid if r.get('project_id') is not None else None
+            use = list(vals)
+            ph = ','.join('?' for _ in use)
+            # OR IGNORE: a call attributed to a shared window can appear in more
+            # than one project's archive; skip the duplicate rather than 409.
+            cur = conn.execute(
+                f'INSERT OR IGNORE INTO scw_deployment_calls '
+                f'({",".join(chr(34)+c+chr(34) for c in use)}) '
+                f'VALUES ({ph})', [vals[c] for c in use])
+            if cur.rowcount == 0:
+                ignored_calls += 1
+        if skipped_calls:
+            _log.warning('restore: skipped %d scw_deployment_call(s) whose shared '
+                         'deployment is not present on this instance', skipped_calls)
+        if ignored_calls:
+            _log.info('restore: skipped %d scw_deployment_call row(s) already '
+                      'present (shared across projects)', ignored_calls)
+
+        _insert_rows('scw_session_costs', (manifest.get('scw_session_costs') or []))
+
+        conn.commit()
+        # The commit is the last fallible step that matters. Everything after it
+        # must NOT raise: agent_archive.restore_archive sets `central_committed`
+        # only once this function returns, so an exception here would make the
+        # caller rmtree the folder while the rows are already durable — orphaning
+        # committed rows and burning globally-unique ids. The read-back is only a
+        # convenience (the caller mostly uses id/path), so fall back to the values
+        # we just inserted.
+        try:
+            row = conn.execute('SELECT * FROM projects WHERE id=?', (pid,)).fetchone()
+            return dict(row) if row else dict(proj_vals)
+        except Exception as e:
+            _log.warning('restore: project row read-back failed after commit: %s', e)
+            return dict(proj_vals)
+    except sqlite3.IntegrityError as e:
+        # A unique/PK/FK violation here means an id was taken between the
+        # up-front collision pre-check and this write (a race). Surface it as a
+        # conflict, not a 500, so the caller's 409 contract holds.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise ArchiveConflictError(
+            'an id from the archive was taken while restoring — restore refused '
+            f'({e})')
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
 def _budget_period_key(reset_day, now=None):
     now = now or datetime.now(timezone.utc)
     day = max(1, min(28, int(reset_day or 1)))
