@@ -216,6 +216,244 @@ class ClassifyDeployErrorTests(unittest.TestCase):
         self.assertEqual(kind, 'conflict')
 
 
+class ClassifyImportErrorTests(unittest.TestCase):
+    def _classify(self, code, body):
+        return agent_scw_deploy._classify_import_error(code, body)
+
+    def test_hf_url_normalisation(self):
+        self.assertEqual(agent_scw_deploy._hf_url('org/repo'),
+                         'https://huggingface.co/org/repo')
+        self.assertEqual(agent_scw_deploy._hf_url('https://huggingface.co/org/repo/'),
+                         'https://huggingface.co/org/repo')
+
+    def test_gguf_repo_surfaces_help_message(self):
+        # Live verify-model rejection for a GGUF-only repo (HTTP 412).
+        body = ('{"help_message":"the model with ID \'x/y-GGUF\' is not supported. '
+                'Maximum model context length (\'max_position_embeddings\') is not '
+                'available in model config.json file.","precondition":"resource_not_usable"}')
+        kind, msg = self._classify(412, body)
+        self.assertEqual(kind, 'unsupported_format')
+        self.assertIn('not supported', msg)
+
+    def test_missing_repo_needs_token(self):
+        body = ('{"help_message":"Repository org/nope does not exist or you do not '
+                'have enough permissions to access it."}')
+        kind, msg = self._classify(412, body)
+        self.assertEqual(kind, 'access')
+        self.assertIn('HF_TOKEN', msg)
+
+    def test_auth(self):
+        kind, _ = self._classify(403, 'forbidden')
+        self.assertEqual(kind, 'auth')
+
+    def test_conflict(self):
+        kind, msg = self._classify(409, 'already exists')
+        self.assertEqual(kind, 'conflict')
+        self.assertIn('already exists', msg)
+
+    def test_tokenizer_rejection(self):
+        kind, msg = self._classify(400, 'missing tokenizers for this model')
+        self.assertEqual(kind, 'unsupported_format')
+        self.assertIn('Transformers', msg)
+
+    def test_fallback_none_body(self):
+        kind, msg = self._classify(500, None)
+        self.assertEqual(kind, 'error')
+        self.assertIn('HTTP 500', msg)
+
+
+class VerifyHfModelTests(unittest.TestCase):
+    def _verify(self, payload):
+        with patch.object(agent_scw_deploy, '_SCW_SECRET_KEY', 'k'), \
+             patch.object(agent_scw_deploy, '_scw_post', return_value=payload) as post:
+            result = agent_scw_deploy.verify_hf_model('org/repo')
+        return result, post
+
+    def test_success_builds_nodes_and_quantizations(self):
+        payload = {
+            'nodes': [
+                {'node_type_name': 'L4', 'quantizations': [
+                    {'quantization_bits': 16, 'allowed': True, 'max_context_size': 40960}]},
+                {'node_type_name': 'H100-SXM-2', 'quantizations': [
+                    {'quantization_bits': 16, 'allowed': True, 'max_context_size': 40960},
+                    {'quantization_bits': 8, 'allowed': False, 'max_context_size': 0}]},
+            ],
+            'size_bytes': 4522815806,
+        }
+        result, post = self._verify(payload)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['nodes'], ['L4', 'H100-SXM-2'])
+        self.assertEqual(result['quantizations'], {'L4': [16], 'H100-SXM-2': [16]})
+        self.assertEqual(result['max_context_size'], 40960)
+        self.assertEqual(result['size_bytes'], 4522815806)
+        # URL passed to Scaleway is the canonical HF model page.
+        self.assertEqual(post.call_args[0][1]['source']['url'],
+                         'https://huggingface.co/org/repo')
+
+    def test_http_error_maps_to_friendly(self):
+        import urllib.error
+        err = urllib.error.HTTPError(
+            'u', 412, 'precondition', {}, None)
+        err.read = lambda: b'{"help_message":"Maximum model context length is not available"}'
+        with patch.object(agent_scw_deploy, '_SCW_SECRET_KEY', 'k'), \
+             patch.object(agent_scw_deploy, '_scw_post', side_effect=err):
+            result = agent_scw_deploy.verify_hf_model('org/gguf')
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['error_code'], 'unsupported_format')
+
+    def test_missing_key(self):
+        with patch.object(agent_scw_deploy, '_SCW_SECRET_KEY', ''):
+            result = agent_scw_deploy.verify_hf_model('org/repo')
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['error_code'], 'auth')
+
+
+class ImportHfModelTests(unittest.TestCase):
+    def test_uses_env_token_when_not_passed(self):
+        with patch.object(agent_scw_deploy, '_SCW_SECRET_KEY', 'k'), \
+             patch.object(agent_scw_deploy, '_HF_TOKEN', 'hf_secret'), \
+             patch.object(agent_scw_deploy, '_scw_post',
+                          return_value={'id': 'm1', 'status': 'preparing'}) as post:
+            model = agent_scw_deploy.import_hf_model('name1', 'org/repo', project_id='p1')
+        self.assertEqual(model['id'], 'm1')
+        body = post.call_args[0][1]
+        self.assertEqual(body['name'], 'name1')
+        self.assertEqual(body['project_id'], 'p1')
+        self.assertEqual(body['source']['secret'], 'hf_secret')
+
+    def test_public_repo_omits_secret(self):
+        with patch.object(agent_scw_deploy, '_SCW_SECRET_KEY', 'k'), \
+             patch.object(agent_scw_deploy, '_HF_TOKEN', ''), \
+             patch.object(agent_scw_deploy, '_scw_post',
+                          return_value={'id': 'm1', 'status': 'ready'}) as post:
+            agent_scw_deploy.import_hf_model('name1', 'org/repo')
+        self.assertNotIn('secret', post.call_args[0][1]['source'])
+
+    def test_rejection_raises_scw_import_error(self):
+        import urllib.error
+        err = urllib.error.HTTPError('u', 409, 'conflict', {}, None)
+        err.read = lambda: b'{"message":"already exists"}'
+        with patch.object(agent_scw_deploy, '_SCW_SECRET_KEY', 'k'), \
+             patch.object(agent_scw_deploy, '_HF_TOKEN', ''), \
+             patch.object(agent_scw_deploy, '_scw_post', side_effect=err):
+            with self.assertRaises(agent_scw_deploy.ScwImportError) as cm:
+                agent_scw_deploy.import_hf_model('name1', 'org/repo')
+        self.assertEqual(cm.exception.kind, 'conflict')
+
+
+class WaitModelReadyTests(unittest.TestCase):
+    def test_ready_returns_model(self):
+        with patch.object(agent_scw_deploy, '_scw_get', return_value={'status': 'ready'}):
+            out = agent_scw_deploy.wait_model_ready('m1', timeout=5)
+        self.assertEqual(out['status'], 'ready')
+
+    def test_error_returns_model_with_message(self):
+        with patch.object(agent_scw_deploy, '_scw_get',
+                          return_value={'status': 'error', 'error_message': 'boom'}):
+            out = agent_scw_deploy.wait_model_ready('m1', timeout=5)
+        self.assertEqual(out['status'], 'error')
+        self.assertEqual(out['error_message'], 'boom')
+
+
+class ModelImportDbTests(unittest.TestCase):
+    def setUp(self):
+        import os
+        import tempfile
+        import agent_db
+        self.agent_db = agent_db
+        self._tmp = tempfile.mkdtemp()
+        self._orig = agent_db.DB_PATH
+        agent_db.DB_PATH = os.path.join(self._tmp, 'aingel.db')
+        agent_db.init_db()
+
+    def tearDown(self):
+        self.agent_db.DB_PATH = self._orig
+        import shutil as _sh
+        _sh.rmtree(self._tmp, ignore_errors=True)
+
+    def test_import_row_lifecycle(self):
+        db = self.agent_db
+        iid = db.add_model_import(None, 'org/repo', 'm', scw_model_id='uuid1',
+                                  status='preparing')
+        rows = db.get_model_imports()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['repo_id'], 'org/repo')
+        self.assertEqual(rows[0]['status'], 'preparing')
+
+        db.update_model_import(iid, status='ready')
+        row = db.get_model_imports(scw_model_id='uuid1')[0]
+        self.assertEqual(row['status'], 'ready')
+        self.assertIsNone(row['error_message'])
+        self.assertEqual(db.get_model_import(iid)['id'], iid)
+
+        db.remove_model_import(iid)
+        self.assertEqual(db.get_model_imports(), [])
+
+    def test_error_message_can_be_cleared_to_null(self):
+        db = self.agent_db
+        iid = db.add_model_import(None, 'org/r', 'm', scw_model_id='u', status='error')
+        db.update_model_import(iid, error_message='boom')
+        self.assertEqual(db.get_model_import(iid)['error_message'], 'boom')
+        # Explicit None must clear the column (previously impossible).
+        db.update_model_import(iid, error_message=None)
+        self.assertIsNone(db.get_model_import(iid)['error_message'])
+
+    def test_update_without_fields_is_noop(self):
+        db = self.agent_db
+        iid = db.add_model_import(None, 'org/r', 'm', scw_model_id='u')
+        db.update_model_import(iid)  # must not raise
+        self.assertEqual(db.get_model_import(iid)['status'], 'preparing')
+
+    def test_find_active_model_import_prefers_ready(self):
+        db = self.agent_db
+        db.add_model_import(None, 'org/r', 'm1', scw_model_id='u1', status='ready')
+        self.assertEqual(db.find_active_model_import('org/r')['scw_model_id'], 'u1')
+        # A failed import is not reusable.
+        db.add_model_import(None, 'org/f', 'm', scw_model_id='u2', status='failed')
+        self.assertIsNone(db.find_active_model_import('org/f'))
+
+    def test_find_active_skips_newer_failed_row(self):
+        # A newer FAILED row must be skipped in favour of an older usable row.
+        db = self.agent_db
+        db.add_model_import(None, 'org/r', 'old', scw_model_id='u-old', status='preparing')
+        db.add_model_import(None, 'org/r', 'new', scw_model_id='u-fail', status='failed')
+        found = db.find_active_model_import('org/r')
+        self.assertEqual(found['scw_model_id'], 'u-old')
+        # A newer READY row wins over an older one.
+        db.add_model_import(None, 'org/r', 'newest', scw_model_id='u-ready', status='ready')
+        self.assertEqual(db.find_active_model_import('org/r')['scw_model_id'], 'u-ready')
+
+    def test_find_latest_model_import_returns_failed(self):
+        db = self.agent_db
+        db.add_model_import(None, 'org/r', 'm1', scw_model_id='u1', status='ready')
+        db.add_model_import(None, 'org/r', 'm2', scw_model_id='u2', status='failed')
+        latest = db.find_latest_model_import('org/r')
+        self.assertEqual(latest['model_name'], 'm2')
+        self.assertEqual(latest['status'], 'failed')
+        self.assertIsNone(db.find_latest_model_import('org/absent'))
+
+    def test_ensure_model_import_backfills_once(self):
+        db = self.agent_db
+        rid = db.ensure_model_import(None, 'org/x', 'lib-name',
+                                     'uuid-x', 'ready', size_bytes=123)
+        self.assertIsNotNone(rid)
+        row = db.find_latest_model_import('org/x')
+        self.assertEqual(row['model_name'], 'lib-name')
+        self.assertEqual(row['scw_model_id'], 'uuid-x')
+        # Second call is a no-op when a row already exists.
+        self.assertIsNone(db.ensure_model_import(None, 'org/x', 'other', 'uuid-y', 'ready'))
+
+    def test_delete_project_clears_imports(self):
+        db = self.agent_db
+        db.upsert_project('tmp-proj', 'tmp-proj', '/tmp/tmp-proj')
+        conn = db.get_db()
+        pid = conn.execute("SELECT id FROM projects WHERE slug='tmp-proj'").fetchone()['id']
+        conn.close()
+        db.add_model_import(pid, 'org/r', 'm', scw_model_id='u', status='ready')
+        db.delete_project(pid)  # must not raise FK constraint failure
+        self.assertEqual(db.get_model_imports(project_id=pid), [])
+
+
 class RecommendedNodeForOptionsTests(unittest.TestCase):
     def _recommend(self, options):
         import agent_api
@@ -231,7 +469,7 @@ class RecommendedNodeForOptionsTests(unittest.TestCase):
     def test_cheapest_in_stock_wins_over_cheaper_out_of_stock(self):
         options = [{'node_types': ['L4', 'H100'],
                     'stock_status': {'L4': 'out_of_stock', 'H100': 'available'}}]
-        self.assertEqual(self._recommend(options), ('H100', 4.50))
+        self.assertEqual(self._recommend(options), ('H100', 3.40))
 
     def test_falls_back_to_cheapest_when_none_in_stock(self):
         options = [{'node_types': ['L4', 'H100'],
@@ -247,7 +485,7 @@ class RecommendedNodeForOptionsTests(unittest.TestCase):
 
     def test_missing_stock_status_falls_back_to_cheapest(self):
         options = [{'node_types': ['H100']}]
-        self.assertEqual(self._recommend(options), ('H100', 4.50))
+        self.assertEqual(self._recommend(options), ('H100', 3.40))
 
     def test_unknown_node_type_uses_default_rate(self):
         options = [{'node_types': ['WAT'], 'stock_status': {'WAT': 'available'}}]

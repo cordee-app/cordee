@@ -832,6 +832,23 @@ def init_db():
             usd         REAL DEFAULT 0.0,
             UNIQUE(project_id, day, category)
         );
+        -- Hugging Face → Scaleway custom model imports (Generative APIs beta).
+        -- One row per import attempt; scw_model_id is the library UUID used to
+        -- poll status and delete the model when it is no longer needed. status
+        -- mirrors Scaleway (preparing|downloading|ready|error) plus 'failed'
+        -- when the client gave up polling.
+        CREATE TABLE IF NOT EXISTS scw_model_imports (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id     INTEGER REFERENCES projects(id),
+            repo_id        TEXT NOT NULL,
+            model_name     TEXT NOT NULL,
+            scw_model_id   TEXT,
+            status         TEXT DEFAULT 'preparing',
+            error_message  TEXT,
+            size_bytes     INTEGER,
+            created_at     TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at     TEXT DEFAULT CURRENT_TIMESTAMP
+        );
         -- Per-project roster of Hugging Face models adopted for this project
         -- (Phase: Hugging Face Scout). model_id is the resolvable provider id
         -- (e.g. scw-qwen3.6-35b) or '' when the model needs self-hosting.
@@ -856,6 +873,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_exec_reg        ON exec_registry(project_id);
         CREATE INDEX IF NOT EXISTS idx_chat_reg        ON chat_registry(project_id);
         CREATE INDEX IF NOT EXISTS idx_scw_deployments_project ON scw_deployments(project_id);
+        CREATE INDEX IF NOT EXISTS idx_scw_model_imports_project ON scw_model_imports(project_id);
         CREATE INDEX IF NOT EXISTS idx_project_hf_models_project ON project_hf_models(project_id);
         CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(path);
         -- Multi-tenancy (Phase 1): users, memberships, quotas, bootstrap sentinel.
@@ -1842,14 +1860,19 @@ def get_all_hf_models():
 def add_project_hf_model(project_id, repo_id, model_id='', label='',
                          provider='', validation_score=0.0):
     """Insert or refresh a roster entry. `model_id` is the resolvable provider
-    id, or '' when the model needs self-hosting (no serving path yet)."""
+    id, or '' when the model needs self-hosting (no serving path yet). An empty
+    incoming `model_id` never clobbers an existing non-empty one (e.g. a repo
+    already adopted with a serverless mapping must keep it when an import
+    re-registers the roster row)."""
     conn = get_db()
     conn.execute(
         'INSERT INTO project_hf_models '
         '(project_id, repo_id, model_id, label, provider, validation_score) '
         'VALUES (?,?,?,?,?,?) '
         'ON CONFLICT(project_id, repo_id) DO UPDATE SET '
-        'model_id=excluded.model_id, label=excluded.label, provider=excluded.provider, '
+        "model_id=CASE WHEN excluded.model_id='' THEN project_hf_models.model_id "
+        'ELSE excluded.model_id END, '
+        'label=excluded.label, provider=excluded.provider, '
         'validation_score=excluded.validation_score',
         (project_id, repo_id, model_id or '', label or '', provider or '',
          float(validation_score or 0.0)))
@@ -1892,6 +1915,120 @@ def get_deployment_calls(deployment_id):
         (deployment_id,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def add_model_import(project_id, repo_id, model_name, scw_model_id=None,
+                     status='preparing', size_bytes=None):
+    """Insert a custom-model import row and return its DB id."""
+    conn = get_db()
+    cur = conn.execute(
+        'INSERT INTO scw_model_imports '
+        '(project_id, repo_id, model_name, scw_model_id, status, size_bytes) '
+        'VALUES (?,?,?,?,?,?)',
+        (project_id, repo_id, model_name, scw_model_id, status, size_bytes))
+    conn.commit()
+    db_id = cur.lastrowid
+    conn.close()
+    return db_id
+
+
+_UNSET = object()
+
+
+def update_model_import(import_id, status=_UNSET, error_message=_UNSET,
+                        scw_model_id=_UNSET):
+    """Update an import row by DB id. Pass a field to change it; the sentinel
+    distinguishes "leave alone" from an explicit ``None`` (which clears the
+    column) — needed because ``_poll`` resets ``error_message`` to NULL on a
+    successful import after a previous failure."""
+    sets, vals = [], []
+    for col, val in (('status', status), ('error_message', error_message),
+                     ('scw_model_id', scw_model_id)):
+        if val is not _UNSET:
+            sets.append(f'{col}=?')
+            vals.append(val)
+    if not sets:
+        return
+    sets.append('updated_at=CURRENT_TIMESTAMP')
+    vals.append(import_id)
+    conn = get_db()
+    conn.execute(f'UPDATE scw_model_imports SET {", ".join(sets)} WHERE id=?', vals)
+    conn.commit()
+    conn.close()
+
+
+def get_model_imports(project_id=None, scw_model_id=None):
+    conn = get_db()
+    if scw_model_id:
+        rows = conn.execute('SELECT * FROM scw_model_imports WHERE scw_model_id=? '
+                            'ORDER BY id DESC', (scw_model_id,)).fetchall()
+    elif project_id is not None:
+        rows = conn.execute('SELECT * FROM scw_model_imports WHERE project_id=? '
+                            'ORDER BY id DESC', (project_id,)).fetchall()
+    else:
+        rows = conn.execute('SELECT * FROM scw_model_imports ORDER BY id DESC').fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_model_import(import_id):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM scw_model_imports WHERE id=?',
+                       (import_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def find_active_model_import(repo_id):
+    """Newest import row for `repo_id` that is still usable (has a Scaleway model
+    id and is in-flight or ready). Used to reuse an existing library model instead
+    of importing the same HF repo again and inflating quota."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM scw_model_imports WHERE repo_id=? AND scw_model_id IS NOT NULL "
+        "AND status IN ('preparing','downloading','ready') ORDER BY id DESC LIMIT 1",
+        (repo_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def find_latest_model_import(repo_id):
+    """Newest import row for `repo_id` regardless of status (for status display)."""
+    conn = get_db()
+    row = conn.execute(
+        'SELECT * FROM scw_model_imports WHERE repo_id=? ORDER BY id DESC LIMIT 1',
+        (repo_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def ensure_model_import(project_id, repo_id, model_name, scw_model_id, status,
+                        size_bytes=None, error_message=None):
+    """Backfill an import row only when the repo has none yet — used to reconcile
+    custom models imported out-of-band (Scaleway console, or before AIngel tracked
+    imports). Returns the new row id, or None when a row already existed."""
+    conn = get_db()
+    existing = conn.execute('SELECT id FROM scw_model_imports WHERE repo_id=? LIMIT 1',
+                            (repo_id,)).fetchone()
+    if existing:
+        conn.close()
+        return None
+    cur = conn.execute(
+        'INSERT INTO scw_model_imports '
+        '(project_id, repo_id, model_name, scw_model_id, status, error_message, size_bytes) '
+        'VALUES (?,?,?,?,?,?,?)',
+        (project_id, repo_id, model_name, scw_model_id, status, error_message, size_bytes))
+    conn.commit()
+    db_id = cur.lastrowid
+    conn.close()
+    return db_id
+
+
+def remove_model_import(import_id):
+    conn = get_db()
+    conn.execute('DELETE FROM scw_model_imports WHERE id=?', (import_id,))
+    conn.commit()
+    conn.close()
 
 
 def get_shared_windows():
@@ -1996,6 +2133,10 @@ def delete_project(project_id):
     )
     conn.execute('DELETE FROM scw_deployment_calls WHERE project_id=?', (project_id,))
     conn.execute('DELETE FROM scw_session_costs WHERE project_id=?', (project_id,))
+    # Custom-model import rows reference the project with an FK NO-ACTION, so
+    # they must be cleared before the projects row (the remote Scaleway library
+    # model they point at is intentionally left alone — it may still be deployed).
+    conn.execute('DELETE FROM scw_model_imports WHERE project_id=?', (project_id,))
     # scw_deployments rows owned by this project (non-shared windows). Shared
     # windows (is_shared=1) are left alone — they belong to no single project.
     conn.execute('DELETE FROM scw_deployments WHERE project_id=? AND is_shared=0', (project_id,))

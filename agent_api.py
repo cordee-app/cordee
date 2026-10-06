@@ -2613,10 +2613,15 @@ def _hf_queue_group(allowed_ids=None):
     """Group cross-project HF-assigned tasks by their adopted repo, annotating
     each group with its resolved serving model and servability. When
     `allowed_ids` is set (Phase 3C scoping for non-admins), only tasks in
-    those projects are included and empty groups are dropped."""
+    those projects are included and empty groups are dropped.
+
+    Groups also carry custom-model import info (single batched query): a
+    ``ready`` import makes the group servable even without a serverless
+    provider mapping (deployable via a GPU window)."""
     tasks = db.hf_queue_tasks()
     if allowed_ids is not None:
         tasks = [t for t in tasks if t.get('project_id') in allowed_ids]
+    imports = _import_map()
     groups = {}
     for t in tasks:
         repo_id = t.get('hf_repo_id') or ''
@@ -2627,12 +2632,19 @@ def _hf_queue_group(allowed_ids=None):
             'label': repo_id,
             'provider_mapping': '',
             'servable': False,
+            'import_status': None,
+            'import_model_name': None,
+            'import_ready': False,
             'tasks': [],
         })
         entry = hf_catalog.catalog_entry(repo_id) or {}
         g['label'] = entry.get('label') or repo_id
         g['provider_mapping'] = (entry.get('provider_mapping') or '').strip()
-        g['servable'] = bool(g['provider_mapping'])
+        imp = imports.get(repo_id) or {}
+        g['import_status'] = imp.get('status')
+        g['import_model_name'] = imp.get('model_name')
+        g['import_ready'] = (imp.get('status') == 'ready')
+        g['servable'] = bool(g['provider_mapping']) or g['import_ready']
         g['tasks'].append({
             'id': t['id'],
             'title': t.get('title') or '',
@@ -2698,6 +2710,9 @@ def list_gpu_window_models():
     for HF models only: serverless scw-* models need no GPU."""
     try:
         deployable = agent_scw_deploy.list_models(region='fr-par')
+        # Reconcile any out-of-band custom models (console imports) so the picker
+        # and statuses reflect them without a manual re-import.
+        _sync_library_imports(deployable)
         # Phase 3C: the task queue feeding this catalog is membership-scoped
         # for non-admins (same as /api/hf-queue); node catalog stays global.
         allowed_ids = None
@@ -2726,12 +2741,19 @@ def list_gpu_window_models():
                     if fam_key and fam_key in name:
                         options.append(m)
             else:
-                # No catalogue mapping → a fine-tune awaiting self-hosting. Offer
-                # any custom model already imported into Scaleway whose name
-                # matches the HF repo, so it can be deployed on a GPU window
-                # instead of staying stuck at `awaiting_model=1`.
+                # No catalogue mapping → a fine-tune awaiting self-hosting. Prefer
+                # the exact Scaleway model imported for this repo (by name in
+                # scw_model_imports); fall back to the name-token heuristic for
+                # models imported out-of-band via the Scaleway console.
+                imported = db.find_active_model_import(grp['repo_id']) or {}
+                imported_name = (imported.get('model_name') or '').lower()
                 for m in deployable:
-                    if m.get('custom') and _custom_model_matches(grp['repo_id'], m):
+                    if not m.get('custom'):
+                        continue
+                    name = (m.get('name') or '').lower()
+                    if imported_name and name == imported_name:
+                        options.insert(0, m)
+                    elif _custom_model_matches(grp['repo_id'], m):
                         options.append(m)
             est_node = _node_for_params(params_b)
             est_eur = agent_scw_deploy._hourly_rate(est_node)
@@ -2846,6 +2868,225 @@ def open_gpu_window():
         return jsonify({'ok': True, 'deployment': dict(row) if row else None})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# ── Custom model import (Hugging Face → Scaleway model library, beta) ────────
+
+def _model_name_for_repo(repo_id):
+    """Derive a unique-ish Scaleway model name from a HF repo id. Scaleway only
+    allows alphanumerics, dots, spaces and dashes, and the name must be unique
+    within the Organization/Project."""
+    import re
+    import uuid
+    base = (repo_id or '').strip().rstrip('/').rsplit('/', 1)[-1]
+    base = re.sub(r'[^A-Za-z0-9.\- ]+', '-', base).strip('- ')
+    if not base:
+        base = 'hf-model'
+    suffix = uuid.uuid4().hex[:6]
+    return f'{base[:48]}-{suffix}'
+
+
+@app.route('/api/hf-models/verify', methods=['POST'])
+@require_auth
+def hf_model_verify():
+    """Authoritative pre-flight for an HF repo via Scaleway's verify-model
+    endpoint. Creates nothing; returns allowed nodes/quantizations/size or a
+    friendly rejection (e.g. GGUF/tokenizer-less repos)."""
+    data = request.get_json(silent=True) or {}
+    repo_id = (data.get('repo_id') or '').strip()
+    if not repo_id:
+        return jsonify({'error': 'repo_id is required'}), 400
+    try:
+        result = agent_scw_deploy.verify_hf_model(repo_id)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e), 'error_code': 'error'}), 502
+    status = 200 if result.get('ok') else 422
+    return jsonify(result), status
+
+
+@app.route('/api/projects/<int:pid>/hf-models/import', methods=['POST'])
+@require_project_access('owner')
+def hf_model_import(pid):
+    """Import an HF repo into the Scaleway model library, initiated from a project.
+
+    The Scaleway library model is Organization-global, so once imported any
+    project can deploy it; but the import is always attributed to the project it
+    was started from, and on success the repo is added to that project's roster —
+    which makes it visible (cross-project) in every task form. Import is free;
+    billing starts only on deployment."""
+    data = request.get_json(silent=True) or {}
+    repo_id = (data.get('repo_id') or '').strip()
+    if not repo_id:
+        return jsonify({'error': 'repo_id is required'}), 400
+    model_name = (data.get('model_name') or '').strip() or _model_name_for_repo(repo_id)
+
+    # Reuse an already-imported/in-flight model for this repo instead of pulling
+    # the same weights again (each import creates a new Scaleway library model).
+    if not data.get('model_name'):
+        existing = db.find_active_model_import(repo_id)
+        if existing:
+            # Register synchronously without the HF metadata lookup (no network on
+            # the request thread); the ready-path poll enriches the row later.
+            _register_import_roster(pid, repo_id, fetch_meta=False)
+            # If the row is still in-flight (e.g. the original poller died in a
+            # server restart), resume polling so it can't stay stuck forever.
+            if (existing.get('scw_model_id')
+                    and existing.get('status') in ('preparing', 'downloading')):
+                _launch_import_poll(existing['id'], existing['scw_model_id'], pid, repo_id)
+            return jsonify({'ok': True, 'import': existing,
+                            'model_id': existing.get('scw_model_id'),
+                            'status': existing.get('status'), 'reused': True})
+
+    try:
+        model = agent_scw_deploy.import_hf_model(
+            name=model_name, repo_id=repo_id, project_id=data.get('scw_project_id'))
+    except agent_scw_deploy.ScwImportError as e:
+        return jsonify({'error': e.friendly, 'error_code': e.kind}), 422
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    scw_model_id = model.get('id') or ''
+    status = model.get('status') or 'preparing'
+    import_id = db.add_model_import(
+        pid, repo_id, model_name, scw_model_id=scw_model_id, status=status,
+        size_bytes=model.get('size_bytes'))
+    # Adopt immediately so the project roster shows the in-flight status chip
+    # (preparing/downloading) rather than only appearing once ready.
+    _register_import_roster(pid, repo_id, fetch_meta=False)
+
+    if scw_model_id:
+        _launch_import_poll(import_id, scw_model_id, pid, repo_id)
+    else:
+        # Scaleway returned no model id — nothing to poll, and a 1-hour poll of an
+        # empty id would only 404. Record it as failed immediately.
+        db.update_model_import(import_id, status='failed',
+                               error_message='Scaleway did not return a model id.')
+
+    row = db.get_model_import(import_id)
+    return jsonify({'ok': True, 'import': row, 'model_id': scw_model_id,
+                    'status': status})
+
+
+# In-flight import pollers, keyed by scw_model_id, so a second Import click on a
+# still-downloading model reuses the running poller instead of spawning a rival
+# thread (which could time out and flip the row to 'failed' early).
+_IMPORT_POLLS = {}
+_IMPORT_POLLS_LOCK = threading.Lock()
+
+# Throttle for _sync_library_imports when it must fetch the Scaleway library
+# itself (the None path, hit on every roster/adopted request). A provided payload
+# bypasses the throttle. In-flight status is also advanced directly by the poller.
+_SYNC_LAST = {'ts': 0.0}
+_SYNC_LOCK = threading.Lock()
+_SYNC_MIN_INTERVAL = 60.0
+
+
+def _launch_import_poll(import_id, scw_model_id, project_id, repo_id):
+    """Start a daemon thread polling a Scaleway model until ready, then update the
+    import row and enrich the roster. Deduplicated per ``scw_model_id`` so the
+    reuse path can't spawn a second poller. Wrapped so an unexpected error marks
+    the row failed instead of silently killing the thread and stranding it."""
+    if not scw_model_id:
+        return
+    with _IMPORT_POLLS_LOCK:
+        existing = _IMPORT_POLLS.get(scw_model_id)
+        if existing is not None and existing.is_alive():
+            return
+
+    def _poll():
+        try:
+            ready = agent_scw_deploy.wait_model_ready(scw_model_id)
+            if not ready:
+                db.update_model_import(import_id, status='failed',
+                                       error_message='Import did not complete in time '
+                                                     '(model may still be downloading).')
+                return
+            final = ready.get('status') or 'error'
+            db.update_model_import(
+                import_id, status=final,
+                error_message=(ready.get('error_message') or None) if final == 'error' else None)
+            if final == 'ready':
+                _register_import_roster(project_id, repo_id, fetch_meta=True)
+        except Exception as e:
+            app.logger.warning('import poll for %s failed: %s', scw_model_id, e)
+            try:
+                db.update_model_import(import_id, status='failed',
+                                       error_message=f'Import tracking error: {e}')
+            except Exception:
+                pass
+        finally:
+            with _IMPORT_POLLS_LOCK:
+                if _IMPORT_POLLS.get(scw_model_id) is threading.current_thread():
+                    _IMPORT_POLLS.pop(scw_model_id, None)
+
+    t = threading.Thread(target=_poll, daemon=True)
+    with _IMPORT_POLLS_LOCK:
+        _IMPORT_POLLS[scw_model_id] = t
+    t.start()
+
+
+def _register_import_roster(project_id, repo_id, fetch_meta=True):
+    """Adopt an imported repo into a project's roster so the task-form HF picker
+    (which reads the global roster cross-project) lists it. Best-effort: the
+    Scaleway library model already exists regardless of roster state, so a failed
+    Hugging Face metadata lookup must not prevent the roster row. ``fetch_meta``
+    is False on request-thread paths to avoid a blocking HF API call."""
+    label = repo_id
+    score = 0.0
+    if fetch_meta:
+        try:
+            entry = hf_catalog.catalog_entry(repo_id)
+            if entry is None:
+                entry = hf_catalog.register_model(
+                    repo_id, hf_catalog._normalize(hf_catalog.get_model_card(repo_id)))
+            label = entry.get('label') or repo_id
+            score = float((entry.get('validation') or {}).get('score') or 0.0)
+        except Exception as e:
+            app.logger.warning('import roster metadata lookup failed for %s: %s', repo_id, e)
+    try:
+        db.add_project_hf_model(project_id, repo_id, model_id='', label=label,
+                                provider='scaleway-deployment', validation_score=score)
+    except Exception as e:
+        app.logger.warning('register import roster failed for %s: %s', repo_id, e)
+
+
+@app.route('/api/hf-models/imports', methods=['GET'])
+@require_auth
+def hf_model_imports():
+    """List custom-model import attempts (membership-scoped for non-admins)."""
+    try:
+        project_id = request.args.get('project_id', type=int)
+        if project_id and not db.get_project(project_id):
+            return jsonify({'error': f'project {project_id} not found'}), 404
+        rows = db.get_model_imports(project_id=project_id)
+        if auth_enabled():
+            allowed = get_user_project_ids(g.current_user)
+            if allowed is not None:
+                # A specific non-member project_id → 404 (anti-enumeration);
+                # otherwise filter rows to the caller's member projects. Rows
+                # with project_id NULL (org-wide imports) are admin-only.
+                if project_id is not None and project_id not in allowed:
+                    return jsonify({'error': 'not_found'}), 404
+                rows = [r for r in rows if r.get('project_id') in allowed]
+        return jsonify({'imports': rows})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/hf-models/imports/<int:import_id>', methods=['DELETE'])
+@require_admin
+def hf_model_import_delete(import_id):
+    """Delete an imported model from the Scaleway library (stops it counting
+    toward quota) and drop the local import row."""
+    row = db.get_model_import(import_id)
+    if not row:
+        return jsonify({'error': f'import {import_id} not found'}), 404
+    if row.get('scw_model_id'):
+        result = agent_scw_deploy.delete_model(row['scw_model_id'])
+        if not result.get('ok'):
+            return jsonify({'error': result.get('error', 'delete_model failed')}), 500
+    db.remove_model_import(import_id)
+    return jsonify({'ok': True})
 
 
 # In-memory progress for GPU-window runs, keyed by deployment DB id. Each entry
@@ -3938,7 +4179,7 @@ def _hf_eu_servable(provider_mapping):
             or m.startswith('codestral-') or m.startswith('devstral-'))
 
 
-def _hf_candidate(repo_row):
+def _hf_candidate(repo_row, imports_map=None):
     """Build a Counselor HF candidate from a roster row + its catalogue entry.
 
     `repo_row` is a row from project_hf_models; `entry` is the matching
@@ -3955,6 +4196,7 @@ def _hf_candidate(repo_row):
     eff = dict(entry)
     eff['provider_mapping'] = mapping
     servable = hf_catalog.candidate_servable(eff)
+    imp = (imports_map or {}).get(repo_id) or {}
     return {
         'repo_id': repo_id,
         'label': repo_row.get('label') or entry.get('label') or repo_id,
@@ -3967,9 +4209,114 @@ def _hf_candidate(repo_row):
         'task_model': bool(validation.get('task_model')) if 'task_model' in validation
                       else hf_catalog._task_model(eff),
         'servable': servable,
+        'import_status': imp.get('status'),
+        'import_model_name': imp.get('model_name'),
+        'import_error': imp.get('error_message'),
+        'import_ready': imp.get('status') == 'ready',
         'limitations': hf_catalog.limitations_for(eff),
         'hf_url': f'https://huggingface.co/{repo_id}',
     }
+
+
+def _import_map():
+    """{repo_id: latest import row} for annotating roster candidates without a
+    query per row. Rows come newest-first, so the first wins."""
+    out = {}
+    try:
+        for r in db.get_model_imports():
+            out.setdefault(r['repo_id'], r)
+    except Exception:
+        pass
+    return out
+
+
+def _sync_library_imports(deployable=None):
+    """Reconcile custom models present in the Scaleway library but missing from
+    ``scw_model_imports`` (imported via the console, or before AIngel tracked
+    imports). For every repo referenced by an adopted roster or a queued HF task
+    with no import row, match a live custom model and backfill the row so chips,
+    the GPU-window picker and status all light up.
+
+    Best-effort and cheap: reuses the ``list_models`` payload the caller already
+    fetched. Returns the number of rows backfilled."""
+    try:
+        repos = {}  # repo_id -> project_id (first project that references it)
+        for r in db.get_all_hf_models():
+            repos.setdefault(r['repo_id'], r.get('project_id'))
+        for grp in _hf_queue_group():
+            repos.setdefault(grp['repo_id'], None)
+        rows = db.get_model_imports()
+        existing = {r['repo_id'] for r in rows}
+        pending = {repo: pid for repo, pid in repos.items()
+                   if repo and repo not in existing}
+        # Any tracked row warrants a (throttled) reconcile: ready rows confirm the
+        # model still exists, in-flight/error/failed rows may have advanced on
+        # Scaleway (resuming a restart-stalled import or a late-completed one).
+        needs_reconcile = any(r.get('scw_model_id') for r in rows)
+        if not pending and not needs_reconcile:
+            return 0
+        if deployable is None:
+            # Steady-state guard: a ready row is the normal resting state, so this
+            # path would otherwise hit Scaleway on every roster/adopted request.
+            # Throttle the self-fetch; callers that already fetched (the gpu-window
+            # picker) pass the payload and are never throttled.
+            now = time.time()
+            with _SYNC_LOCK:
+                if now - _SYNC_LAST['ts'] < _SYNC_MIN_INTERVAL:
+                    return 0
+                _SYNC_LAST['ts'] = now
+            deployable = agent_scw_deploy.list_models(region='fr-par')
+        customs = [m for m in (deployable or []) if m.get('custom')]
+        by_id = {m.get('id'): m for m in customs if m.get('id')}
+        # Reconcile rows against the live library:
+        #   * any row whose model is present → advance its status (ready/error),
+        #     healing in-flight rows stranded by a mid-import restart AND error/
+        #     failed rows whose Scaleway import later turned ready.
+        #   * ready/in-flight row whose model is gone → error ("re-import it").
+        for r in rows:
+            status = r.get('status')
+            mid = r.get('scw_model_id')
+            m = by_id.get(mid)
+            if m is not None:
+                live = m.get('status') or 'ready'
+                if live in ('ready', 'error') and live != status:
+                    db.update_model_import(
+                        r['id'], status=live,
+                        error_message=(m.get('error_message') or None) if live == 'error' else None)
+                continue
+            if status in ('ready', 'preparing', 'downloading'):
+                if agent_scw_deploy.model_exists(mid) is False:
+                    gone = ('Model disappeared from the Scaleway library — re-import it.'
+                            if status in ('preparing', 'downloading')
+                            else 'Model no longer exists in the Scaleway library — re-import it.')
+                    db.update_model_import(r['id'], status='error', error_message=gone)
+                    app.logger.info('reconcile: import row %s marked error (model gone)', r['id'])
+        if not pending or not customs:
+            return 0
+        added = 0
+        for repo_id, project_id in pending.items():
+            exact = None
+            tok = None
+            base = repo_id.rsplit('/', 1)[-1].lower().replace('_', '-')
+            for m in customs:
+                if not _custom_model_matches(repo_id, m):
+                    continue
+                tok = tok or m
+                if base and base in (m.get('name') or '').lower().replace('_', '-'):
+                    exact = exact or m
+            match = exact or tok
+            if not match:
+                continue
+            if db.ensure_model_import(
+                    project_id, repo_id, match.get('name'), match.get('id'),
+                    match.get('status') or 'ready', size_bytes=match.get('size_bytes')):
+                added += 1
+        if added:
+            app.logger.info('sync_library_imports backfilled %d import row(s)', added)
+        return added
+    except Exception as e:
+        app.logger.warning('sync_library_imports failed: %s', e)
+        return 0
 
 
 @app.route('/api/hf/search', methods=['GET'])
@@ -4001,7 +4348,8 @@ def hf_adopted():
     Phase 3C: deduped catalog rows carry no project attribution, so any
     logged-in user may read it — no membership filtering needed."""
     try:
-        cands = [_hf_candidate(r) for r in db.get_all_hf_models()]
+        _sync_library_imports()
+        cands = [_hf_candidate(r, _import_map()) for r in db.get_all_hf_models()]
         cands.sort(key=lambda c: (not c['servable'],
                                   -(c['validation'].get('score') or 0.0)))
         return jsonify({'models': cands})
@@ -4060,10 +4408,14 @@ def project_hf_models(pid):
     proj = db.get_project(pid)
     if not proj:
         return jsonify({'error': 'Project not found'}), 404
+    # Reconcile/backfill imports so console-imported models adopted in this project
+    # show their status here without waiting for another surface to run the sync.
+    _sync_library_imports()
     default_model = (proj.get('default_model') or '').strip()
+    imports_map = _import_map()
     roster = []
     for r in db.get_project_hf_models(pid):
-        cand = _hf_candidate(r)
+        cand = _hf_candidate(r, imports_map)
         roster.append({
             'repo_id': r['repo_id'],
             'model_id': r['model_id'],
@@ -4074,6 +4426,11 @@ def project_hf_models(pid):
             'limitations': cand['limitations'],
             'hf_url': cand['hf_url'],
             'is_default': bool(default_model and r['model_id'] == default_model),
+            'import_status': cand.get('import_status'),
+            'import_model_name': cand.get('import_model_name'),
+            'import_error': cand.get('import_error'),
+            'import_ready': cand.get('import_ready', False),
+            'import_id': (imports_map.get(r['repo_id']) or {}).get('id'),
         })
     return jsonify({'models': roster, 'default_model': default_model})
 

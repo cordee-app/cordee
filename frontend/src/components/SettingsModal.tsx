@@ -4,7 +4,7 @@ import { api } from '../api';
 import { cn } from '../utils/cn';
 import { SettingsUsersTab } from './SettingsUsersTab';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
-import type { Config, ProviderReadiness, ScwSessionStatus, ProjectHfModel, HfSearchResult } from '../types';
+import type { Config, ProviderReadiness, ScwSessionStatus, ProjectHfModel, HfSearchResult, HfImportVerify } from '../types';
 
 // Public source repository: the single place to change if the GitHub org changes.
 const SOURCE_URL = 'https://github.com/cordee-app/cordee';
@@ -62,6 +62,12 @@ export const SettingsModal = () => {
   const [hfSearching, setHfSearching] = useState(false);
   const [hfRoster, setHfRoster] = useState<ProjectHfModel[]>([]);
   const [hfBusy, setHfBusy] = useState(false);
+  // Import to Scaleway (beta): a project-initiated import whose result is an
+  // Organization-global library model any project can deploy.
+  const [importRepo, setImportRepo] = useState('');
+  const [importVerify, setImportVerify] = useState<HfImportVerify | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
 
   // The AIngel model choices were a hardcoded <option> list: it offered both
   // Claude models on EU-only projects (the backend refuses them on save, so the
@@ -248,6 +254,24 @@ export const SettingsModal = () => {
     if (showSettingsModal && tab === 'project' && activeProject) loadHfRoster();
   }, [showSettingsModal, tab, activeProject, loadHfRoster]);
 
+  // A repo staged for import must not carry across a project switch — imports are
+  // attributed to the project that initiated them.
+  useEffect(() => {
+    setImportRepo('');
+    setImportVerify(null);
+    setImportError(null);
+  }, [activeProject]);
+
+  // Poll while any roster model has an in-flight import so its status advances
+  // (preparing → downloading → ready) without the user reopening Settings.
+  useEffect(() => {
+    const inFlight = hfRoster.some((m) => m.import_status
+      && ['preparing', 'downloading'].includes(m.import_status));
+    if (!showSettingsModal || tab !== 'project' || !inFlight) return;
+    const i = setInterval(loadHfRoster, 15000);
+    return () => clearInterval(i);
+  }, [showSettingsModal, tab, hfRoster, loadHfRoster]);
+
   const handleHfSearch = async () => {
     const q = hfQuery.trim();
     if (!q) return;
@@ -286,6 +310,56 @@ export const SettingsModal = () => {
       alert('Error: ' + (e as Error).message);
     } finally {
       setHfBusy(false);
+    }
+  };
+
+  const handleImportVerify = async (repoId: string) => {
+    setImportError(null);
+    setImportVerify(null);
+    if (!repoId.trim()) return;
+    setImportBusy(true);
+    try {
+      const r = await api.hfModelImports.verify(repoId.trim());
+      setImportVerify(r);
+    } catch (e) {
+      // api.post throws on the 422 rejection; keep a failure state so Import
+      // stays disabled (the server would reject it anyway).
+      setImportVerify({ ok: false, error: (e as Error).message });
+      setImportError((e as Error).message);
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
+  const handleImport = async (repoId: string) => {
+    if (!activeProject) return;
+    setImportError(null);
+    setImportBusy(true);
+    try {
+      await api.hfModelImports.create(activeProject, { repo_id: repoId.trim() });
+      setImportRepo('');
+      setImportVerify(null);
+      await loadHfRoster();
+    } catch (e) {
+      setImportError((e as Error).message);
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
+  const handleImportDelete = async (importId: number) => {
+    if (!window.confirm(
+      'Delete this imported model from the Scaleway library? This frees quota and cannot be undone.\n\n'
+      + 'Any task (in any project) assigned to this model will show "awaiting self-host" '
+      + 'until it is re-imported.')) return;
+    setImportBusy(true);
+    try {
+      await api.hfModelImports.remove(importId);
+      await loadHfRoster();
+    } catch (e) {
+      alert('Error: ' + (e as Error).message);
+    } finally {
+      setImportBusy(false);
     }
   };
 
@@ -764,6 +838,7 @@ export const SettingsModal = () => {
                             {!ro && (
                               <>
                                 <button data-tip="Adopt this model for the project" className="btn py-0.5 px-2 border border-accent rounded cursor-pointer text-xs text-accent" onClick={() => handleHfAdopt(r.repo_id, false)} disabled={hfBusy}>Adopt</button>
+                                <button data-tip="Import into the Scaleway model library (usable by any project)" className="btn py-0.5 px-2 border border-default rounded cursor-pointer text-xs" onClick={() => { setImportRepo(r.repo_id); handleImportVerify(r.repo_id); }} disabled={importBusy}>Import</button>
                                 {r.validation.servable && (
                                   <button data-tip="Adopt and set as default model" className="btn py-0.5 px-2 border border-accent rounded cursor-pointer text-xs bg-accent text-white" onClick={() => handleHfAdopt(r.repo_id, true)} disabled={hfBusy}>Adopt + default</button>
                                 )}
@@ -772,6 +847,37 @@ export const SettingsModal = () => {
                           </div>
                         </div>
                       ))}
+                    </div>
+                  )}
+                  {importRepo && (
+                    <div className="mt-2 p-2.5 bg-surface-subtle rounded-md">
+                      <div className="text-xs text-text-soft mb-1">
+                        Import <span className="font-mono">{importRepo}</span> to the Scaleway model library
+                        <span className="text-text-faint"> — once ready, any project can deploy it on a GPU window.</span>
+                      </div>
+                      {importVerify?.ok && (
+                        <div className="text-xs text-status-running mb-1">
+                          Importable — nodes {importVerify.nodes?.join(', ') || '—'}
+                          {importVerify.max_context_size != null && ` · up to ${importVerify.max_context_size.toLocaleString()} ctx`}
+                          {importVerify.size_bytes != null && ` · ${(importVerify.size_bytes / 1e9).toFixed(1)} GB`}
+                        </div>
+                      )}
+                      {importError && (
+                        <div className="p-2 rounded text-xs bg-status-pending/20 text-status-pending mb-1">{importError}</div>
+                      )}
+                      <div className="flex gap-2">
+                        <button
+                          data-tip="Import this repo into the Scaleway model library"
+                          className="btn btn-primary py-1 px-3 border border-accent rounded cursor-pointer text-sm- bg-accent text-white"
+                          onClick={() => handleImport(importRepo)}
+                          disabled={importBusy || (importVerify ? !importVerify.ok : false)}
+                        >{importBusy ? 'Working…' : 'Import to Scaleway'}</button>
+                        <button
+                          data-tip="Cancel import"
+                          className="btn py-1 px-3 border border-default rounded cursor-pointer text-sm-"
+                          onClick={() => { setImportRepo(''); setImportVerify(null); setImportError(null); }}
+                        >Cancel</button>
+                      </div>
                     </div>
                   )}
                   {hfRoster.length > 0 && (
@@ -789,6 +895,20 @@ export const SettingsModal = () => {
                               {m.repo_id} ↗
                             </a>
                             {m.is_default && <span className="text-2xs px-1 rounded ml-1" style={{ background: '#e1eecc', color: '#000' }}>Default</span>}
+                            {m.import_status && (
+                              <span
+                                className={cn('text-2xs px-1 rounded ml-1',
+                                  m.import_status === 'ready' ? 'bg-status-running/20 text-status-running'
+                                    : m.import_status === 'error' || m.import_status === 'failed' ? 'bg-danger/20 text-danger'
+                                    : 'bg-surface text-text-muted')}
+                                title={m.import_error || ''}
+                              >
+                                {m.import_status === 'ready' ? 'imported' : `import: ${m.import_status}`}
+                              </span>
+                            )}
+                            {!m.import_status && m.model_id === '' && (
+                              <span className="text-2xs px-1 rounded ml-1 bg-surface text-text-muted" title="Fine-tune without a serverless mapping — can run on a GPU window">needs GPU window</span>
+                            )}
                             {m.limitations && m.limitations.length > 0 && (
                               <div className="text-2xs text-text-faint">{m.limitations.join(' · ')}</div>
                             )}
@@ -798,6 +918,12 @@ export const SettingsModal = () => {
                               <>
                                 {!m.is_default && m.model_id && (
                                   <button data-tip="Set as the default model" className="btn py-0.5 px-2 border border-default rounded cursor-pointer text-xs" onClick={() => handleHfAdopt(m.repo_id, true)} disabled={hfBusy}>Make default</button>
+                                )}
+                                {!m.import_status && canAdminProject && (
+                                  <button data-tip="Import into the Scaleway model library (usable by any project)" className="btn py-0.5 px-2 border border-default rounded cursor-pointer text-xs" onClick={() => { setImportRepo(m.repo_id); handleImportVerify(m.repo_id); }} disabled={importBusy}>Import</button>
+                                )}
+                                {m.import_id && (m.import_status === 'error' || m.import_status === 'failed') && user?.role === 'admin' && (
+                                  <button data-tip="Delete the imported model from Scaleway" className="btn py-0.5 px-2 border border-danger rounded cursor-pointer text-xs text-danger" onClick={() => handleImportDelete(m.import_id as number)} disabled={importBusy}>Delete import</button>
                                 )}
                                 <button data-tip="Remove this model from the project" className="btn py-0.5 px-2 border border-danger rounded cursor-pointer text-xs text-danger" onClick={() => handleHfRemove(m.repo_id)} disabled={hfBusy}>Remove</button>
                               </>

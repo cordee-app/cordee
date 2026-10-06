@@ -51,9 +51,18 @@ export const Header = () => {
             <Menu size={18} />
           </button>
         )}
-        <h1 className="header-title text-lg font-bold m-0 cursor-pointer flex items-center gap-1.5" onClick={handleGoHome}>
-          <svg width="20" height="20" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="#c67139" stroke-width="3"/><circle cx="12" cy="12" r="2.6" fill="#c67139"/></svg>
-          <span className="font-heading font-normal tracking-[-0.01em] text-white">cordée</span>
+        {/* Same logo as the marketing site: anchor ring + "cor•dée" with its phonetics underneath */}
+        <h1 className="header-title m-0 cursor-pointer flex items-center gap-2.5" onClick={handleGoHome}>
+          <span aria-hidden="true" className="grid h-9 w-9 shrink-0 place-items-center rounded-full border-[3px] border-accent"><span className="h-2.5 w-2.5 rounded-full bg-accent" /></span>
+          <span aria-hidden="true" className="inline-flex flex-col leading-none">
+            <span className="flex items-baseline gap-[3px] font-heading font-normal text-[22px] tracking-[-0.01em] text-white">
+              <span>cor</span>
+              <span className="mt-[3px] h-[5px] w-[5px] self-center rounded-full bg-accent" />
+              <span>dée</span>
+            </span>
+            <span className="mt-1 font-mono text-[11px] font-medium tracking-[0.02em] text-accent-dark">/kɔʁ.de/</span>
+          </span>
+          <span className="sr-only">Cordée</span>
         </h1>
         {activeProject && (
           <>

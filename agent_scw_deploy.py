@@ -19,15 +19,25 @@ _SCW_DEFAULT_PROJECT_ID = (
     os.environ.get('SCW_DEFAULT_PROJECT_ID')
     or os.environ.get('SCW_PROJECT_ID', '')
 )
+# Hugging Face READ token used when importing custom models. Public repos work
+# without one; gated/private repos require a token whose account has been granted
+# access. Kept in .env so a single token covers every import.
+_HF_TOKEN = os.environ.get('HF_TOKEN', '')
 _EUR_TO_USD = 1.08
+# Official Scaleway Generative APIs Dedicated Deployment prices (fr-par), EUR/h.
+# Source: https://www.scaleway.com/en/pricing/model-as-a-service/ (verified 2026-10-05).
 _HOURLY_RATES = {
-    'L4': 0.93, 'L40S': 1.46, 'H100': 4.50,
-    'H100-2': 9.00, 'H100-SXM-2': 9.00,
-    'H100-SXM-4': 18.00, 'H100-SXM-8': 36.00,
+    'L4': 0.93, 'L40S': 1.72, 'H100': 3.40,
+    'H100-2': 6.68, 'H100-SXM-2': 7.95,
+    'H100-SXM-4': 15.22, 'H100-SXM-8': 30.06,
 }
 _DEPLOYED_NODE_TYPES = ('L4', 'L40S', 'H100', 'H100-2', 'H100-SXM-2', 'H100-SXM-4', 'H100-SXM-8')
 _READY_TIMEOUT = 1800
 _POLL_INTERVAL = 20
+# Downloading a custom model (e.g. a ~55 GB 27B fp16 repo) can run long; allow
+# an hour before giving up. Import itself is free — billing only starts when the
+# model is actually deployed.
+_IMPORT_TIMEOUT = 3600
 _INFER_BASE = 'https://api.scaleway.com/inference/v1/regions'
 
 
@@ -55,6 +65,16 @@ def _scw_delete(url):
         if e.code == 404:
             return {}
         raise
+
+
+def _scw_post(url, body, timeout=120):
+    """POST JSON and return the parsed response. Raises HTTPError on rejection so
+    callers can map it with the friendly classifiers; kept separate from
+    ``urllib`` so tests can patch a single seam."""
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method='POST', headers=_scw_headers())
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
 
 
 def _rand6():
@@ -159,6 +179,228 @@ def _pick_quantization(model, node_type):
     models. Bits are returned highest-first as the safe (most-compatible) default."""
     bits = (model or {}).get('quantizations', {}).get(node_type)
     return max(bits) if bits else None
+
+
+# ── Custom model import (Hugging Face → Scaleway model library) ───────────────
+
+def _classify_import_error(code, body):
+    """Map a Scaleway model import/verify rejection to a friendly, in-app message.
+
+    The 412 ``resource_not_usable`` body carries a ``help_message`` that is the
+    single most useful thing a user can read (e.g. GGUF repos: "Maximum model
+    context length is not available in config.json"), so it is surfaced verbatim
+    when present. ``kind`` lets the UI react (e.g. suggest a Transformers-format
+    repo for ``unsupported_format``)."""
+    msg = ''
+    try:
+        parsed = json.loads(body or '{}')
+        msg = (parsed.get('help_message') or parsed.get('message') or '').strip()
+    except (ValueError, TypeError):
+        msg = ''
+    b = (body or '').lower()
+    if code in (401, 403):
+        return ('auth', 'Scaleway rejected the import (check SCW_SECRET_KEY and '
+                'API permissions).')
+    if code == 404:
+        return ('not_found', 'The Hugging Face repository or Scaleway model was '
+                'not found.')
+    if code == 409:
+        return ('conflict', 'A model with that name already exists in your '
+                'Scaleway Organization/Project. Choose a different name.')
+    if 'does not exist' in b or 'permissions to access' in b or 'gated' in b:
+        return ('access', (msg + ' ' if msg else '')
+                + 'For gated or private models, set HF_TOKEN in .env to a token '
+                  'whose account has been granted access.')
+    if 'quantization' in b and 'not available' in b:
+        return ('unsupported_quantization', msg or 'This quantization is not '
+                'supported for the chosen node type.')
+    if any(k in b for k in ('max_position_embeddings', 'config.json',
+                            'maximum model context length',
+                            'not supported', 'not_usable', 'not usable',
+                            'tokeniz')):
+        return ('unsupported_format', msg or 'Scaleway cannot import this repo. '
+                'It must be a full Transformers repo (config.json + tokenizer '
+                'files + weights). GGUF repos are not supported — use the base '
+                'or FP8/NVFP4 repo instead.')
+    if code in (400, 412, 422):
+        return ('invalid', msg or f'Scaleway rejected the import: {(body or "")[:200]}')
+    return ('error', msg or f'Scaleway import failed (HTTP {code}): {(body or "")[:200]}')
+
+
+class ScwImportError(RuntimeError):
+    """A model import/verify rejection, carrying a machine-readable ``kind``."""
+
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind = kind
+        self.friendly = message
+
+
+def _hf_url(repo_id):
+    """Normalise a HF repo id or URL to the canonical model-page URL Scaleway
+    expects as ``source.url``."""
+    repo = (repo_id or '').strip().rstrip('/')
+    if repo.startswith('http://') or repo.startswith('https://'):
+        return repo
+    return f'https://huggingface.co/{repo}'
+
+
+def verify_hf_model(repo_id, region='fr-par', hf_token=None, **_):
+    """Pre-flight an HF repo with Scaleway's own ``verify-model`` endpoint.
+
+    Returns ``{ok, nodes, size_bytes}`` or ``{ok: False, error, error_code}``.
+    This is authoritative for compatibility (it is what the console's "Verify
+    import" button calls) and needs no import — so a GGUF repo is rejected here
+    before anything is created. ``nodes`` mirrors ``list_models`` for the
+    prospective model, ready to drive node/quantization pickers."""
+    if not _SCW_SECRET_KEY:
+        return {'ok': False, 'error': 'SCW_SECRET_KEY not set', 'error_code': 'auth'}
+    url = f'{_INFER_BASE}/{region}/verify-model'
+    token = hf_token or _HF_TOKEN
+    source = {'url': _hf_url(repo_id)}
+    if token:
+        source['secret'] = token
+    try:
+        raw = _scw_post(url, {'source': source})
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors='replace')
+        kind, friendly = _classify_import_error(e.code, body)
+        return {'ok': False, 'error': friendly, 'error_code': kind}
+    except Exception as e:
+        return {'ok': False, 'error': str(e), 'error_code': 'error'}
+
+    nodes = []
+    quantizations = {}
+    context_size = None
+    for n in raw.get('nodes') or []:
+        nt = n.get('node_type_name', '')
+        if not nt:
+            continue
+        allowed_bits = []
+        for q in (n.get('quantizations') or []):
+            if q.get('allowed') and q.get('quantization_bits') is not None:
+                allowed_bits.append(q['quantization_bits'])
+                cs = q.get('max_context_size')
+                if cs and (context_size is None or cs > context_size):
+                    context_size = cs
+        if allowed_bits and nt not in nodes:
+            nodes.append(nt)
+            quantizations[nt] = sorted(allowed_bits)
+    return {
+        'ok': True,
+        'repo_id': (repo_id or '').strip(),
+        'nodes': nodes,
+        'quantizations': quantizations,
+        'max_context_size': context_size,
+        'size_bytes': raw.get('size_bytes'),
+        'hourly_eur': {nt: _hourly_rate(nt) for nt in nodes},
+    }
+
+
+def import_hf_model(name, repo_id, project_id=None, region='fr-par',
+                    hf_token=None, **_):
+    """Import an HF repo into the Scaleway model library (``POST /models``).
+
+    Returns the created model object (``status`` is ``preparing``/``downloading``
+    while it downloads). Import is free; billing starts only on deployment.
+    Raises ``ScwImportError`` with a friendly message on rejection."""
+    if not _SCW_SECRET_KEY:
+        raise ScwImportError('auth', 'SCW_SECRET_KEY not set')
+    url = f'{_INFER_BASE}/{region}/models'
+    token = hf_token or _HF_TOKEN
+    source = {'url': _hf_url(repo_id)}
+    if token:
+        source['secret'] = token
+    body = {'name': name, 'source': source}
+    if project_id:
+        body['project_id'] = project_id
+    elif _SCW_DEFAULT_PROJECT_ID:
+        body['project_id'] = _SCW_DEFAULT_PROJECT_ID
+    try:
+        return _scw_post(url, body)
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode(errors='replace')
+        kind, friendly = _classify_import_error(e.code, raw)
+        raise ScwImportError(kind, friendly) from e
+
+
+def get_model(model_id, region='fr-par', **_):
+    """Fetch one model from the library (``GET /models/{id}``), or None."""
+    url = f'{_INFER_BASE}/{region}/models/{model_id}'
+    try:
+        return _scw_get(url)
+    except Exception as e:
+        _log.warning('get_model %s failed: %s', model_id, e)
+        return None
+
+
+def wait_model_ready(model_id, region='fr-par', timeout=_IMPORT_TIMEOUT,
+                     status_cb=None, **_):
+    """Poll a model until it reaches ``ready``. Returns the model dict, or None
+    on timeout/error. ``error_message`` on a failed model is logged and left on
+    the returned dict when status is ``error``."""
+    url = f'{_INFER_BASE}/{region}/models/{model_id}'
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            data = _scw_get(url)
+            status = data.get('status', '')
+            if status_cb:
+                try:
+                    status_cb(status)
+                except Exception:
+                    pass
+            if status == 'ready':
+                return data
+            if status == 'error':
+                _log.error('model %s import error: %s', model_id,
+                           data.get('error_message'))
+                return data
+        except Exception as e:
+            _log.warning('poll model %s failed: %s', model_id, e)
+        time.sleep(_POLL_INTERVAL)
+    _log.error('model %s did not become ready within %ds', model_id, timeout)
+    return None
+
+
+def delete_model(model_id, region='fr-par', **_):
+    """Delete an imported model from the Scaleway library (frees quota)."""
+    url = f'{_INFER_BASE}/{region}/models/{model_id}'
+    try:
+        _scw_delete(url)
+        return {'ok': True}
+    except Exception as e:
+        _log.warning('delete_model %s failed: %s', model_id, e)
+        return {'ok': False, 'error': str(e)}
+
+
+def get_model_eula(model_id, region='fr-par', **_):
+    """Fetch a model's EULA content (empty string when none)."""
+    url = f'{_INFER_BASE}/{region}/models/{model_id}/eula'
+    try:
+        data = _scw_get(url)
+        return data.get('content', '') if isinstance(data, dict) else ''
+    except Exception as e:
+        _log.warning('get_model_eula %s failed: %s', model_id, e)
+        return ''
+
+
+def model_exists(model_id, region='fr-par', **_):
+    """Tri-state existence check for a library model: True (found), False (404,
+    authoritatively gone), or None (couldn't tell — network/other error). Used to
+    reconcile stale local import rows after an out-of-band deletion."""
+    if not model_id:
+        return False
+    url = f'{_INFER_BASE}/{region}/models/{model_id}'
+    try:
+        _scw_get(url)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        return None
+    except Exception:
+        return None
 
 
 def _extract_endpoint_url(deployment):

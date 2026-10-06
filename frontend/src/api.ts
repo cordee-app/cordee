@@ -5,6 +5,7 @@ import type {
   MemoryView, ContextOptions, AttachableTask, TaskAttachment, GateAction, MemoryLevel, GitMode,
   ScwSessionStatus, Deployment, FilesCatalog, ProjectHfModel, HfSearchResult, HfCandidate,
   HfQueueGroup, GpuWindow, GpuWindowModel, GpuRunStatus,
+  HfImportVerify, HfModelImport,
   MeResponse, ProjectMember, MemberRole, AdminUser, DirectoryUser,
   ArchiveResult, ImportResult,
 } from './types';
@@ -474,6 +475,20 @@ export const api = {
       get<{ run: GpuRunStatus | null }>(`/api/gpu-window/${depId}/run-status`),
     close: (depId: number) =>
       del<{ ok: boolean; final_cost_usd: number; cost_by_project: Record<string, number> }>(`/api/gpu-window/${depId}`),
+  },
+
+  // ── Custom model import (Hugging Face → Scaleway, beta) ───────────────
+  // Imports are initiated from a project (owner), but the resulting Scaleway
+  // library model is Organization-global and usable by any project.
+  hfModelImports: {
+    verify: (repoId: string) =>
+      post<HfImportVerify>('/api/hf-models/verify', { repo_id: repoId }),
+    create: (pid: number, data: { repo_id: string; model_name?: string }) =>
+      post<{ ok: boolean; import: HfModelImport; model_id: string; status: string; reused?: boolean }>(`/api/projects/${pid}/hf-models/import`, data),
+    list: (projectId?: number) =>
+      get<{ imports: HfModelImport[] }>(`/api/hf-models/imports${projectId ? `?project_id=${projectId}` : ''}`),
+    remove: (importId: number) =>
+      del<{ ok: boolean }>(`/api/hf-models/imports/${importId}`),
   },
 
   // ── Unified File Manager (Phase 1 + F7 chunked) ────────────────────────

@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "last_reviewed": "2026-08-20",
+    "last_reviewed": "2026-10-06",
     "review_after": "2026-11-18"
   },
   "models": {
@@ -370,6 +370,45 @@
           "permissive licence (apache-2.0)",
           "4,631 downloads/mo",
           "low likes",
+          "has model card",
+          "needs self-hosting",
+          "text-generation model"
+        ],
+        "servable": false,
+        "task_model": true
+      }
+    },
+    "Qwen/Qwen3-0.6B": {
+      "repo_id": "Qwen/Qwen3-0.6B",
+      "label": "Qwen/Qwen3-0.6B",
+      "pipeline_tag": "text-generation",
+      "tags": [
+        "transformers",
+        "safetensors",
+        "qwen3",
+        "text-generation",
+        "conversational",
+        "arxiv:2505.09388",
+        "base_model:Qwen/Qwen3-0.6B-Base",
+        "base_model:finetune:Qwen/Qwen3-0.6B-Base",
+        "license:apache-2.0",
+        "text-generation-inference",
+        "endpoints_compatible",
+        "deploy:sagemaker",
+        "deploy:azure",
+        "region:us"
+      ],
+      "language": [],
+      "license": "apache-2.0",
+      "downloads": 30795305,
+      "likes": 1737,
+      "provider_mapping": "",
+      "validation": {
+        "score": 0.7,
+        "reasons": [
+          "permissive licence (apache-2.0)",
+          "30,795,305 downloads/mo",
+          "1,737 likes",
           "has model card",
           "needs self-hosting",
           "text-generation model"

@@ -3,7 +3,7 @@ import { useStore } from '../store';
 import { api } from '../api';
 import { cn } from '../utils/cn';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
-import type { HfQueueGroup, GpuWindow, GpuWindowModel, GpuRunStatus } from '../types';
+import type { HfQueueGroup, GpuWindow, GpuWindowModel, GpuRunStatus, HfImportVerify } from '../types';
 
 const fmtEur = (n: number) => `€${(n || 0).toFixed(2)}`;
 const fmtUsd = (n: number) => `$${(n || 0).toFixed(2)}`;
@@ -41,6 +41,14 @@ export const GpuWindowModal = () => {
   const [runWarnings, setRunWarnings] = useState<string[]>([]);
   const [activeRunDep, setActiveRunDep] = useState<number | null>(null);
   const [runProgress, setRunProgress] = useState<GpuRunStatus | null>(null);
+
+  // Repair an un-servable group whose model was deleted from the Scaleway
+  // library: re-import it (attributed to the first task's project, per the
+  // project-scoped import rule).
+  const [repairRepo, setRepairRepo] = useState<string | null>(null);
+  const [repairVerify, setRepairVerify] = useState<HfImportVerify | null>(null);
+  const [repairError, setRepairError] = useState<string | null>(null);
+  const [repairBusy, setRepairBusy] = useState(false);
 
   const projectName = (pid: number | null) => {
     if (pid == null) return '';
@@ -169,6 +177,44 @@ export const GpuWindowModal = () => {
     }
   };
 
+  const handleRepairVerify = async (repoId: string) => {
+    setRepairRepo(repoId);
+    setRepairVerify(null);
+    setRepairError(null);
+    setRepairBusy(true);
+    try {
+      const r = await api.hfModelImports.verify(repoId);
+      setRepairVerify(r);
+    } catch (e) {
+      setRepairVerify({ ok: false, error: e instanceof Error ? e.message : 'unknown' });
+      setRepairError(e instanceof Error ? e.message : 'unknown');
+    } finally {
+      setRepairBusy(false);
+    }
+  };
+
+  const handleRepairImport = async (repoId: string, projectId: number | null) => {
+    if (projectId == null) {
+      setRepairError('No project owns a task for this model — import it from a project\'s Settings → HF Scout.');
+      return;
+    }
+    setRepairError(null);
+    setRepairBusy(true);
+    try {
+      await api.hfModelImports.create(projectId, { repo_id: repoId });
+      setRepairRepo(null);
+      setRepairVerify(null);
+      await load();
+    } catch (e) {
+      // Keep Import disabled after a rejection so the user can't re-click into
+      // the same error; they must re-Verify (e.g. after re-importing correctly).
+      setRepairVerify({ ok: false, error: e instanceof Error ? e.message : 'unknown' });
+      setRepairError(e instanceof Error ? e.message : 'unknown');
+    } finally {
+      setRepairBusy(false);
+    }
+  };
+
   const handleRun = async (depId: number) => {
     if (selected.size === 0) return;
     setRunBusy(true);
@@ -223,12 +269,59 @@ export const GpuWindowModal = () => {
                 <div key={g.repo_id} className="mb-2 border border-border-subtle rounded-md p-2">
                   <div className="flex items-center gap-2 text-sm+">
                     <span className="font-semibold truncate" title={g.repo_id}>{g.label}</span>
-                    {g.servable ? (
+                    {g.servable && g.import_ready ? (
+                      <span
+                        className="text-2xs px-1.5 py-px rounded-full font-semibold bg-status-running/20 text-status-running"
+                        title={g.import_model_name ? `Imported as ${g.import_model_name} — deploy via Open GPU Window` : 'Imported — deploy via Open GPU Window'}
+                      >imported</span>
+                    ) : g.servable ? (
                       <span className="text-2xs px-1.5 py-px rounded-full font-semibold bg-status-running/20 text-status-running">servable</span>
+                    ) : (g.import_status === 'preparing' || g.import_status === 'downloading') ? (
+                      <span className="text-2xs px-1.5 py-px rounded-full font-semibold bg-status-pending/20 text-status-pending">import: {g.import_status}…</span>
                     ) : (
                       <span className="text-2xs px-1.5 py-px rounded-full font-semibold bg-status-pending/20 text-status-pending">awaiting self-host</span>
                     )}
+                    {!g.servable && g.import_status !== 'preparing' && g.import_status !== 'downloading' && perms.canAdminister && (
+                      <button
+                        data-tip="Download this Hugging Face model into the Scaleway library so it can be deployed"
+                        className="ml-auto btn py-0.5 px-2 border border-accent rounded cursor-pointer text-xs text-accent"
+                        onClick={() => handleRepairVerify(g.repo_id)}
+                        disabled={repairBusy}
+                      >Import to Scaleway</button>
+                    )}
                   </div>
+
+                  {repairRepo === g.repo_id && (
+                    <div className="mt-1.5 p-2 bg-surface-subtle rounded-md">
+                      {repairVerify?.ok ? (
+                        <div className="text-xs text-status-running mb-1">
+                          Importable — nodes {repairVerify.nodes?.join(', ') || '—'}
+                          {repairVerify.max_context_size != null && ` · up to ${repairVerify.max_context_size.toLocaleString()} ctx`}
+                          {repairVerify.size_bytes != null && ` · ${(repairVerify.size_bytes / 1e9).toFixed(1)} GB`}
+                        </div>
+                      ) : (repairVerify?.error || repairError) ? (
+                        <div className="p-2 rounded text-xs bg-status-pending/20 text-status-pending mb-1">
+                          {repairVerify?.error || repairError}
+                        </div>
+                      ) : (
+                        <div className="text-xs text-text-faint mb-1">Checking…</div>
+                      )}
+                      <div className="flex gap-2">
+                        <button
+                          data-tip="Import this repo into the Scaleway model library"
+                          className="btn btn-primary py-1 px-3 border border-accent rounded cursor-pointer text-sm- bg-accent text-white"
+                          onClick={() => handleRepairImport(g.repo_id, g.tasks[0]?.project_id ?? null)}
+                          disabled={repairBusy || (repairVerify ? !repairVerify.ok : true)}
+                        >{repairBusy ? 'Working…' : 'Import'}</button>
+                        <button
+                          data-tip="Cancel"
+                          className="btn py-1 px-3 border border-default rounded cursor-pointer text-sm-"
+                          onClick={() => { setRepairRepo(null); setRepairVerify(null); setRepairError(null); }}
+                        >Cancel</button>
+                      </div>
+                    </div>
+                  )}
+
                   {g.tasks.map((t) => (
                     <div key={t.id} className="flex items-center gap-2 py-1 text-sm+ border-b border-border-subtle last:border-0">
                       <input

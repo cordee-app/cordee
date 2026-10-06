@@ -846,7 +846,12 @@ export const AddTaskModal = () => {
                 }}
               >
                 <span className="text-status-pending font-semibold flex-1 truncate" title={hfRepoId}>
-                  HF model: {hfRepoId}{awaitingModel ? ' · awaiting self-host' : ''}
+                  HF model: {hfRepoId}
+                  {awaitingModel && (
+                    adoptedHf.find((c) => c.repo_id === hfRepoId)?.import_ready
+                      ? ' · imported — deploy via GPU window'
+                      : ' · awaiting self-host'
+                  )}
                 </span>
                 {perms.canEdit && (
                   <button
@@ -892,7 +897,12 @@ export const AddTaskModal = () => {
                 <button
                   key={cand.repo_id}
                   type="button"
-                  data-tip={cand.servable ? `Serve as ${cand.provider_mapping}` : 'Awaiting self-host'}
+                  data-tip={
+                    cand.servable ? `Serve as ${cand.provider_mapping}`
+                      : cand.import_ready ? 'Imported — deploy on a GPU window to run'
+                      : cand.import_status ? `Import ${cand.import_status}`
+                      : 'Awaiting self-host'
+                  }
                   className={cn(
                     'inline-flex items-center gap-1.5 rounded-[10px] px-2 py-1 text-xs border cursor-pointer',
                     hfRepoId === cand.repo_id
@@ -904,6 +914,10 @@ export const AddTaskModal = () => {
                   <span className="max-w-[200px] truncate">{cand.label}</span>
                   {cand.servable ? (
                     <span className="text-2xs px-1 rounded bg-status-running/20 text-status-running">servable</span>
+                  ) : cand.import_ready ? (
+                    <span className="text-2xs px-1 rounded bg-status-running/20 text-status-running">imported</span>
+                  ) : cand.import_status ? (
+                    <span className="text-2xs px-1 rounded bg-surface text-text-muted">{cand.import_status}</span>
                   ) : (
                     <span className="text-2xs px-1 rounded bg-status-pending/20 text-status-pending">self-host</span>
                   )}

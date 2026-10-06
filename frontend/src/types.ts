@@ -427,6 +427,11 @@ export interface ProjectHfModel {
   limitations?: string[];
   hf_url?: string;
   is_default: boolean;
+  import_status?: string | null;
+  import_model_name?: string | null;
+  import_error?: string | null;
+  import_ready?: boolean;
+  import_id?: number | null;
 }
 
 export interface HfCandidate {
@@ -447,6 +452,10 @@ export interface HfCandidate {
   task_model?: boolean;
   limitations: string[];
   hf_url: string;
+  import_status?: string | null;
+  import_model_name?: string | null;
+  import_error?: string | null;
+  import_ready?: boolean;
 }
 
 export interface HfSearchResult {
@@ -484,6 +493,9 @@ export interface HfQueueGroup {
   label: string;
   provider_mapping: string;
   servable: boolean;
+  import_status?: string | null;
+  import_model_name?: string | null;
+  import_ready?: boolean;
   tasks: HfQueueTask[];
 }
 
@@ -525,6 +537,31 @@ export interface GpuRunStatus {
   dep_id: number;
   started_at: string;
   tasks: Record<string, { status: string; error: string }>;
+}
+
+export interface HfImportVerify {
+  ok: boolean;
+  repo_id?: string;
+  nodes?: string[];
+  quantizations?: Record<string, number[]>;
+  max_context_size?: number | null;
+  size_bytes?: number;
+  hourly_eur?: Record<string, number>;
+  error?: string;
+  error_code?: string;
+}
+
+export interface HfModelImport {
+  id: number;
+  project_id: number | null;
+  repo_id: string;
+  model_name: string;
+  scw_model_id: string | null;
+  status: string;
+  error_message: string | null;
+  size_bytes: number | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface GpuWindowModel {
