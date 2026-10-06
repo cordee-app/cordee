@@ -273,7 +273,7 @@ Binary files (`.pdf`, `.db`, `.xlsx`, `.docx`, etc.) are noted in the prompt but
 
 ## Development Workflow
 
-1. Develop and test in your checkout: `python -m unittest discover -s . -p 'test_agent_*.py'`.
+1. Develop and test in your checkout: `python -m unittest discover -s . -p 'test_*.py'`, plus the script suites `python tests/test_large_file_transform.py` and `python tests/test_model_metadata.py`.
 2. Rebuild the frontend if TSX/TS changed: `cd frontend && npx tsc -b --noEmit && npm run build`.
 3. Restart the server (`sudo systemctl restart cordee` with the example unit) and check its logs.
 

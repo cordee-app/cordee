@@ -18,7 +18,12 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run unit tests
         # The suite builds its own temp DBs; no network or live services needed.
-        run: python -m unittest discover -s . -p 'test_agent_*.py' -v
+        run: python -m unittest discover -s . -p 'test_*.py' -v
+      - name: Run script tests (tests/)
+        # Plain-script suites with their own runner; each exits non-zero on failure.
+        run: |
+          python tests/test_large_file_transform.py
+          python tests/test_model_metadata.py
 
   frontend-typecheck:
     runs-on: ubuntu-latest
