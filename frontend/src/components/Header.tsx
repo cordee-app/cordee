@@ -51,16 +51,17 @@ export const Header = () => {
             <Menu size={18} />
           </button>
         )}
-        {/* Same logo as the marketing site: anchor ring + "cor•dée" with its phonetics underneath */}
+        {/* Same logo as the marketing site: anchor ring + "cor•dée" with its phonetics underneath.
+            Pixel sizes on purpose: this app redefines spacing 1/9 as 1px/9px in tailwind.config.js. */}
         <h1 className="header-title m-0 cursor-pointer flex items-center gap-2.5" onClick={handleGoHome}>
-          <span aria-hidden="true" className="grid h-9 w-9 shrink-0 place-items-center rounded-full border-[3px] border-accent"><span className="h-2.5 w-2.5 rounded-full bg-accent" /></span>
+          <span aria-hidden="true" className="grid h-[36px] w-[36px] shrink-0 place-items-center rounded-full border-[3px] border-accent"><span className="h-2.5 w-2.5 rounded-full bg-accent" /></span>
           <span aria-hidden="true" className="inline-flex flex-col leading-none">
             <span className="flex items-baseline gap-[3px] font-heading font-normal text-[22px] tracking-[-0.01em] text-white">
               <span>cor</span>
               <span className="mt-[3px] h-[5px] w-[5px] self-center rounded-full bg-accent" />
               <span>dée</span>
             </span>
-            <span className="mt-1 font-mono text-[11px] font-medium tracking-[0.02em] text-accent-dark">/kɔʁ.de/</span>
+            <span className="mt-[4px] font-mono text-[11px] font-medium tracking-[0.02em] text-accent-dark">/kɔʁ.de/</span>
           </span>
           <span className="sr-only">Cordée</span>
         </h1>
