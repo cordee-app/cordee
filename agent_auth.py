@@ -477,6 +477,7 @@ def login():
 
 
 _OIDC_TEMP_PREFIXES = ('oidc_', '_state_', '_nonce_', '_verifier_')
+_MAX_SESSION_ID_TOKEN = 2500
 
 
 def _clear_oidc_temp_keys():
@@ -529,6 +530,11 @@ def callback():
         _clear_oidc_temp_keys()
         return jsonify(error='suspended'), 403
     session['uid'] = user['id']
+    # Kept for logout: the IdP needs it as id_token_hint (see logout()). The
+    # session is a ~4 KB cookie, so skip it if the token is unexpectedly big.
+    id_token = token.get('id_token') if isinstance(token, dict) else None
+    if id_token and len(id_token) <= _MAX_SESSION_ID_TOKEN:
+        session['id_token'] = id_token
     _clear_oidc_temp_keys()
     return redirect('/')
 
@@ -542,15 +548,27 @@ def logout():
     silently re-authenticate the user via the still-live SSO session,
     making logout appear to do nothing.
     """
+    id_token = session.get('id_token')
     session.clear()
     end_session_url = None
     issuer = os.environ.get('AINGEL_OIDC_ISSUER', '').rstrip('/')
     if issuer and auth_enabled():
         import urllib.parse
-        redirect = _post_logout_url()
-        end_session_url = issuer + '/end-session/?' + urllib.parse.urlencode({
-            'post_logout_redirect_uri': redirect,
-        })
+        params = {}
+        # OIDC RP-initiated logout: Authentik 2026 only honours
+        # post_logout_redirect_uri together with id_token_hint, and answers
+        # "invalid_request" otherwise. Sessions from before id_token was
+        # stored have none; they still log out, but stay on Authentik's
+        # logged-out page instead of returning to the app.
+        if id_token:
+            params['id_token_hint'] = id_token
+            params['post_logout_redirect_uri'] = _post_logout_url()
+        client_id = os.environ.get('AINGEL_OIDC_CLIENT_ID', '').strip()
+        if client_id:
+            params['client_id'] = client_id
+        end_session_url = issuer + '/end-session/'
+        if params:
+            end_session_url += '?' + urllib.parse.urlencode(params)
     return jsonify(ok=True, end_session_url=end_session_url)
 
 

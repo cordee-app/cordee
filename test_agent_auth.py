@@ -84,8 +84,9 @@ class LogoutRouteTests(unittest.TestCase):
         self._saved = {
             k: os.environ.get(k) for k in
             ('AINGEL_AUTH', 'AINGEL_PUBLIC_URL', 'AINGEL_OIDC_ISSUER',
-             'AINGEL_SESSION_SECRET')
+             'AINGEL_SESSION_SECRET', 'AINGEL_OIDC_CLIENT_ID')
         }
+        os.environ.pop('AINGEL_OIDC_CLIENT_ID', None)
         os.environ['AINGEL_AUTH'] = 'oidc'
         os.environ['AINGEL_SESSION_SECRET'] = 'test-secret-' + 'x' * 32
         os.environ['AINGEL_OIDC_ISSUER'] = 'https://auth.example.com/application/o/aingel/'
@@ -108,6 +109,9 @@ class LogoutRouteTests(unittest.TestCase):
     def test_logout_includes_public_post_logout_redirect(self):
         app = self._app()
         with app.test_client() as client:
+            with client.session_transaction() as sess:
+                sess['uid'] = 1
+                sess['id_token'] = 'header.payload.sig'
             resp = client.post('/api/auth/logout')
             self.assertEqual(resp.status_code, 200)
             payload = resp.get_json()
@@ -115,6 +119,26 @@ class LogoutRouteTests(unittest.TestCase):
             self.assertIn(
                 'post_logout_redirect_uri=https%3A%2F%2Fcordee.example%2F%3Floggedout%3D1',
                 payload['end_session_url'])
+            self.assertIn('id_token_hint=header.payload.sig', payload['end_session_url'])
+            self.assertNotIn('client_id=', payload['end_session_url'])
+            with client.session_transaction() as sess:
+                self.assertNotIn('id_token', sess)
+
+    def test_logout_without_id_token_omits_redirect(self):
+        # Authentik rejects post_logout_redirect_uri without id_token_hint.
+        app = self._app()
+        with app.test_client() as client:
+            payload = client.post('/api/auth/logout').get_json()
+            self.assertIn('end-session', payload['end_session_url'])
+            self.assertNotIn('post_logout_redirect_uri', payload['end_session_url'])
+            self.assertNotIn('id_token_hint', payload['end_session_url'])
+
+    def test_logout_identifies_client_when_configured(self):
+        os.environ['AINGEL_OIDC_CLIENT_ID'] = 'cordee-client'
+        app = self._app()
+        with app.test_client() as client:
+            payload = client.post('/api/auth/logout').get_json()
+            self.assertIn('client_id=cordee-client', payload['end_session_url'])
 
 
 class OidcPkceConfigTests(unittest.TestCase):
