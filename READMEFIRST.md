@@ -194,15 +194,22 @@ Feedback loop: Approve (→ memory) / Reject + Feedback (→ new task) / Skip / 
 
 | Model | AIngel ID | Provider | Input $/M | Output $/M | Slot |
 |-------|-----------|----------|-----------|------------|------|
+| Claude Sonnet 5.5 (default) | `claude-sonnet-5-5` | Anthropic | $2.00 | $10.00 | 1/3 |
 | Claude Sonnet 4.6 | `claude-sonnet-4-6` | Anthropic | $3.00 | $15.00 | 1/3 |
-| Claude Haiku 4.5 | `claude-haiku-4-5-20251001` | Anthropic | $0.80 | $4.00 | 1/3 |
-| Claude Opus 4.7 | `claude-opus-4-7` | Anthropic | $15.00 | $75.00 | 1/3 |
-| Mistral Large | `mistral-large-latest` | Mistral | $2.00 | $6.00 | 3 |
-| Mistral Small | `mistral-small-latest` | Mistral | $0.10 | $0.30 | 2 |
-| Mistral Medium | `mistral-medium-latest` | Mistral | $0.40 | $2.00 | 2 |
+| Claude Opus 5.5 | `claude-opus-5-5` | Anthropic | $4.00 | $20.00 | 1/3 |
+| Claude Opus 4.7 | `claude-opus-4-7` | Anthropic | $5.00 | $25.00 | 1/3 |
+| Claude Fable 5.1 | `claude-fable-5-1` | Anthropic | $10.00 | $50.00 | 1/3 |
+| Claude Haiku 4.5 | `claude-haiku-4-5-20251001` | Anthropic | $1.00 | $5.00 | 1/3 |
+| Mistral Large | `mistral-large-latest` | Mistral | $0.00 | $0.00 | 2/3 |
+| Mistral Large 4 | `mistral-large-4` | Mistral | $0.00 | $0.00 | 2/3 |
+| Mistral Small | `mistral-small-latest` | Mistral | $0.00 | $0.00 | 2/3 |
+| Mistral Medium | `mistral-medium-latest` | Mistral | $0.00 | $0.00 | 2/3 |
+| Codestral | `codestral-latest` | Mistral | $0.00 | $0.00 | 2/3 |
 | GLM-5.3 (Mistral Pro) | `mistral-glm-5-3` | Mistral | $0.00 | $0.00 | 2 |
-| Codex ChatGPT | `codex-chatgpt` | OpenAI | $0.00 | $0.00 | 3 |
-| SCW Qwen3-Coder 30B | `scw-qwen3-coder-30b` | Scaleway | $0.22 | $0.86 | 4 |
+| Mistral OCR | `mistral-ocr-latest` | Mistral | $0.00 | $0.00 | 2/3/4 |
+| Codex ChatGPT (gpt-6-luna) | `codex-chatgpt` | OpenAI | $0.00 | $0.00 | 3 |
+| SCW DeepSeek-V4 Flash | `scw-deepseek-v4-flash` | Scaleway | $0.43 | $0.86 | 4 |
+| SCW Qwen3.8 27B | `scw-qwen3.8-27b` | Scaleway | $0.65 | $3.56 | 4 |
 | SCW GPT-OSS 120B | `scw-gpt-oss-120b` | Scaleway | $0.16 | $0.65 | 4 |
 | SCW Llama 3.3 70B | `scw-llama-3.3-70b` | Scaleway | $0.97 | $0.97 | 4 |
 | SCW Mistral-Small 24B | `scw-mistral-small-24b` | Scaleway | $0.16 | $0.38 | 4 |
@@ -212,8 +219,26 @@ Feedback loop: Approve (→ memory) / Reject + Feedback (→ new task) / Skip / 
 | SCW Qwen3.6 35B | `scw-qwen3.6-35b` | Scaleway | $0.27 | $1.62 | 4 |
 | SCW Qwen3.5 397B | `scw-qwen3.5-397b` | Scaleway | $0.65 | $3.89 | 4 |
 | SCW GLM-5.2 | `scw-glm-5.2` | Scaleway | $1.94 | $5.94 | 4 |
+| OLL GLM-5.3 | `oll-glm-5.3` | Ollama | $0.00 | $0.00 | 5 |
+| OLL GLM-5.3 Flash | `oll-glm-5.3-flash` | Ollama | $0.00 | $0.00 | 5 |
+| OLL Mistral-Large 4 | `oll-mistral-large-4` | Ollama | $0.00 | $0.00 | 5 |
+| OLL DeepSeek-V4 Pro | `oll-deepseek-v4-pro` | Ollama | $0.00 | $0.00 | 5 |
+| OLL DeepSeek-V4.1 Flash | `oll-deepseek-v4.1-flash` | Ollama | $0.00 | $0.00 | 5 |
+| OLL Kimi K2.6 | `oll-kimi-k2.6` | Ollama | $0.00 | $0.00 | 5 |
+| OLL MiniMax M2.7 | `oll-minimax-m2.7` | Ollama | $0.00 | $0.00 | 5 |
+| OLL GLM-5.2 | `oll-glm-5.2` | Ollama | $0.00 | $0.00 | 5 |
+| OLL GPT-OSS 120B | `oll-gpt-oss-120b` | Ollama | $0.00 | $0.00 | 5 |
+| OLL GPT-OSS 20B | `oll-gpt-oss-20b` | Ollama | $0.00 | $0.00 | 5 |
+| OLL Gemma-4 31B | `oll-gemma4-31b` | Ollama | $0.00 | $0.00 | 5 |
+| OLL Kimi K2.7 Code | `oll-kimi-k2.7-code` | Ollama | $0.00 | $0.00 | 5 |
+| OLL Kimi K3 | `oll-kimi-k3` | Ollama | $0.00 | $0.00 | 5 |
+| OLL MiniMax M3 | `oll-minimax-m3` | Ollama | $0.00 | $0.00 | 5 |
+| OLL Mistral-Large 675B | `oll-mistral-large-675b` | Ollama | $0.00 | $0.00 | 5 |
+| OLL Nemotron-3 Nano 30B | `oll-nemotron-3-nano` | Ollama | $0.00 | $0.00 | 5 |
+| OLL Nemotron-3 Super | `oll-nemotron-3-super` | Ollama | $0.00 | $0.00 | 5 |
+| OLL Nemotron-3 Ultra | `oll-nemotron-3-ultra` | Ollama | $0.00 | $0.00 | 5 |
 
-Scaleway prices in USD (EUR × 1.08). For provider routing details see `agent_router.py` (`route()` and the EU guard).
+Mistral `-latest` models (and Mistral Large 4) are covered by the Le Chat Pro subscription via the Vibe CLI — flat, not per-token — so priced at $0.00. Scaleway prices in USD (EUR × 1.08). Ollama Cloud is subscription-metered by GPU-time, so also $0.00. For provider routing details see `agent_router.py` (`route()` and the EU guard).
 
 ## Work Sessions & Kanban Columns
 
@@ -223,9 +248,10 @@ Scaleway prices in USD (EUR × 1.08). For provider routing details see `agent_ro
 |------|--------|---------|
 | NULL | Unassigned | any model |
 | 1 | Claude Pro | Claude models only |
-| 2 | Mistral Pro | Mistral models only (not Large — PAYG) |
+| 2 | Mistral Pro | Mistral models only (all Pro-covered via Vibe) |
 | 3 | PAYG | any non-Scaleway model |
 | 4 | EU Scaleway | `scw-*` models only; function-calling loop, pay-per-token |
+| 5 | Ollama Cloud | `oll-*` models only; function-calling loop, subscription-metered |
 
 - 5-hour window, 150k token budget per slot. `start_work_session(slot, force)` starts the countdown.
 - `work_sessions.tokens_used` accumulates actual `tok_in + tok_out` after every run.
@@ -237,7 +263,7 @@ Scaleway prices in USD (EUR × 1.08). For provider routing details see `agent_ro
 
 Projects created with `eu_only=1` may run **only EU-operated models — Mistral and Scaleway (`scw-*`)**. Claude (Anthropic/US), Codex (OpenAI/US) and Ollama Cloud (`oll-*`, US) are excluded.
 
-- `_is_eu_model(model_id)` in `agent_api.py` is the single source of truth (`scw-*` / `mistral-*` / `open-mistral*`).
+- `is_eu_model(model_id)` in `agent_config.py` is the single source of truth (`scw-*` / `mistral-*` / `open-mistral*` / `codestral-*` / `devstral-*`); `agent_api._is_eu_model` is a thin alias.
 - Enforced at the API boundary by `_eu_guard(proj, model_id)`: **task creation** (`POST /api/tasks`), **model change** (`PATCH /api/tasks/<id>`) and the **Counselor** (`recommend-model` filters non-EU models out entirely).
 - The React model picker (`AddTaskModal`) also hides non-EU models and snaps an illegal selection back to a compliant one — but the backend guard is the real enforcement (API-direct callers are rejected with HTTP 400).
 
@@ -421,23 +447,26 @@ Each project has an `aingel.json` file at its root, auto-generated from the DB a
 }
 ```
 
-### Execution types
+### Execution types (per task)
 
-| Type | Runtime behaviour | git |
-|------|-------------------|-----|
-| `standard` | Current task loop — confirm → run → approve | `git_enabled` column / auto-detect |
-| `software` | Force git on unconditionally (bypasses `resolve_enabled()`) | Always on |
-| `research` | Full memory injection — no SCW caps, all `phase-*.memory.md` files injected | `git_enabled` / auto |
-| `deployment` | **Stubbed** — logs a note, runs as `standard`. Full Scaleway batch pipeline is Phase 6 | `git_enabled` / auto |
+Set per task in Edit/Create Task ("Processing"), stored in `tasks.execution_type` (`project.db`). Git does not depend on it.
+
+| Type | Runtime behaviour |
+|------|-------------------|
+| none (NULL) | Normal run — confirm → run → approve |
+| `research` | Full memory injection — no SCW caps, all `phase-*.memory.md` files injected |
+| `deployment` | Oversized files go through the 1:1 large-file transform (OCR correction, translation) instead of chunk-and-summarise; the task branch is not auto-merged |
+
+`projects.execution_type` still exists (and is written to `aingel.json`) but is no longer read: it used to be project-wide, and its `software` value only forced git, which is now on for every project.
 
 ### AIngel Autopilot modes
 
 | Mode | Effect |
 |------|--------|
-| `advisory` (default) | H2/H3 gates show banners but do not block execution. User sees warnings post-hoc. |
-| `strict` | H2 `gate=hold` aborts the run before `route()` is called. H3 `severity≠ok` sets `gate_state=hold` on the next task. User must explicitly override or discuss.
+| `advisory` | H2/H3 gates show banners but do not block execution. User sees warnings post-hoc. Column default for older rows. |
+| `strict` (new projects) | H2 `gate=hold` aborts the run before `route()` is called. H3 `severity≠ok` sets `gate_state=hold` on the next task. User must explicitly override or discuss.
 
-`execution_type` is stored in `aingel.db projects` table and injected into the task dict as `task['_execution_type']` before `_build_prompt()` is called. UI: project settings panel and Add Project modal both expose a dropdown.
+The task's `execution_type` is injected into the task dict as `task['_execution_type']` before `_build_prompt()` is called. Guide mode is set in Settings › Project under Guide autopilot.
 
 `aingel_name` (optional persona name, e.g. "Léa") is injected as the first line of the system prompt: `"You are Léa, AIngel for the Family project."` — followed by the role system prompt if a role is assigned (Phase 5, complete 2026-07-14).
 
@@ -655,7 +684,7 @@ Three fixes from a single incident on task #465 (project 118, a hardware-setup p
 
 ## Git-Validated Execution
 
-Per-task branches (`task/<id>-<slug>`) for software projects. `projects.git_enabled`: NULL = auto, 1 = on, 0 = off. Auto-detect via `agent_git.looks_like_software()`. When `execution_type = 'software'`, git is forced on regardless of the `git_enabled` column.
+Per-task branches (`task/<id>-<slug>`) for **every** project: git is the per-task undo (Reject) and audit trail, not only a code tool. `projects.git_enabled`: NULL or 1 = on, 0 = off (no UI; `POST /api/projects/<id>/git`). Mistral OCR runs skip git. Root-file relocation (stray files moved to the task's outputs) is skipped for projects whose `project_type` is Software. **User folders are not versioned:** `Working Documents/`, `Working Docs/`, `My Docs/` and `working-docs/` are in the `.gitignore` template, and repos that still track them drop them on the next run (`_untrack_runtime_files`, files stay on disk). Deleted user files therefore cannot come back through git; task deliverables in `Artifacts/outputs/` stay versioned and rejectable. `docs/` stays versioned (project documentation in code projects).
 
 Run lifecycle: start branch → AI edits on branch → `commit_task()` auto-commits diff → Approve merges (`git merge --no-ff`), Reject discards, Revert does `git revert`.
 

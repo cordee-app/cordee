@@ -97,6 +97,7 @@ export interface Task {
   corpus_id?: string;
   requires_rag?: boolean | number;
   context_refs?: string[];
+  execution_type?: string | null;
 }
 
 export type ExecutionStatus = 'pending' | 'running' | 'done' | 'failed' | 'rejected' | 'skipped';

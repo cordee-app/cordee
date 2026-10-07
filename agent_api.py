@@ -488,10 +488,13 @@ def set_config():
 
     if anthropic_mode:
         agent_config.ANTHROPIC_MODE = anthropic_mode
+        db.set_app_setting('anthropic_mode', anthropic_mode)
     if mistral_mode:
         agent_config.MISTRAL_MODE = mistral_mode
+        db.set_app_setting('mistral_mode', mistral_mode)
     if token_budget is not None:
         agent_config.SESSION_TOKEN_BUDGET = token_budget
+        db.set_app_setting('claude_pro_token_budget', token_budget)
 
     return jsonify({
         'anthropic_mode': agent_config.ANTHROPIC_MODE,
@@ -985,6 +988,10 @@ def create_project():
 
     project = db.upsert_project(name, slug, project_path, project_type, eu_only, llm_mode,
                                 execution_type=execution_type, aingel_name=aingel_name)
+    # New projects enforce the Guide gate: a hold stops the run. The column
+    # default stays 'advisory' so existing rows keep whatever they were set to.
+    db.set_project_field(project['id'], 'aingel_mode', 'strict')
+    project['aingel_mode'] = 'strict'
     _write_aingel_json(project_path, project)
 
     # Multi-tenancy: in oidc mode the creator becomes owner (owner_id +
@@ -3627,6 +3634,10 @@ def create_task():
     if not ok:
         return _eu_reject(proj, model, 'create_task', err)
     user_tokens = data.get('estimated_tokens')
+    try:
+        execution_type = _norm_task_execution_type(data.get('execution_type'))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
     task_id = db.create_task(
         project_id=data['project_id'],
         title=data['title'],
@@ -3640,6 +3651,7 @@ def create_task():
         corpus_id=data.get('corpus_id') or None,
         requires_rag=1 if data.get('requires_rag') else 0,
         created_by=(g.current_user or {}).get('id') if auth_enabled() else None,
+        execution_type=execution_type,
     )
     # Hugging Face Scout: record an assigned HF model + awaiting-self-host flag
     # when supplied at creation time.
@@ -3758,7 +3770,7 @@ def _eu_reject(proj, model_id, caller, err):
 
 def _validate_slot_for_model(slot, model_id):
     """Return (ok, error_message) for assigning a model to a kanban column.
-    Column rules: 1=Claude Pro (claude only), 2=Mistral Pro (mistral, no Large),
+    Column rules: 1=Claude Pro (claude only), 2=Mistral Pro (mistral, all Pro-covered),
     3=PAYG (any non-Scaleway, non-Ollama), 4=EU Scaleway (scaleway models only),
     5=Ollama Cloud (ollama models only), NULL=Unassigned (any).
     Special: mistral-ocr-* is Mistral EU-operated, API-only (no CLI), so it is
@@ -3783,7 +3795,7 @@ def _validate_slot_for_model(slot, model_id):
         if not _is_mistral_model(model_id):
             return False, 'Mistral Pro column only accepts Mistral models'
         if not _is_mistral_pro_eligible(model_id):
-            return False, 'Mistral Large is not on the Pro subscription — use PAYG'
+            return False, 'This Mistral model is not covered by the Pro subscription — use PAYG'
     if slot == 4 and not _is_scaleway_model(model_id):
         return False, 'EU Scaleway column only accepts Scaleway models (scw-*)'
     if slot == 5 and not _is_ollama_model(model_id):
@@ -3931,8 +3943,21 @@ _TASK_CLIENT_FIELDS = frozenset({
     'original_description', 'gate_state', 'gate_reason',
     'gate_source', 'gate_decided_at', 'gate_report_json',
     'gate_report_h2_json', 'hf_repo_id', 'awaiting_model',
-    'corpus_id', 'requires_rag', 'context_refs',
+    'corpus_id', 'requires_rag', 'context_refs', 'execution_type',
 })
+
+# Per-task processing types. Empty/None = a normal run.
+_TASK_EXECUTION_TYPES = ('research', 'deployment')
+
+
+def _norm_task_execution_type(value):
+    """'' / None → None; 'research' / 'deployment' → itself; else ValueError."""
+    v = (value or '').strip().lower()
+    if not v or v == 'standard':
+        return None
+    if v not in _TASK_EXECUTION_TYPES:
+        raise ValueError(f"execution_type must be one of: none, {', '.join(_TASK_EXECUTION_TYPES)}")
+    return v
 
 
 @app.route('/api/tasks/<int:tid>', methods=['PATCH'])
@@ -3945,6 +3970,11 @@ def update_task(tid):
     task = db.get_task(tid)
     if not task:
         return jsonify({'error': 'Task not found'}), 404
+    if 'execution_type' in data:
+        try:
+            data['execution_type'] = _norm_task_execution_type(data['execution_type'])
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
 
     # Lane B: handle context_refs update via normalized helper
     if 'context_refs' in data:
@@ -4527,7 +4557,8 @@ def _score_model(model_id, model_cfg, task_cfg, *, estimated_tokens,
     # ── cost ─────────────────────────────────────────────────────────────────
     cost_in = model_cfg.get('cost_input', 0.0)
     cost_out = model_cfg.get('cost_output', 0.0)
-    est_cost = (cost_in * 0.8 + cost_out * 0.2) * estimated_tokens / 1_000_000
+    est_cost = (cost_in * agent_config.ESTIMATE_INPUT_RATIO
+                + cost_out * agent_config.ESTIMATE_OUTPUT_RATIO) * estimated_tokens / 1_000_000
 
     balanced = quality
     if est_cost == 0.0:
@@ -8423,8 +8454,28 @@ def _start_slot_scheduler_once():
     print('[slot-scheduler] background tick started (60s interval)')
 
 
+def _apply_saved_app_settings():
+    """Re-apply Settings › General values saved in app_settings over the env
+    defaults; before this they were lost on every restart."""
+    try:
+        saved = db.get_app_settings()
+    except Exception as _e:
+        print(f'[startup] WARNING: could not read app_settings: {_e}')
+        return
+    if saved.get('anthropic_mode') in ('api', 'claude-code'):
+        agent_config.ANTHROPIC_MODE = saved['anthropic_mode']
+    if saved.get('mistral_mode') in ('api', 'vibe'):
+        agent_config.MISTRAL_MODE = saved['mistral_mode']
+    try:
+        if saved.get('claude_pro_token_budget'):
+            agent_config.SESSION_TOKEN_BUDGET = int(saved['claude_pro_token_budget'])
+    except ValueError:
+        pass
+
+
 if __name__ == '__main__':
     db.init_db()
+    _apply_saved_app_settings()
     # Bootstrap: generate aingel.json for any project that doesn't have one yet.
     try:
         _bootstrapped = 0

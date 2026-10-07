@@ -169,6 +169,24 @@ _STATUTE_TERMS = (
 )
 
 
+# Text introduced as an example: "(e.g., Art. 12(3) of Regulation Y)",
+# "for example art. 5", "np. art. 7". Parenthesised examples go whole; an
+# inline one up to the end of its clause.
+_EXAMPLE_PAREN_RE = re.compile(
+    r'\((?:e\.\s?g\.|eg\.|for example|for instance|such as|np\.|na przykład|przykładowo)'
+    r'(?:[^()]|\([^()]*\))*\)', re.I)
+_EXAMPLE_INLINE_RE = re.compile(
+    r'\b(?:e\.\s?g\.|for example|for instance|such as|np\.|na przykład|przykładowo)[,:]?\s*[^;\n)]*?(?=[;\n)]|\.\s|$)',
+    re.I)
+
+
+def _strip_examples(text):
+    """Remove example citations so they neither trigger nor steer a RAG lookup."""
+    if not text:
+        return text
+    return _EXAMPLE_INLINE_RE.sub(' ', _EXAMPLE_PAREN_RE.sub(' ', text))
+
+
 def _extract_legal_query(desc, title):
     """Build a focused RAG query from a (possibly long) task description.
 
@@ -199,6 +217,7 @@ def _extract_legal_query(desc, title):
         r'\(Dz\.U\.\s*\d{4}\s+poz\.\s*\d+[^)]*\)', ' ', blob, flags=re.IGNORECASE)
     blob = re.sub(
         r'\[OCR:[^\]]*\]', ' ', blob, flags=re.IGNORECASE)
+    blob = _strip_examples(blob)
     blob = re.sub(r'\s+', ' ', blob)
 
     # 1. Article references — the strongest signal. Keep them verbatim.
@@ -271,10 +290,12 @@ def detect_rag_intent(task, project):
     title = (task.get('title') or '').strip()
     project_type = ((project or {}).get('project_type') or '').lower()
 
+    # Citations given as examples ("e.g., Art. 12(3) of Regulation Y") are not
+    # a legal need: #10001184 fetched art. 12 for nothing.
     auto = bool(
         project_type == 'legal'
         or _role_is_legal(task)
-        or bool(_LEGAL_REGEX.search(desc or title))
+        or bool(_LEGAL_REGEX.search(_strip_examples(desc) or title))
     )
     requires = _task_requires_rag(task)
     if not (requires or auto):
@@ -708,10 +729,16 @@ def reindex_file(project_path, rel):
     return True
 
 
+# The local-index keyword: a line that starts with "rag:" (after optional
+# indentation / list marker). Anywhere-in-the-text matched citation templates
+# like '"RAG: [query], Source: …"' (#10001186).
+_RAG_KEYWORD_LINE_RE = re.compile(r'^[ \t]*(?:[-*•]\s+)?rag:', re.I | re.M)
+
+
 def _has_rag_keyword(task):
-    """Return True if description contains ``rag:`` (case-insensitive)."""
+    """Return True if a line of the description starts with ``rag:`` (case-insensitive)."""
     desc = (task or {}).get('description') or ''
-    return 'rag:' in desc.lower()
+    return bool(_RAG_KEYWORD_LINE_RE.search(desc))
 
 
 def _task_rag_index_refs(task, project_path):
@@ -801,9 +828,9 @@ def retrieve_local_rag(task, project_path, project=None):
     desc = (task or {}).get('description') or ''
     # Extract rag: query if present
     query = ''
-    low = desc.lower()
-    if 'rag:' in low:
-        idx = low.index('rag:')
+    _kw = _RAG_KEYWORD_LINE_RE.search(desc)
+    if _kw:
+        idx = _kw.end() - 4
         query = desc[idx + 4:].strip().split('\n')[0].strip()
         # Also include next sentence if short
         if len(query) < 5 and '\n' in desc[idx:]:

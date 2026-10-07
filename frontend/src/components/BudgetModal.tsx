@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useStore } from '../store';
 import { api } from '../api';
+import { fmtUsd, fmtPct } from '../utils/currency';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
 import type { BudgetInfo } from '../types';
 
@@ -94,20 +95,20 @@ export const BudgetModal = () => {
             >
               <div className="mb-2">
                 <span className="text-text-faint">Monthly budget: </span>
-                <strong>${(budget.monthly_budget || 0).toFixed(2)}</strong>
+                <strong>{fmtUsd(budget.monthly_budget)}</strong>
               </div>
               <div className="mb-2">
                 <span className="text-text-faint">Current spend: </span>
-                <strong>${(budget.current_month_spend || 0).toFixed(4)}</strong>
+                <strong>{fmtUsd(budget.current_month_spend)}</strong>
               </div>
               <div className="mb-2">
                 <span className="text-text-faint">Remaining: </span>
                 <strong style={{ color: exceeded ? '#a3402f' : '#56633f' }}>
-                  ${(budget.remaining || 0).toFixed(4)}
+                  {fmtUsd(budget.remaining)}
                 </strong>
               </div>
               <div className="mb-1 flex justify-between text-xs">
-                <span>{percent.toFixed(1)}% used</span>
+                <span>{fmtPct(percent)} used</span>
                 {exceeded ? <span className="text-danger font-semibold">Budget exceeded!</span> : null}
               </div>
               <div className="h-2 bg-[#eee7db] rounded overflow-hidden">

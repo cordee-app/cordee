@@ -23,7 +23,7 @@ _SCW_DEFAULT_PROJECT_ID = (
 # without one; gated/private repos require a token whose account has been granted
 # access. Kept in .env so a single token covers every import.
 _HF_TOKEN = os.environ.get('HF_TOKEN', '')
-_EUR_TO_USD = 1.08
+_EUR_TO_USD = agent_config.EUR_TO_USD
 # Official Scaleway Generative APIs Dedicated Deployment prices (fr-par), EUR/h.
 # Source: https://www.scaleway.com/en/pricing/model-as-a-service/ (verified 2026-10-05).
 _HOURLY_RATES = {

@@ -225,32 +225,99 @@ def _extract_referenced_files(description: str) -> List[str]:
     # `Doświadczenia%20z%20niemieckiego%20rynku.pdf`) name the file on disk
     # only once decoded; undecoded they also yield fake refs like `20rynku.pdf`.
     description = _decode_url_escapes(description)
+    # An extension needs a letter: 'DPN-WPOA.501.282.2026' is a case number,
+    # not a file with a '.2026' extension (#10001184, strict-mode false hold).
     refs = set()
     # Backtick-quoted: `foo.txt` or `/path/to/foo.py`
-    for m in re.findall(r'`([^`]+\.[a-zA-Z0-9]{2,5})`', description):
+    for m in re.findall(r'`([^`]+\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})`', description):
         if not _looks_like_url_or_email(m):
             refs.add(m)
     # Double-quoted: "foo.json"
-    for m in re.findall(r'"([^"]+\.[a-zA-Z0-9]{2,5})"', description):
+    for m in re.findall(r'"([^"]+\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})"', description):
         if not _looks_like_url_or_email(m):
             refs.add(m)
     # Single-quoted: 'foo.json' or 'Working Documents/CUPT/II Etap/foo.pdf'
-    for m in re.findall(r"'([^']+\.[a-zA-Z0-9]{2,5})'", description):
+    for m in re.findall(r"'([^']+\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})'", description):
         if not _looks_like_url_or_email(m):
             refs.add(m)
     # Bare paths: /foo/bar/baz.ext  or  ./foo/bar.ext
-    for m in re.findall(r'(?<![\w/])(\.{0,2}/[\w./\-]+\.[a-zA-Z0-9]{2,5})', description):
+    for m in re.findall(r'(?<![\w/])(\.{0,2}/[\w./\-]+\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})', description):
         if not _looks_like_url_or_email(m):
             refs.add(m)
     # Bare filenames: word chars + .ext  (only if the stem looks identifier-ish
     # to avoid catching English prose like "this is")
-    for m in re.findall(r'(?<![\w./\-])([A-Za-z0-9_\-./]{4,}\.[a-zA-Z0-9]{2,5})\b', description):
+    for m in re.findall(r'(?<![\w./\-])([A-Za-z0-9_\-./]{4,}\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})\b', description):
         if _looks_like_url_or_email(m):
             continue
         stem = os.path.splitext(m)[0]
         if any(c in stem for c in '_-') or any(c.isdigit() for c in stem) or any(c.isupper() for c in stem):
             refs.add(m)
-    return sorted(refs)
+    # Name templates ("e.g., 'DPP-XXXXXX.md'", '<decision>.md') describe a file
+    # to create, not one to read; H2 reported them as missing inputs (#10001185).
+    return sorted(r for r in refs
+                  if not _PLACEHOLDER_RE.search(os.path.basename(r)) and _has_file_extension(r)
+                  and not _only_excluded(description, r))
+
+
+# "Do not reference `READMEFIRST.md`" names a file the task must NOT use; it is
+# not an input (#10001186). Only use-verbs count: "do not modify `a.pdf`"
+# still implies the file exists and is read.
+_EXCLUDED_REF_RE = re.compile(
+    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|avoid)\s+"
+    r"(?:\w+\s+){0,2}?(?:reference|referencing|use|using|read|reading|open|opening|"
+    r"include|including|cite|citing|consult|consulting|rely\s+on|look\s+at)\b[^.\n]{0,80}$",
+    re.I)
+
+
+def _only_excluded(description: str, ref: str) -> bool:
+    """True when every mention of ref sits in a "do not use/read/reference …" phrase."""
+    positions = [m.start() for m in re.finditer(re.escape(ref), description)]
+    if not positions:
+        return False
+    for i in positions:
+        sent_start = max(description.rfind('.', 0, i - 1), description.rfind('\n', 0, i)) + 1
+        before = re.sub(r'[*_`]', '', description[sent_start:i]).rstrip('"\' ')
+        if not _EXCLUDED_REF_RE.search(before):
+            return False
+    return True
+
+
+# Extensions accepted in any case ('.PDF', '.Xlsx'). Anything else must be
+# written in lowercase: an unknown all-caps ending is a case-number suffix
+# ('DPN-WPOA.501.282.2026.1.DK', 'DPP-WOPN.718.4.2021.PP'), not a file type
+# (#10001186). Kept broad on purpose — a missed extension once meant tasks
+# could not reference .xlsx files.
+_KNOWN_FILE_EXTS = frozenset("""
+    pdf doc docx docm dot dotx odt rtf txt text md markdown mdx rst tex pages wpd
+    xls xlsx xlsm xlsb xlt xltx ods csv tsv numbers
+    ppt pptx pptm pps ppsx pot potx odp key
+    eml msg mbox ics vcf
+    html htm xhtml xml xsd xsl rels json jsonl ndjson yaml yml toml ini cfg conf
+    env properties sql db sqlite sqlite3 parquet feather avro orc
+    log err out lock bak tmp timer service cron
+    py ipynb js mjs cjs ts tsx jsx css scss sass less vue svelte php rb go rs java
+    kt kts scala c h cc cpp cxx hpp cs swift m mm r jl lua pl pm dart ex exs erl
+    hs clj sh bash zsh fish ps1 psm1 bat cmd mk cmake gradle dockerfile tf hcl
+    mmd puml dot graphml
+    png jpg jpeg gif bmp tif tiff webp svg ico heic heif avif psd ai eps raw
+    mp3 wav flac ogg m4a aac opus wma mid midi
+    mp4 mov avi mkv webm wmv flv m4v mpg mpeg 3gp
+    zip tar gz tgz bz2 xz 7z rar zst
+    stl step stp iges igs 3mf obj fbx dxf dwg scad gcode f3d sldprt sldasm blend
+    gpx kml kmz geojson shp
+    epub mobi azw3 djvu xps oxps
+    srt vtt sub ass
+    pem crt key pub p12
+    """.split())
+
+
+def _has_file_extension(ref: str) -> bool:
+    ext = os.path.splitext(os.path.basename(ref))[1][1:]
+    if not ext:
+        return False
+    if ext.lower() in _KNOWN_FILE_EXTS:
+        return True
+    return 2 <= len(ext) <= 5 and not ext.isupper()
 
 
 # A file the task is told to CREATE is not a missing input. The verb must sit
@@ -259,6 +326,17 @@ def _extract_referenced_files(description: str) -> List[str]:
 _OUTPUT_VERB_RE = re.compile(
     r'\b(?:save|saved|saving|write|writing|create|created|creating|produce|'
     r'generate|generated|export|store)\b(?P<gap>[^\n`"\']{0,60})$', re.I)
+# Imperative naming at the start of a sentence: "Name the output file … 'X.md'".
+# No input-word check: "using the decision number" there describes the name.
+# Only consulted for files that do not exist yet, so a renamed source is safe.
+_NAME_VERB_RE = re.compile(
+    r'(?:^|[.;:!?]\s+|\(\s*)(?:name|rename)\b[^\n`"\']{0,90}$', re.I)
+# Runs of X / YYYY must stand alone so Roman numerals ('Uchwała_XXXIV.pdf') survive.
+_PLACEHOLDER_RE = re.compile(
+    r'(?<![A-Za-z])(?:X{3,}|x{3,}|YYYY)(?![A-Za-z])|<[^>]*>|\{[^}]*\}|\.{3}|…')
+# The description asks for the shared library: "RAG" as a word, or
+# "rag library/system/corpus" in any case.
+_RAG_REQUEST_RE = re.compile(r'\bRAG\b|\b(?i:rag)\s+(?i:library|system|corpus)\b')
 _INPUT_WORD_RE = re.compile(
     r'\b(?:of|from|using|based on|read|open|extract|analy[sz]e|review|'
     r'summari[sz]e|compare|parse|load|consult)\b', re.I)
@@ -284,10 +362,39 @@ def _output_target_refs(description: str, refs: List[str]) -> set:
             # Drop the quote/backtick that opens the reference itself.
             before = desc[line_start:i].rstrip('`"\'')[-90:]
             m = _OUTPUT_VERB_RE.search(before)
-            if m and not _INPUT_WORD_RE.search(m.group('gap')):
+            if (m and not _INPUT_WORD_RE.search(m.group('gap'))) or _NAME_VERB_RE.search(before) \
+                    or _list_parent_is_output(desc, line_start, before):
                 targets.add(ref)
                 break
     return targets
+
+
+_LIST_MARKER_RE = re.compile(r'^\s*(?:[-*•+]|\d+[.)])\s+')
+# A parent line that announces outputs: imperative verb first, or an
+# "Output(s):" heading — after list markers and markdown emphasis.
+_OUTPUT_PARENT_RE = re.compile(
+    r'^(?:save|write|create|produce|generate|export|store)\b|^outputs?\b', re.I)
+
+
+def _list_parent_is_output(desc: str, line_start: int, before: str) -> bool:
+    """True when the reference is a list item whose parent line asks for outputs:
+
+        - Produce two separate text files:
+          - `UTK_reply_option1.txt` (…)
+
+    The parent is the nearest earlier line with less indentation (#10001186).
+    """
+    if not _LIST_MARKER_RE.match(before) or _LIST_MARKER_RE.sub('', before).strip(' `*_"\''):
+        return False  # not a bare list item holding just the reference
+    indent = len(before) - len(before.lstrip())
+    lines = desc[:line_start].rstrip('\n').split('\n')
+    for line in reversed(lines[-12:]):
+        if not line.strip():
+            continue
+        if len(line) - len(line.lstrip()) < indent:
+            head = _LIST_MARKER_RE.sub('', line).strip().lstrip('*_ ')
+            return bool(_OUTPUT_PARENT_RE.match(head))
+    return False
 
 
 def _scan_folders() -> List[str]:
@@ -297,6 +404,41 @@ def _scan_folders() -> List[str]:
     except Exception:
         _WORKING_DOC_FOLDERS = ('My Docs', 'Working Docs', 'Working Documents', 'working-docs', 'docs')
     return list(_WORKING_DOC_FOLDERS) + [os.path.join('Artifacts', 'outputs')]
+
+
+def _cited_project_folders(description: str, project_path: str) -> List[str]:
+    """Folders under the scanned roots (depth <= 3) whose name the description
+    cites, as paths relative to the project root.
+
+    H2 only knew about cited *files*; asked to work in a cited folder
+    ('Search the folder OCR_Mistral'), it could not tell the folder exists
+    and held the run under strict mode (#10001184).
+    """
+    if not description or not project_path or not os.path.isdir(project_path):
+        return []
+    norm_desc = _h2a_norm(description)
+    found = []
+
+    def _walk(d, depth):
+        try:
+            entries = sorted(os.listdir(d))
+        except OSError:
+            return
+        for name in entries:
+            full = os.path.join(d, name)
+            if name.startswith('.') or not os.path.isdir(full):
+                continue
+            if len(name) >= 3 and name.lower() not in _H2A_GENERIC_DIRS \
+                    and _h2a_mentions(norm_desc, _h2a_norm(name)):
+                found.append(os.path.relpath(full, project_path))
+            if depth < 3:
+                _walk(full, depth + 1)
+
+    for root in _scan_folders():
+        if root.replace('\\', '/').lower() == 'artifacts/outputs':
+            continue  # task-output slugs, not folders a description cites
+        _walk(os.path.join(project_path, root), 1)
+    return found
 
 
 def _resolve_referenced_path(path: str, project_path: str) -> Optional[str]:
@@ -379,7 +521,8 @@ def pre_run_check(task: Dict[str, Any],
                   model_caps: Dict[str, Any],
                   dep_titles: List[str],
                   budget_snapshot: Optional[Dict[str, Any]] = None,
-                  dep_outcomes: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                  dep_outcomes: Optional[List[Dict[str, Any]]] = None,
+                  rag_provenance: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One medium-AI call that returns both strategic brief + completeness check.
 
     Returns a dict with keys:
@@ -575,7 +718,14 @@ def pre_run_check(task: Dict[str, Any],
             f"{json.dumps(output_expected[:6], ensure_ascii=False)}\n"
         )
     prompt += f"Binary unparsable analysis: {binary_block}\n"
+    cited_dirs = _cited_project_folders(task.get('description') or '', project_path)
+    if cited_dirs:
+        prompt += (
+            "Folders named in the description that EXIST inside the project "
+            f"(an agentic model can list and read them itself): {json.dumps(cited_dirs[:8], ensure_ascii=False)}\n"
+        )
     # RAG intent: does this task need the shared legal library?
+    _rag_intent = None
     try:
         import agent_rag as _rag
         _rag_intent = _rag.detect_rag_intent(task, project)
@@ -586,12 +736,41 @@ def pre_run_check(task: Dict[str, Any],
                 "It MUST be grounded on retrieved citations (Dz.U./CELEX/ELI). "
                 "If the library is unavailable (empty corpus / service down), set gate=hold.\n"
             )
+            # Retrieval already ran while the prompt was built: state its outcome,
+            # so the gate is not decided on "availability unconfirmed" (#10001184).
+            if rag_provenance:
+                if rag_provenance.get('error'):
+                    prompt += f"RAG retrieval FAILED: {str(rag_provenance.get('error'))[:200]}\n"
+                elif rag_provenance.get('n_hits'):
+                    prompt += (f"RAG retrieval already ran: {rag_provenance.get('n_hits')} citations "
+                               "inlined in the prompt — the library is available.\n")
+                else:
+                    prompt += "RAG retrieval already ran and returned 0 citations.\n"
     except Exception:
         pass
+    # A description that asks for the RAG library while no retrieval is set up
+    # (Requires RAG off, no legal markers, no tagged rag-index refs) gets
+    # sources the run never retrieved (#10001186). Held deterministically below.
+    # Scaleway/Ollama models run the in-process tool loop, which offers the
+    # rag_query tool when the project has the library on: wired as well.
+    _model_id = (task.get('model') or '').strip()
+    _has_rag_tool = (_model_id.startswith(('scw-', 'oll-'))
+                     and bool((project or {}).get('use_rag')))
+    rag_unwired = False
+    if not _rag_intent and not _has_rag_tool \
+            and _RAG_REQUEST_RE.search(task.get('description') or ''):
+        try:
+            import agent_rag as _rag_refs
+            rag_unwired = not _rag_refs._task_rag_index_refs(task, project_path)
+        except Exception:
+            rag_unwired = True
+    if rag_unwired:
+        prompt += ("RAG: the description asks for the RAG library, but no retrieval is set up "
+                   "for this run; the model cannot consult it.\n")
     prompt += f"Description:\n{desc}\n\n"
     prompt += (
         "Rules for `gate`:\n"
-        "- run: every referenced file is inlined, OR the route is agentic and the file is inside the project (self-serve); no blocking binary mismatches.\n"
+        "- run: every referenced file is inlined, OR the route is agentic and the file is inside the project (self-serve); no blocking binary mismatches. A folder listed above as existing inside the project is reachable by an agentic model and is never a reason to hold.\n"
         "- hold: partial — minor warnings the user should see but can override (e.g. agentic self-serve of a file that may not exist).\n"
         "- skip: incomplete OR a binary file is unparsable by this model OR a referenced path is OUTSIDE the project folder (containment breach) OR a capability mismatch makes the task unreachable as written.\n"
         "`strategic_advice`: 1-3 short bullets on model fit + risks (one string, use ' • ' as separator).\n"
@@ -634,6 +813,12 @@ def pre_run_check(task: Dict[str, Any],
             parsed['reason'] = (
                 f"{', '.join(os.path.basename(t) for t in output_expected[:3])} is this task's "
                 "own output and will be created; no blocking issue found")
+    if rag_unwired and parsed.get('gate') != 'skip':
+        parsed['gate'] = 'hold'
+        parsed['reason'] = (
+            'The description asks for the RAG library, but none will be consulted: tick '
+            '"Requires RAG library" on the task (the project must have the RAG library on) '
+            'and name the provisions to look up, or remove the RAG instruction.')
     # Force skip on containment breaches regardless of model opinion.
     if any('OUTSIDE the project folder' in (m.get('reason') or '') for m in missing):
         parsed['gate'] = 'skip'
@@ -642,6 +827,103 @@ def pre_run_check(task: Dict[str, Any],
         ))
         parsed['reason'] = 'referenced path outside project folder — containment breach'
     return parsed
+
+
+_H2A_FILE_CAP = 120
+_H2A_FOLDER_CAP = 60
+# A filename token shared by more files than this is a naming convention
+# (e.g. 'wopn' in 41 DPP-WOPN.*.md files), not evidence of relevance.
+_H2A_TOKEN_DISTINCTIVE_MAX = 5
+# Path components that say nothing about the task: the working-doc roots and
+# the Artifacts/outputs prefix. Task-output slug folders are skipped separately.
+_H2A_GENERIC_DIRS = {'my docs', 'working docs', 'working documents', 'working-docs',
+                     'docs', 'artifacts', 'outputs'}
+
+
+def _h2a_norm(s: str) -> str:
+    return re.sub(r'[_\-\s]+', ' ', s.lower()).strip()
+
+
+def _h2a_mentions(norm_desc: str, norm_term: str) -> bool:
+    """Whole-word mention of an already-normalised term in the description."""
+    if not norm_term:
+        return False
+    return re.search(r'(?<![^\W_])' + re.escape(norm_term) + r'(?![^\W_])', norm_desc) is not None
+
+
+def _rank_h2a_paths(paths: List[str], desc: str):
+    """Order H2a's file list by relevance to the description and cap it, and
+    build the folder list shown beside it.
+
+    Tiers (best first): 4 = the file's own name is cited; 3 = the file sits
+    in a folder the description cites; 2 = a distinctive filename token is
+    cited; 0 = everything else. Scoring looks at the basename and at
+    real folder names only — never at the working-doc root names or at the
+    Artifacts/outputs/<task-slug> folders, whose slugs are built from task
+    titles full of common words ('find', 'file', 'decision'...).
+
+    History: #10001126 added relevance ordering on bare basenames. #10001145
+    switched the list to relative paths so nested references could be matched,
+    which silently turned the "stem in description" check into a full-path
+    check that never fired; #10001185 then had its file buried among
+    old outputs and its cited output folder cut off by the cap.
+
+    Returns (file_list, folder_list); folder_list entries are
+    "<relative folder> (<n> files)".
+    """
+    norm_desc = _h2a_norm(desc)
+    token_df: Dict[str, int] = {}
+    for p in paths:
+        stem = os.path.splitext(os.path.basename(p))[0]
+        for t in {t for t in re.split(r'[_\-\s.]+', stem.lower()) if len(t) >= 4}:
+            token_df[t] = token_df.get(t, 0) + 1
+
+    def _meaningful_dirs(p: str) -> List[str]:
+        parts = p.replace('\\', '/').split('/')[:-1]
+        out = []
+        for i, part in enumerate(parts):
+            if part.lower() in _H2A_GENERIC_DIRS:
+                continue
+            if i == 2 and [x.lower() for x in parts[:2]] == ['artifacts', 'outputs']:
+                continue  # task-output slug
+            out.append(part)
+        return out
+
+    def _score(p: str) -> int:
+        stem = os.path.splitext(os.path.basename(p))[0]
+        base = os.path.basename(p)
+        # A one-word stem ('TASKS', '_summary', '_index') is just an English word
+        # in most descriptions; it needs its extension to count as cited.
+        stem_n = _h2a_norm(stem)
+        if _h2a_mentions(norm_desc, _h2a_norm(base)) or (
+                len(stem) >= 4 and re.search(r'[\d\s.]', stem_n)
+                and _h2a_mentions(norm_desc, stem_n)):
+            return 4
+        if any(len(d) >= 3 and _h2a_mentions(norm_desc, _h2a_norm(d)) for d in _meaningful_dirs(p)):
+            return 3
+        tokens = {t for t in re.split(r'[_\-\s.]+', stem.lower()) if len(t) >= 4}
+        if any(token_df.get(t, 0) <= _H2A_TOKEN_DISTINCTIVE_MAX and _h2a_mentions(norm_desc, t)
+               for t in tokens):
+            return 2
+        return 0
+
+    file_list = sorted(paths, key=lambda p: (-_score(p), p.lower()))[:_H2A_FILE_CAP]
+
+    counts: Dict[str, int] = {}
+    for p in paths:
+        d = os.path.dirname(p)
+        if d:
+            counts[d] = counts.get(d, 0) + 1
+
+    def _folder_key(d: str):
+        base = os.path.basename(d)
+        cited = base.lower() not in _H2A_GENERIC_DIRS and _h2a_mentions(norm_desc, _h2a_norm(base))
+        is_output = d.replace('\\', '/').lower().startswith('artifacts/outputs')
+        return (0 if cited else 1, 1 if is_output else 0, d.lower())
+
+    folder_list = [f'{d} ({counts[d]} files)'
+                   for d in sorted(counts, key=_folder_key)[:_H2A_FOLDER_CAP]]
+    return file_list, folder_list
 
 
 def pre_check_questions(task: Dict[str, Any],
@@ -678,15 +960,7 @@ def pre_check_questions(task: Dict[str, Any],
     # The naive [:40] alphabetical cap hid files the task actually referenced
     # (task #10001126 — umowa file sat at index 234 of 334, so the overseer
     # wrongly concluded the file didn't exist and asked a bogus question).
-    desc_l = desc.lower()
-    def _relevance(name: str):
-        n_l = name.lower()
-        stem = os.path.splitext(n_l)[0]
-        tokens = [t for t in re.split(r'[_\-\s]+', stem) if len(t) >= 4]
-        score = 3 if (stem and stem in desc_l) else 2 if any(t in desc_l for t in tokens) else 0
-        return (-score, n_l)
-    ordered_names = sorted((file_names or []), key=_relevance)
-    file_list = ordered_names[:120]
+    file_list, folder_list = _rank_h2a_paths(file_names or [], desc)
 
     # The list above covers Working Docs and Artifacts/outputs only. A file the
     # description names that exists at the project root instead is real, but
@@ -722,6 +996,9 @@ def pre_check_questions(task: Dict[str, Any],
         f"Model assigned: {task.get('model','n/a')}\n\n"
         f"Files available in the project (paths relative to project root, content not read):\n"
         f"{json.dumps(file_list, ensure_ascii=False)}\n\n"
+        f"Folders in the project (with file counts; folders named in the description first — "
+        f"a folder listed here exists even if none of its files appear in the file list above):\n"
+        f"{json.dumps(folder_list, ensure_ascii=False)}\n\n"
         f"{root_block}"
         f"Description:\n{desc}\n\n"
         f"Rules:\n"

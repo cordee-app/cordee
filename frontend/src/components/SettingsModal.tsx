@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useStore } from '../store';
 import { api } from '../api';
 import { cn } from '../utils/cn';
+import { fmtEur, fmtUsd } from '../utils/currency';
 import { SettingsUsersTab } from './SettingsUsersTab';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
 import type { Config, ProviderReadiness, ScwSessionStatus, ProjectHfModel, HfSearchResult, HfImportVerify } from '../types';
@@ -14,7 +15,7 @@ const isVault = Boolean((typeof window !== 'undefined' && (window as unknown as 
 export const SettingsModal = () => {
   const {
     showSettingsModal, setShowSettingsModal,
-    activeProject, projects, roleTemplates, models,
+    activeProject, projects, models,
     settingsDirty, setSettingsDirty,
     setKanbanTokenBudget,
     user,
@@ -39,14 +40,12 @@ export const SettingsModal = () => {
 
   const [ptype, setPtype] = useState('');
   const [euOnly, setEuOnly] = useState(false);
-  const [llmMode, setLlmMode] = useState('standard');
   const [monthlyBudget, setMonthlyBudget] = useState('0');
   const [budgetResetDay, setBudgetResetDay] = useState('1');
-  const [gitMode, setGitMode] = useState('auto');
-  const [executionType, setExecutionType] = useState('standard');
   const [aingelName, setAingelName] = useState('');
   const [aingelModel, setAingelModel] = useState('');
   const [autopilot, setAutopilot] = useState(false);
+  const [aingelMode, setAingelMode] = useState('strict');
   const [useRag, setUseRag] = useState(false);
   const [ragCorpusId, setRagCorpusId] = useState('railway');
   const [saving, setSaving] = useState(false);
@@ -98,22 +97,50 @@ export const SettingsModal = () => {
     } catch { /* ignore */ }
   }, []);
 
+  // Save sends only the fields that differ from what the form loaded, so a
+  // form opened before a change made elsewhere (another tab, a direct DB fix)
+  // cannot silently put the old value back.
+  const loadedPayload = useRef<Record<string, unknown>>({});
+  const buildProjectPayload = (v: {
+    euOnly: boolean; monthlyBudget: string; budgetResetDay: string; aingelName: string;
+    aingelModel: string; autopilot: boolean; aingelMode: string; useRag: boolean; ragCorpusId: string;
+  }): Record<string, unknown> => ({
+    eu_only: v.euOnly,
+    monthly_budget: parseFloat(v.monthlyBudget) || 0,
+    budget_reset_day: parseInt(v.budgetResetDay, 10) || 1,
+    aingel_name: v.aingelName.trim() || null,
+    aingel_model: v.aingelModel || null,
+    aingel_autopilot: v.autopilot ? 1 : 0,
+    aingel_mode: v.aingelMode,
+    use_rag: v.useRag ? 1 : 0,
+    rag_corpus_id: v.ragCorpusId,
+  });
+
   const loadProjectFields = useCallback(() => {
     const proj = activeProject ? projects.find(p => p.id === activeProject) : null;
     if (!proj) return;
     const p = proj as unknown as Record<string, unknown>;
     setPtype(String(p.project_type || ''));
     setEuOnly(Boolean(p.eu_only));
-    setLlmMode(String(p.llm_mode || 'standard'));
     setMonthlyBudget(String(p.budget_monthly || p.monthly_budget || '0'));
     setBudgetResetDay(String(p.budget_reset_day || '1'));
-    setGitMode(String(p.git_mode || (p.git_enabled ? 'on' : 'off')));
-    setExecutionType(String(p.execution_type || 'standard'));
     setAingelName(String(p.aingel_name || ''));
     setAingelModel(String(p.aingel_model || ''));
     setAutopilot(Boolean(p.aingel_autopilot));
+    setAingelMode(String(p.aingel_mode || 'advisory'));
     setUseRag(Boolean(p.use_rag));
     setRagCorpusId(String(p.rag_corpus_id || 'railway'));
+    loadedPayload.current = buildProjectPayload({
+      euOnly: Boolean(p.eu_only),
+      monthlyBudget: String(p.budget_monthly || p.monthly_budget || '0'),
+      budgetResetDay: String(p.budget_reset_day || '1'),
+      aingelName: String(p.aingel_name || ''),
+      aingelModel: String(p.aingel_model || ''),
+      autopilot: Boolean(p.aingel_autopilot),
+      aingelMode: String(p.aingel_mode || 'advisory'),
+      useRag: Boolean(p.use_rag),
+      ragCorpusId: String(p.rag_corpus_id || 'railway'),
+    });
   }, [activeProject, projects]);
 
   useEffect(() => {
@@ -363,9 +390,6 @@ export const SettingsModal = () => {
     }
   };
 
-  const fmtEur = (n: number) => `€${(n || 0).toFixed(2)}`;
-  const fmtUsd = (n: number) => `$${(n || 0).toFixed(2)}`;
-
   const setDirty = () => { if (!settingsDirty) setSettingsDirty(true); };
 
   const handleSetAnthropicMode = async (mode: string) => {
@@ -424,23 +448,20 @@ export const SettingsModal = () => {
 
   const saveProjectSettings = async () => {
     if (!activeProject || !canAdminProject) return;
+    const current = buildProjectPayload({
+      euOnly, monthlyBudget, budgetResetDay, aingelName, aingelModel,
+      autopilot, aingelMode, useRag, ragCorpusId,
+    });
+    const changed = Object.fromEntries(Object.entries(current).filter(
+      ([k, v]) => JSON.stringify(v) !== JSON.stringify(loadedPayload.current[k])));
+    if (Object.keys(changed).length === 0) {
+      setSettingsDirty(false);
+      return;
+    }
     setSaving(true);
     try {
-      await api.projects.update(activeProject, {
-        project_type: ptype,
-        eu_only: euOnly,
-        llm_mode: llmMode,
-        monthly_budget: parseFloat(monthlyBudget) || 0,
-        budget_reset_day: parseInt(budgetResetDay, 10) || 1,
-        git_mode: gitMode,
-        git_enabled: gitMode !== 'off' ? 1 : 0,
-        execution_type: executionType,
-        aingel_name: aingelName.trim() || null,
-        aingel_model: aingelModel || null,
-        aingel_autopilot: autopilot ? 1 : 0,
-        use_rag: useRag ? 1 : 0,
-        rag_corpus_id: ragCorpusId,
-      });
+      await api.projects.update(activeProject, changed);
+      loadedPayload.current = current;
       setSettingsDirty(false);
     } catch (e) {
       alert('Error: ' + (e instanceof Error ? e.message : 'unknown'));
@@ -626,13 +647,8 @@ export const SettingsModal = () => {
                   <input data-tip="Project name (read-only)" type="text" className="w-full py-[7px] px-2.5 border border-default rounded text-base opacity-60" value={projects.find(p => p.id === activeProject)?.name || ''} disabled />
                 </div>
                 <div className="form-group mb-3">
-                  <label className="block text-sm font-semibold text-text-soft mb-[3px]">Project Type</label>
-                  <select data-tip="Set the project type template" className={cn('w-full py-[7px] px-2.5 border border-default rounded text-base', roClass)} value={ptype} onChange={e => { setPtype(e.target.value); setDirty(); }} disabled={ro}>
-                    <option value="">— None —</option>
-                    {roleTemplates.map(t => (
-                      <option key={t.id} value={t.name}>{t.name}</option>
-                    ))}
-                  </select>
+                  <label className="block text-sm font-semibold text-text-soft mb-[3px]">Project type <span className="font-normal text-text-faint">— template used at creation</span></label>
+                  <input data-tip="Role template applied when the project was created; changing it later would not change the roles. A Legal project also consults the legal library on every task when the RAG library is on." type="text" className="w-full py-[7px] px-2.5 border border-default rounded text-base opacity-60" value={ptype || '— None —'} disabled />
                 </div>
                 <div className="form-group mb-3">
                   <label className="inline-flex items-center gap-2 cursor-pointer">
@@ -641,36 +657,12 @@ export const SettingsModal = () => {
                   </label>
                 </div>
                 <div className="form-group mb-3">
-                  <label className="block text-sm font-semibold text-text-soft mb-[3px]">LLM Mode</label>
-                  <select data-tip="Set the LLM routing mode" className={cn('w-full py-[7px] px-2.5 border border-default rounded text-base', roClass)} value={llmMode} onChange={e => { setLlmMode(e.target.value); setDirty(); }} disabled={ro}>
-                    <option value="standard">Standard</option>
-                    <option value="specific">Specific</option>
-                  </select>
-                </div>
-                <div className="form-group mb-3">
                   <label className="block text-sm font-semibold text-text-soft mb-[3px]">Monthly budget (USD) <span className="font-normal text-text-faint">— leave 0 to disable</span></label>
                   <input data-tip="Set monthly budget (USD, 0 disables)" type="number" className={cn('w-35 py-[7px] px-2.5 border border-default rounded text-base', roClass)} value={monthlyBudget} onChange={e => { setMonthlyBudget(e.target.value); setDirty(); }} min={0} step={0.01} style={{ width: 140 }} disabled={ro} />
                 </div>
                 <div className="form-group mb-3">
                   <label className="block text-sm font-semibold text-text-soft mb-[3px]">Budget reset day <span className="font-normal text-text-faint">(1–28)</span></label>
                   <input data-tip="Set the budget reset day (1–28)" type="number" className={cn('py-[7px] px-2.5 border border-default rounded text-base', roClass)} value={budgetResetDay} onChange={e => { setBudgetResetDay(e.target.value); setDirty(); }} min={1} max={28} step={1} style={{ width: 80 }} disabled={ro} />
-                </div>
-                <div className="form-group mb-3">
-                  <label className="block text-sm font-semibold text-text-soft mb-[3px]">Git mode</label>
-                  <select data-tip="Set git validation mode" className={cn('w-full py-[7px] px-2.5 border border-default rounded text-base', roClass)} value={gitMode} onChange={e => { setGitMode(e.target.value); setDirty(); }} disabled={ro}>
-                    <option value="auto">Auto</option>
-                    <option value="on">On</option>
-                    <option value="off">Off</option>
-                  </select>
-                </div>
-                <div className="form-group mb-3">
-                  <label className="block text-sm font-semibold text-text-soft mb-[3px]">Execution type</label>
-                  <select data-tip="Set the execution type" className={cn('w-full py-[7px] px-2.5 border border-default rounded text-base', roClass)} value={executionType} onChange={e => { setExecutionType(e.target.value); setDirty(); }} disabled={ro}>
-                    <option value="standard">Standard</option>
-                    <option value="software">Software</option>
-                    <option value="research">Research</option>
-                    <option value="deployment">Deployment</option>
-                  </select>
                 </div>
                 <div className="form-group mb-3">
                   <label className="block text-sm font-semibold text-text-soft mb-[3px]">Guide name <span className="font-normal text-text-faint">— optional AI persona name</span></label>
@@ -691,6 +683,13 @@ export const SettingsModal = () => {
                     <input data-tip="Enable guide autopilot oversight" type="checkbox" className={roClass} checked={autopilot} onChange={e => { setAutopilot(e.target.checked); setDirty(); }} disabled={ro} />
                     Enable autopilot oversight
                   </label>
+                  <div className="mt-2">
+                    <label className="block text-sm font-semibold text-text-soft mb-[3px]">Guide mode</label>
+                    <select data-tip="Strict: a Guide hold stops the run. Advisory: a hold is only a warning." className={cn('w-full py-[7px] px-2.5 border border-default rounded text-base', roClass)} value={aingelMode} onChange={e => { setAingelMode(e.target.value); setDirty(); }} disabled={ro || !autopilot}>
+                      <option value="strict">Strict — a Guide hold stops the run</option>
+                      <option value="advisory">Advisory — a Guide hold is only a warning</option>
+                    </select>
+                  </div>
                 </div>
 
                 <div className="form-group mb-3 border-t border-border-muted pt-3 mt-3">

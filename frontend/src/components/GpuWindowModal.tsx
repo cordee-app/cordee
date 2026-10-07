@@ -2,11 +2,10 @@ import { useState, useEffect, useCallback } from 'react';
 import { useStore } from '../store';
 import { api } from '../api';
 import { cn } from '../utils/cn';
+import { fmtEur, fmtUsd } from '../utils/currency';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
 import type { HfQueueGroup, GpuWindow, GpuWindowModel, GpuRunStatus, HfImportVerify } from '../types';
 
-const fmtEur = (n: number) => `€${(n || 0).toFixed(2)}`;
-const fmtUsd = (n: number) => `$${(n || 0).toFixed(2)}`;
 const timeAgo = (s: string) => {
   if (!s) return '';
   const d = new Date(s.replace(' ', 'T') + (s.includes('Z') || s.includes('+') ? '' : 'Z'));

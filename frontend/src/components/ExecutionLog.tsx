@@ -3,12 +3,14 @@ import { useStore } from '../store';
 import { api } from '../api';
 import { cn } from '../utils/cn';
 import { fmtTokens } from '../utils/tokens';
+import { fmtUsd } from '../utils/currency';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useProjectPermissions, roleAtLeast } from '../hooks/useProjectPermissions';
 import type { ProjectRole } from '../hooks/useProjectPermissions';
 import type { Execution, MemoryLevel } from '../types';
 import { CircleCheck, X, LoaderCircle, GitCommitHorizontal, GitBranch, GitMerge, Sparkles, RefreshCw, CircleSlash, ChevronRight, ChevronDown } from 'lucide-react';
 import { relUrl } from '../utils/file';
+import { stuckReason } from '../utils/stuck';
 
 const LOG_HEIGHT_KEY = 'log_panel_height';
 const COL_WIDTHS_KEY = 'superagent_exec_col_widths';
@@ -430,9 +432,7 @@ export const ExecutionLog = () => {
                   const hasOutput = e.output_summary && !e.output_summary.startsWith('[STUB');
                   const hasError = e.error_message && e.error_message.length > 0;
                   const elapsedMins = e.status === 'running' ? elapsedMinutes(e.started_at) : 0;
-                  // spec requires: const isStuck = e.status === 'running' && elapsedMinutes > 15 && (e.tokens_output || e.cost_usd * 0 === 0)
-                  // The OR hack (e.cost_usd*0===0) is always true, so we also explicitly check tokens_output === 0 to avoid false positives when tokens exist
-                  const isStuck = e.status === 'running' && elapsedMins > 15 && (e.tokens_output || e.cost_usd * 0 === 0) && (e.tokens_output || 0) === 0;
+                  const stuck = stuckReason(e);
                   return (
                     <tr key={e.id} id={`log-${e.id}`} className={cn('log-row', `status-${e.status}`)}>
                       <td className={tdBase}>
@@ -511,11 +511,11 @@ export const ExecutionLog = () => {
                               {fmtTokens(e.tokens_input)}↑{fmtTokens(e.tokens_output)}↓
                             </span>
                           )}
-                          {isStuck && (
+                          {stuck && (
                             <span
                               className="text-xs font-semibold rounded px-1.5 py-px"
                               style={{ background: '#fff2eb', color: '#b2622d', border: '1px solid #b2622d' }}
-                              title={`Running for ${elapsedMins} min with 0 output tokens. Consider cancelling and re-running.`}
+                              title={stuck}
                             >
                               ⚠ may be stuck
                             </span>
@@ -523,7 +523,7 @@ export const ExecutionLog = () => {
                         </span>
                       </td>
                       <td className={cn(tdBase, 'text-status-done font-semibold')} style={{ fontVariantNumeric: 'tabular-nums' }}>
-                        ${(e.cost_usd || 0).toFixed(4)}
+                        {fmtUsd(e.cost_usd)}
                       </td>
                       <td className={tdBase}>
                         <ExecFileCell exec={e} />
@@ -707,7 +707,7 @@ export const ExecutionLog = () => {
                 const hasError = e.error_message && e.error_message.length > 0;
                 const memStatus = e.memory_status || 'pending';
                 const elapsedMins = e.status === 'running' ? elapsedMinutes(e.started_at) : 0;
-                const isStuck = e.status === 'running' && elapsedMins > 15 && (e.tokens_output || e.cost_usd * 0 === 0) && (e.tokens_output || 0) === 0;
+                const stuck = stuckReason(e);
                 return (
                   <div key={e.id} className="log-card bg-surface-raised dark:bg-surface-dark-raised border border-border-muted dark:border-border-dark-muted rounded-md p-2.5">
                     <div className="flex items-center gap-2 mb-1 flex-wrap">
@@ -720,13 +720,13 @@ export const ExecutionLog = () => {
                         {e.status === 'running' && (
                           <span className="text-xs font-mono text-faint">{fmtTokens(e.tokens_input)}↑{fmtTokens(e.tokens_output)}↓</span>
                         )}
-                        {isStuck && (
-                          <span className="text-xs font-semibold rounded px-1.5 py-px" style={{ background: '#fff2eb', color: '#b2622d', border: '1px solid #b2622d' }} title={`Running for ${elapsedMins} min with 0 output tokens. Consider cancelling and re-running.`}>⚠ may be stuck</span>
+                        {stuck && (
+                          <span className="text-xs font-semibold rounded px-1.5 py-px" style={{ background: '#fff2eb', color: '#b2622d', border: '1px solid #b2622d' }} title={stuck}>⚠ may be stuck</span>
                         )}
                       </span>
                       <span className="text-xs text-faint font-semibold" style={{ fontVariantNumeric: 'tabular-nums' }}>{e.task_id ? `#${e.task_id}` : '—'}</span>
                       <span className="flex-1" />
-                      <span className="text-xs text-status-done font-semibold" style={{ fontVariantNumeric: 'tabular-nums' }}>${(e.cost_usd || 0).toFixed(4)}</span>
+                      <span className="text-xs text-status-done font-semibold" style={{ fontVariantNumeric: 'tabular-nums' }}>{fmtUsd(e.cost_usd)}</span>
                     </div>
                     <div className="text-sm+ text-ink dark:text-text-dark-DEFAULT mb-1">{truncate(e.instructions || e.task_title || '', 120)}</div>
                     <div className="flex items-center gap-2 text-xs text-text-muted dark:text-text-dark-muted mb-1.5">

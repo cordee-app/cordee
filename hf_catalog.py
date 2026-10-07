@@ -28,7 +28,7 @@ _CATALOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hf_mod
 _FAMILY_MAP = {
     'qwen3.5-397b': 'scw-qwen3.5-397b',
     'qwen3.6': 'scw-qwen3.6-35b',
-    'qwen3-coder': 'scw-qwen3-coder-30b',
+    'qwen3-coder': 'scw-qwen3.6-35b',
     'glm-5.2': 'scw-glm-5.2',
     'gpt-oss': 'scw-gpt-oss-120b',
     'mistral-small': 'scw-mistral-small-24b',

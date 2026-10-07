@@ -144,6 +144,40 @@ class AgentRouterCliTests(unittest.TestCase):
         self.assertIn('stdin', seen['kwargs'])
         self.assertEqual(seen['kwargs']['stdin'], subprocess.DEVNULL)
 
+    def test_vibe_cli_timeout_is_not_retried(self):
+        # Regression (task 10001187): a run that outlived the wall-clock cap was
+        # retried from scratch 3x (each attempt cold, each timing out again).
+        # A timeout must spawn the CLI once, raise VibeCLITimeout with a short
+        # message (no argv/prompt dump), and use VIBE_CLI_TIMEOUT_SECS.
+        spawns = []
+
+        class _SlowPopen(_FakePopen):
+            def __init__(self_inner, cmd, *a, **k):
+                spawns.append(cmd)
+                super().__init__()
+                self_inner._first = True
+
+            def communicate(self_inner, input=None, timeout=None):
+                if self_inner._first:
+                    self_inner._first = False
+                    spawns.append(('timeout', timeout))
+                    raise subprocess.TimeoutExpired(['vibe'], timeout)
+                return '', ''
+
+        with patch('shutil.which', return_value='/usr/bin/vibe'), \
+             patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'test-key'), \
+             patch.object(agent_router.agent_config, 'VIBE_CLI_TIMEOUT_SECS', 1234), \
+             patch.object(agent_router, '_kill_process_group', lambda p: None), \
+             patch('subprocess.Popen', side_effect=_SlowPopen):
+            with self.assertRaises(agent_router.VibeCLITimeout) as cm:
+                agent_router._call_vibe_cli(
+                    'mistral-medium-latest', 'secret prompt text',
+                    project_path=os.getcwd())
+
+        self.assertEqual(len([c for c in spawns if isinstance(c, list)]), 1)
+        self.assertIn(('timeout', 1234), spawns)
+        self.assertNotIn('secret prompt text', str(cm.exception))
+
     def test_vibe_cli_caps_oversized_prompt(self):
         # Regression: the vibe prompt is passed on the argv (`--prompt <prompt>`),
         # so an oversized prompt (e.g. a very long chat thread) would raise

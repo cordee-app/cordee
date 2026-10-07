@@ -1,5 +1,6 @@
 import { useStore } from '../store';
 import { cn } from '../utils/cn';
+import { fmtUsd, fmtPct } from '../utils/currency';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useProjectPermissions, roleAtLeast } from '../hooks/useProjectPermissions';
 import { Lock, Trash2, Users, Archive, PackagePlus } from 'lucide-react';
@@ -107,8 +108,8 @@ interface DashboardData {
 }
 
 const Fmt = {
-  cost: (n: number) => `$${(n || 0).toFixed(2)}`,
-  pct: (n: number) => `${(n || 0).toFixed(1)}%`,
+  cost: fmtUsd,
+  pct: fmtPct,
   date: (s: string) => {
     const d = new Date(s.replace(' ', 'T') + (s.includes('Z') ? '' : 'Z'));
     return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
@@ -366,7 +367,7 @@ export const Dashboard = () => {
                 {!!p.active_deployment_cost_usd && p.active_deployment_cost_usd > 0 && (
                   <span className="ml-1.5 inline-flex items-center gap-1 text-[10px] uppercase tracking-wide text-status-failed dark:text-status-failed-dark-DEFAULT px-1 py-px rounded border border-status-failed/25 dark:border-status-failed-dark-DEFAULT/40" style={{ background: 'rgba(248,81,73,.12)' }}>
                     <span className="w-1.5 h-1.5 rounded-full bg-status-failed dark:bg-status-failed-dark-DEFAULT inline-block" />
-                    GPU: ${p.active_deployment_cost_usd.toFixed(2)} accrued
+                    GPU: {fmtUsd(p.active_deployment_cost_usd)} accrued
                   </span>
                 )}
               </span>

@@ -152,7 +152,7 @@ export const api = {
     create: (data: {
       name: string; pitch: string; stack_hints?: string;
       scaffolding_model?: string; project_type?: string;
-      eu_only?: boolean; llm_mode?: string; execution_type?: string;
+      eu_only?: boolean;
       aingel_name?: string; aingel_model?: string;
     }) => post<{ project: Project; chat: Chat; reply: string }>('/api/projects', data),
     update: (pid: number, data: Record<string, unknown>) => patch<{ ok: true }>(`/api/projects/${pid}`, data),
@@ -325,6 +325,7 @@ export const api = {
       requires_rag?: number; corpus_id?: string;
       context_refs?: string[];
       original_description?: string;
+      execution_type?: string;
     }) => post<{ id: number; ok: true }>('/api/tasks', data),
     get: (tid: number) => get<Task>(`/api/tasks/${tid}`),
     update: (tid: number, data: Partial<Task & { handoff_context?: string }>) =>

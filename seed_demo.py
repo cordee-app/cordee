@@ -34,7 +34,7 @@ DEMO_TASKS = [
         ),
         'status': 'pending',
         'slot': None,
-        'model': 'claude-sonnet-4-6',
+        'model': 'claude-sonnet-5-5',
         'priority': 5,
     },
     {
@@ -45,7 +45,7 @@ DEMO_TASKS = [
         ),
         'status': 'confirmed',
         'slot': 1,
-        'model': 'claude-sonnet-4-6',
+        'model': 'claude-sonnet-5-5',
         'priority': 3,
     },
     {
@@ -67,7 +67,7 @@ DEMO_TASKS = [
         ),
         'status': 'done',
         'slot': 1,
-        'model': 'claude-sonnet-4-6',
+        'model': 'claude-sonnet-5-5',
         'priority': 6,
         'actual_cost': 0.0142,
     },

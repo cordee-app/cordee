@@ -3,6 +3,8 @@ import { useStore } from '../store';
 import { api } from '../api';
 import { cn } from '../utils/cn';
 import { fmtTokens } from '../utils/tokens';
+import { fmtUsd } from '../utils/currency';
+import { stuckReason } from '../utils/stuck';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
 import type { CSSProperties } from 'react';
 import type { Task, GateQuestion } from '../types';
@@ -84,7 +86,7 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
     if (isNaN(t)) return 0;
     return Math.floor((Date.now() - t) / 60000);
   })();
-  const taskIsStuck = isRunning && taskElapsedMins > 15 && ((runningExec?.tokens_output || 0) === 0) && ((runningExec?.cost_usd || 0) * 0 === 0 || !runningExec || (runningExec.tokens_output || 0) === 0);
+  const taskStuck = isRunning ? stuckReason(runningExec) : null;
 
   const model = models.find((m) => m.id === task.model);
   const modelColor = model?.color || '#645c50';
@@ -282,7 +284,7 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
       : '— tok';
 
   const estCost = task.estimated_cost != null && task.estimated_cost > 0
-    ? `est. $${task.estimated_cost.toFixed(3)}`
+    ? `est. ${fmtUsd(task.estimated_cost)}`
     : null;
 
   const descPreview = (task.description || '').length > 80
@@ -414,8 +416,8 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
             {runningExec && (
               <span className="text-2xs font-mono text-faint">{fmtTokens(runningExec.tokens_input)}↑{fmtTokens(runningExec.tokens_output)}↓</span>
             )}
-            {taskIsStuck && (
-              <span className="text-2xs font-semibold rounded px-1 py-px" style={{ background: '#fff2eb', color: '#b2622d', border: '1px solid #b2622d' }} title={`Running for ${taskElapsedMins} min with 0 output tokens. Consider cancelling and re-running.`}>⚠ may be stuck</span>
+            {taskStuck && (
+              <span className="text-2xs font-semibold rounded px-1 py-px" style={{ background: '#fff2eb', color: '#b2622d', border: '1px solid #b2622d' }} title={taskStuck}>⚠ may be stuck</span>
             )}
           </div>
         )}
@@ -808,11 +810,11 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
             {!runningExec && taskElapsedMins > 0 && (
               <span className="text-xs font-mono text-faint">{taskElapsedMins}m</span>
             )}
-            {taskIsStuck && (
+            {taskStuck && (
               <span
                 className="text-xs font-semibold rounded px-1.5 py-px"
                 style={{ background: '#fff2eb', color: '#b2622d', border: '1px solid #b2622d' }}
-                title={`Running for ${taskElapsedMins} min with 0 output tokens. Consider cancelling and re-running.`}
+                title={taskStuck}
               >
                 ⚠ may be stuck
               </span>

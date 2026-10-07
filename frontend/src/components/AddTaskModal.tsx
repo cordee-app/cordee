@@ -3,6 +3,7 @@ import type { ReactElement } from 'react';
 import { useStore } from '../store';
 import { api } from '../api';
 import { cn } from '../utils/cn';
+import { fmtUsd } from '../utils/currency';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
 import type { Task, TaskDependencies, ModelRecommendation, TaskAttachment, HfCandidate } from '../types';
 import { TaskAttachPicker } from './TaskAttachPicker';
@@ -111,6 +112,8 @@ export const AddTaskModal = () => {
   const [requiresRag, setRequiresRag] = useState(false);
   const [corpusId, setCorpusId] = useState('railway');
   const [ragCorpora, setRagCorpora] = useState<{ id: string; label: string }[] | null>(null);
+  // Processing type per task: '' (normal), 'research', 'deployment'.
+  const [executionType, setExecutionType] = useState('');
 
   const task = isEdit ? tasks.find((t) => t.id === modModalTaskId) : undefined;
   const remaining = DESC_LIMIT - description.length;
@@ -119,7 +122,8 @@ export const AddTaskModal = () => {
   const perms = useProjectPermissions(task?.project_id ?? projectId ?? activeProject);
 
   // EU-only data residency: such projects may only run Mistral / Scaleway models.
-  // Keep this in sync with agent_api._is_eu_model.
+  // Keep this in sync with agent_config.is_eu_model (the single source of truth;
+  // agent_api._is_eu_model is a thin alias).
   const isEuModel = (id: string) =>
     id.startsWith('scw-') || id.startsWith('mistral-') || id.startsWith('open-mistral')
     || id.startsWith('codestral-') || id.startsWith('devstral-');
@@ -160,6 +164,7 @@ export const AddTaskModal = () => {
       setAwaitingModel(Boolean(t.awaiting_model));
       setRequiresRag(Boolean(t.requires_rag));
       setCorpusId(t.corpus_id || 'railway');
+      setExecutionType(t.execution_type || '');
       setContextRefs((t as unknown as { context_refs?: string[] }).context_refs || []);
       // Auto-attach the project's definition file (READMEFIRST.md or legacy
       // CLAUDE.md) so Guide my prompt has project context out of the box.
@@ -170,7 +175,7 @@ export const AddTaskModal = () => {
       setTitle('');
       setDescription('');
       setEditDescWasEmpty(false);
-      const defaultModel = state.models.find((m) => m.default)?.id || state.models[0]?.id || 'claude-sonnet-4-6';
+      const defaultModel = state.models.find((m) => m.default)?.id || state.models[0]?.id || 'claude-sonnet-5-5';
       setModel(defaultModel);
       setRoleId('');
       setPhase('');
@@ -186,6 +191,7 @@ export const AddTaskModal = () => {
       setHfRepoId('');
       setAwaitingModel(false);
       setRequiresRag(false);
+      setExecutionType('');
       const _np = pid !== null ? state.projects.find((p) => p.id === pid) : undefined;
       // Default corpus from the project's RAG setting when the library is on.
       setCorpusId(_np?.rag_corpus_id || 'railway');
@@ -415,6 +421,7 @@ export const AddTaskModal = () => {
           requires_rag: requiresRag ? 1 : 0,
           corpus_id: requiresRag ? corpusId : undefined,
           context_refs: contextRefs,
+          execution_type: executionType,
           ...(preImproveDescription ? { original_description: preImproveDescription } : {}),
         } as unknown as Record<string, unknown>);
         closeModal();
@@ -453,6 +460,7 @@ export const AddTaskModal = () => {
         requires_rag: requiresRag ? 1 : 0,
         corpus_id: requiresRag ? corpusId : undefined,
         context_refs: contextRefs,
+        execution_type: executionType || undefined,
         ...(preImproveDescription ? { original_description: preImproveDescription } : {}),
       });
 
@@ -955,6 +963,20 @@ export const AddTaskModal = () => {
           </div>
         </div>
 
+        <div className="form-group mb-3">
+          <label className="block text-sm font-semibold text-text-soft mb-[3px]">Processing</label>
+          <select
+            data-tip={"None: a normal run.\nResearch: the prompt carries the full project memory and all phase memories (bigger prompts, more context).\nDeployment: very large files are processed 1:1, page by page (OCR correction, translation), not summarised. Results stay on the task branch until approved."}
+            className="w-full py-[7px] px-2.5 border border-default rounded text-base"
+            value={executionType}
+            onChange={(e) => setExecutionType(e.target.value)}
+          >
+            <option value="">None</option>
+            <option value="research">Research</option>
+            <option value="deployment">Deployment</option>
+          </select>
+        </div>
+
         {/* RAG library — only when the project has RAG enabled */}
         {Boolean(project?.use_rag) && (
           <div className="form-group mb-3 rounded-lg border border-default p-3 bg-bg-inset/40">
@@ -1173,7 +1195,7 @@ export const AddTaskModal = () => {
                     )}
                   </div>
                   <span className="text-text-faint text-sm+ whitespace-nowrap ml-2">
-                    {rec.estimated_cost > 0 ? `~$${rec.estimated_cost.toFixed(4)}` : 'free'}
+                    {rec.estimated_cost > 0 ? `~${fmtUsd(rec.estimated_cost)}` : 'free'}
                   </span>
                 </div>
               );

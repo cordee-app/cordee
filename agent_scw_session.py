@@ -469,7 +469,6 @@ def pull_costs(scw_project_id, project_id, region='fr-par', **_):
         return {'ok': False, 'reason': 'no data'}
 
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-    eur_per_usd = 1.08
     by_category = {}
     total_eur = 0.0
     for c in consumptions:
@@ -484,7 +483,7 @@ def pull_costs(scw_project_id, project_id, region='fr-par', **_):
     try:
         conn = agent_db.get_db()
         for category, eur in by_category.items():
-            usd = round(eur * eur_per_usd, 6)
+            usd = round(eur * agent_config.EUR_TO_USD, 6)
             conn.execute(
                 'INSERT INTO scw_session_costs (project_id, day, category, eur, usd) '
                 'VALUES (?, ?, ?, ?, ?) '
@@ -503,7 +502,7 @@ def pull_costs(scw_project_id, project_id, region='fr-par', **_):
         'project_id': project_id,
         'day': today,
         'total_eur': round(total_eur, 6),
-        'total_usd': round(total_eur * eur_per_usd, 6),
+        'total_usd': round(total_eur * agent_config.EUR_TO_USD, 6),
         'by_category': {k: round(v, 6) for k, v in by_category.items()},
         'count': len(consumptions),
     }

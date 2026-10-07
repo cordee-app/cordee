@@ -111,7 +111,7 @@ def _init_project_db_schema(conn):
             phase_name       TEXT DEFAULT '',
             session_id       INTEGER,
             status           TEXT DEFAULT 'pending',
-            model            TEXT DEFAULT 'claude-sonnet-4-6',
+            model            TEXT DEFAULT 'claude-sonnet-5-5',
             priority         INTEGER DEFAULT 5,
             estimated_tokens INTEGER DEFAULT 50000,
             estimated_cost   REAL DEFAULT 0.0,
@@ -244,6 +244,8 @@ def _init_project_db_schema(conn):
         # Multi-tenancy (Phase 1): durable DB identity of the creating user.
         # NULL = pre-multi-tenancy row (treated as admin-owned).
         ('created_by', 'INTEGER DEFAULT NULL'),
+        # Processing type per task: NULL (normal), 'research', 'deployment'.
+        ('execution_type', 'TEXT'),
     ]:
         _add_column_if_missing(conn, 'tasks', col, defn)
     for col, defn in [
@@ -694,6 +696,28 @@ def _rebuild_projects_without_chat_fk(conn):
         conn.execute('PRAGMA foreign_keys = ON')
 
 
+def get_app_settings():
+    """{key: value} of the saved instance-wide settings."""
+    conn = get_db()
+    try:
+        rows = conn.execute('SELECT key, value FROM app_settings').fetchall()
+    finally:
+        conn.close()
+    return {r[0]: r[1] for r in rows}
+
+
+def set_app_setting(key, value):
+    conn = get_db()
+    try:
+        conn.execute(
+            'INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) '
+            'ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at',
+            (key, None if value is None else str(value)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def init_db():
     conn = get_db()
     # A brand-new DB has no projects table yet. Everything created below is
@@ -759,6 +783,13 @@ def init_db():
             default_model  TEXT DEFAULT '',
             context_scope  TEXT DEFAULT '',
             is_template    INTEGER DEFAULT 0
+        );
+        -- Instance-wide settings changed at run time (Settings › General);
+        -- applied over the env defaults at startup so a restart keeps them.
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key        TEXT PRIMARY KEY,
+            value      TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS project_type_templates (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1133,12 +1164,12 @@ def init_db():
              'You are a business analyst expert in market sizing, financial modeling, '
              'feasibility analysis, and competitive landscape research. Produce structured, '
              'data-backed reports with clear assumptions and sensitivity analysis.',
-             'claude-sonnet-4-6', 'project'),
+             'claude-sonnet-5-5', 'project'),
             ('Backend Engineer',
              'You are a senior backend engineer specializing in Python, Flask, async design, '
              'REST API architecture, SQLite/PostgreSQL, and performance optimization. '
              'Write clean, secure, well-tested code following existing project conventions.',
-             'claude-sonnet-4-6', 'phase'),
+             'claude-sonnet-5-5', 'phase'),
             ('Audio/DSP Engineer',
              'You are a digital signal processing engineer specializing in audio processing, '
              'phase inversion, noise reduction, mobile audio pipelines, and codec optimization. '
@@ -1163,7 +1194,7 @@ def init_db():
              'You are a Linux systems engineer specializing in systemd services, LXC containers, '
              'network configuration, backup strategies, and infrastructure automation. '
              'Write reliable, idempotent shell scripts and configurations.',
-             'claude-sonnet-4-6', 'phase'),
+             'claude-sonnet-5-5', 'phase'),
         ]
         conn.executemany(
             'INSERT INTO roles (name, system_prompt, default_model, context_scope, is_template, project_id) '
@@ -2751,7 +2782,7 @@ def _hydrate_tasks_context_refs(tasks):
 
 
 def upsert_task(project_id, external_id, title, description='',
-                model='claude-sonnet-4-6', priority=5, status='pending',
+                model='claude-sonnet-5-5', priority=5, status='pending',
                 phase_name='Notebook', project_path=None):
     if not project_path:
         proj = get_project(project_id)
@@ -3030,7 +3061,9 @@ def update_task(task_id, project_path=None, **kwargs):
                  # Lane B: task context isolation
                  'context_refs',
                  # Multi-tenancy (Phase 1): creating user id
-                 'created_by'}
+                 'created_by',
+                 # Processing type: NULL / 'research' / 'deployment'
+                 'execution_type'}
     fields = {k: v for k, v in kwargs.items() if k in allowed}
     if not fields:
         return
@@ -3120,10 +3153,10 @@ def delete_task(task_id, project_path=None):
     agent_guide_sync.after_task_change(project_path, project_id=proj_id, task_id=task_id)
 
 
-def create_task(project_id, title, description='', model='claude-sonnet-4-6',
+def create_task(project_id, title, description='', model='claude-sonnet-5-5',
                 priority=5, phase_name='Notebook', estimated_tokens=50000, role_id=None,
                 project_path=None, corpus_id=None, requires_rag=0, context_refs=None,
-                created_by=None):
+                created_by=None, execution_type=None):
     if not project_path:
         proj = get_project(project_id)
         project_path = proj['path'] if proj else None
@@ -3139,9 +3172,9 @@ def create_task(project_id, title, description='', model='claude-sonnet-4-6',
 
     pconn = get_project_db(project_path)
     pconn.execute(
-        'INSERT INTO tasks (id, project_id, title, description, phase_name, model, priority, source, status, estimated_tokens, role_id, corpus_id, requires_rag, created_by) '
-        'VALUES (?,?,?,?,?,?,?,"manual","pending",?,?,?,?,?)',
-        (task_id, project_id, title, description, phase_name or '', model, priority, estimated_tokens, role_id, corpus_id, int(requires_rag), created_by)
+        'INSERT INTO tasks (id, project_id, title, description, phase_name, model, priority, source, status, estimated_tokens, role_id, corpus_id, requires_rag, created_by, execution_type) '
+        'VALUES (?,?,?,?,?,?,?,"manual","pending",?,?,?,?,?,?)',
+        (task_id, project_id, title, description, phase_name or '', model, priority, estimated_tokens, role_id, corpus_id, int(requires_rag), created_by, execution_type)
     )
     pconn.commit()
     pconn.close()
@@ -3218,7 +3251,7 @@ def copy_task(task_id, new_title=None, copy_deps=False, project_path=None):
         project_id=src['project_id'],
         title=title,
         description=src.get('description') or '',
-        model=src.get('model') or 'claude-sonnet-4-6',
+        model=src.get('model') or 'claude-sonnet-5-5',
         priority=src.get('priority') or 5,
         phase_name=src.get('phase_name') or 'Notebook',
         estimated_tokens=src.get('estimated_tokens') or 50000,

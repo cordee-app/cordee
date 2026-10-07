@@ -35,6 +35,9 @@ GIT_TIMEOUT = 120  # seconds
 # exception: every task writes them to Artifacts/outputs/<task-slug>/ and they
 # must be versioned like any other task change (review diff, reject discards,
 # Files > Deliverables attribution, tombstone commit gate).
+# User-file folders (agent_files working-doc variants). 'docs/' is left out on
+# purpose: in code projects it is project documentation and stays versioned.
+USER_FILE_IGNORE_RULES = ('Working Documents/', 'Working Docs/', 'My Docs/', 'working-docs/')
 ARTIFACTS_IGNORE_RULES = (
     'Artifacts/*',
     '!Artifacts/outputs/',
@@ -74,15 +77,22 @@ node_modules/
 # every delete a git rename, so the AI's bash tool could resurrect them and
 # they leaked into exec diffstats. Never versioned.
 .trash/
+
+# ── User files (Working Documents & co.) ──
+# Uploaded and edited by people, not produced by tasks: never versioned, so a
+# deleted file cannot come back through git and repos do not grow with every
+# PDF. Task deliverables go to Artifacts/outputs/, which stays versioned.
+""" + '\n'.join(USER_FILE_IGNORE_RULES) + """
 """
 
 
 # Runtime state git must never own. Tracking any of these makes a branch
 # checkout revert live state — see _untrack_runtime_files and the `checkout -f`
 # in discard_task_branch.
-_RUNTIME_IGNORE_RULES = ('project.db*', 'Artifacts/eu-audit.log', '.trash/')
+_RUNTIME_IGNORE_RULES = ('project.db*', 'Artifacts/eu-audit.log', '.trash/') + USER_FILE_IGNORE_RULES
 _RUNTIME_PATHSPECS    = ('project.db', 'project.db.*', 'project.db-*',
-                         'Artifacts/eu-audit.log', '.trash')
+                         'Artifacts/eu-audit.log', '.trash') + tuple(
+                            r.rstrip('/') for r in USER_FILE_IGNORE_RULES)
 
 
 # ── low-level ───────────────────────────────────────────────────────────────
@@ -142,13 +152,12 @@ def looks_like_software(project_path, max_scan=3000):
 def resolve_enabled(git_enabled_col, project_path):
     """
     Map the projects.git_enabled column to a bool.
-      None → auto: enabled iff the project looks like software
-      0    → explicitly off
-      1    → explicitly on
+      None → on: every project is versioned — git is the per-task undo
+             (Reject) and audit trail, not only a tool for code projects
+      0    → explicitly off (no UI; POST /api/projects/<id>/git)
+      1    → on
     """
-    if git_enabled_col in (0, 1):
-        return bool(git_enabled_col)
-    return looks_like_software(project_path)
+    return git_enabled_col != 0
 
 
 # ── inspection ────────────────────────────────────────────────────────────────
@@ -278,9 +287,11 @@ def _untrack_runtime_files(project_path):
     # Commits the staged removals only; unstaged working-tree edits are left for
     # the caller's checkpoint commit.
     ok, _, err = _run(project_path, 'commit', '-m',
-                      'chore: stop versioning runtime state\n\n'
+                      'chore: stop versioning runtime state and user files\n\n'
                       'Tracking the live DB made every branch checkout revert '
-                      'task state written during a run.')
+                      'task state written during a run. User files (Working '
+                      'Documents & co.) stay on disk but leave version control, '
+                      'so deleted ones cannot come back through git.')
     if not ok:
         return {'ok': False, 'untracked': [], 'error': err}
     return {'ok': True, 'untracked': tracked}

@@ -159,7 +159,7 @@ CLAUDE_CODE_SKIP_PERMISSIONS = parse_bool_env('CLAUDE_CODE_SKIP_PERMISSIONS')
 # 'vibe' = route through the Vibe CLI (full tool support, billed to Le Chat Pro subscription)
 MISTRAL_MODE = os.getenv('MISTRAL_MODE', 'vibe')
 VIBE_SKIP_PERMISSIONS = parse_bool_env('VIBE_SKIP_PERMISSIONS')
-VIBE_MODELS = [m.strip() for m in os.getenv('VIBE_MODELS', 'mistral-large-latest,mistral-glm-5-3').split(',') if m.strip()]
+VIBE_MODELS = [m.strip() for m in os.getenv('VIBE_MODELS', 'mistral-large-latest,mistral-large-4,mistral-medium-latest,mistral-small-latest,codestral-latest,mistral-glm-5-3').split(',') if m.strip()]
 CODEX_SKIP_PERMISSIONS = parse_bool_env('CODEX_SKIP_PERMISSIONS')
 
 # Max USD to spend per Vibe CLI call (0 = no limit)
@@ -170,19 +170,46 @@ if VIBE_MAX_PRICE < 0:
     _log.warning(f"VIBE_MAX_PRICE cannot be negative. Falling back to 15.00.")
     VIBE_MAX_PRICE = 15.00
 
+# Wall-clock cap (seconds) on one Vibe CLI run. Long research-and-write tasks
+# (task 10001187: ~12 min of reading before drafting) blew through the old
+# hard-coded 900s; a timeout is not retried, so this must cover the whole task.
+try:
+    VIBE_CLI_TIMEOUT_SECS = max(60, int(os.getenv('VIBE_CLI_TIMEOUT_SECS', '2700')))
+except ValueError:
+    VIBE_CLI_TIMEOUT_SECS = 2700
+
 # Cost = USD per 1M tokens
 MODELS = {
-    'claude-sonnet-4-6': {
-        'label': 'Claude Sonnet 4.6', 'provider': 'anthropic',
-        'cost_input': 3.0, 'cost_output': 15.0, 'default': True,
+    'claude-sonnet-5-5': {
+        'label': 'Claude Sonnet 5.5', 'provider': 'anthropic',
+        'cost_input': 2.0, 'cost_output': 10.0, 'default': True,
+        'context_window': 1000000,
     },
-    'claude-haiku-4-5-20251001': {
-        'label': 'Claude Haiku 4.5', 'provider': 'anthropic',
-        'cost_input': 0.8, 'cost_output': 4.0,
+    'claude-sonnet-4-6': {
+        # Legacy (still API-available). Kept for existing task rows; no longer default.
+        'label': 'Claude Sonnet 4.6', 'provider': 'anthropic',
+        'cost_input': 3.0, 'cost_output': 15.0,
+    },
+    'claude-opus-5-5': {
+        'label': 'Claude Opus 5.5', 'provider': 'anthropic',
+        'cost_input': 4.0, 'cost_output': 20.0,
+        'context_window': 1000000,
     },
     'claude-opus-4-7': {
+        # Legacy (still API-available). Price corrected 2026-10: $5/$25 (the
+        # $15/$75 that was here was Opus 4.1's retired rate).
         'label': 'Claude Opus 4.7', 'provider': 'anthropic',
-        'cost_input': 15.0, 'cost_output': 75.0,
+        'cost_input': 5.0, 'cost_output': 25.0,
+    },
+    'claude-fable-5-1': {
+        'label': 'Claude Fable 5.1', 'provider': 'anthropic',
+        'cost_input': 10.0, 'cost_output': 50.0,
+        'context_window': 1000000, 'best_for': 'frontier reasoning, long-horizon agentic',
+    },
+    'claude-haiku-4-5-20251001': {
+        # Price corrected 2026-10: $1/$5 (the $0.80/$4 that was here was Haiku 3.5's rate).
+        'label': 'Claude Haiku 4.5', 'provider': 'anthropic',
+        'cost_input': 1.0, 'cost_output': 5.0,
     },
     'mistral-large-latest': {
         # Covered by the Mistral Pro subscription since 2026-08 — billed as a flat
@@ -211,9 +238,16 @@ MODELS = {
         'label': 'Codestral', 'provider': 'mistral',
         'cost_input': 0.0, 'cost_output': 0.0,
     },
-    'devstral-latest': {
-        'label': 'Devstral', 'provider': 'mistral',
-        'cost_input': 0.0, 'cost_output': 0.0,
+    'mistral-large-4': {
+        # Mistral Large 4 (v26.10), released Oct 2026 — Mistral's new flagship,
+        # open-weight multimodal, 524k context. Covered by the Le Chat Pro
+        # subscription via the Vibe CLI (flat, not per-token), so priced at 0 like
+        # the other mistral-*-latest models. EU-operated (Mistral, Paris) —
+        # is_eu_model() returns True for the mistral- prefix. Wire ID equals the
+        # SuperAgent ID on both the Vibe and direct-API paths.
+        'label': 'Mistral Large 4', 'provider': 'mistral',
+        'cost_input': 0.0, 'cost_output': 0.0, 'context_window': 524288,
+        'best_for': 'reasoning, coding, multimodal, long context',
     },
     'mistral-glm-5-3': {
         # Z.ai GLM-5.3, hosted unmodified by Mistral (wire ID `zai-glm-5-3`).
@@ -244,12 +278,24 @@ MODELS = {
         'cost_input': 0.0, 'cost_output': 0.0,
     },
     # Scaleway Generative API (EU, pay-per-token, text-only, OpenAI-compatible)
-    # Prices: EUR converted to USD at 1.08. Actual Scaleway model IDs stored in
-    # agent_router._SCW_MODEL_MAP; SuperAgent uses the scw-* prefix as stable IDs.
-    'scw-qwen3-coder-30b': {
-        'label': 'SCW Qwen3-Coder 30B', 'provider': 'scaleway',
-        'cost_input': 0.216, 'cost_output': 0.864, 'context_window': 131072,
-        'best_for': 'code, analysis',
+    # Prices: EUR converted to USD at EUR_TO_USD (see constant above). Actual
+    # Scaleway model IDs stored in agent_router._SCW_MODEL_MAP; SuperAgent uses
+    # the scw-* prefix as stable IDs.
+    'scw-deepseek-v4-flash': {
+        # deepseek-v4-flash-0731: agentic/logical-reasoning model (Jul 2026).
+        # Scaleway price EUR 0.40 / 0.80 per 1M tokens; ×EUR_TO_USD. Added
+        # 2026-10 after qwen3-coder-30b's EOL.
+        'label': 'SCW DeepSeek-V4 Flash', 'provider': 'scaleway',
+        'cost_input': 0.432, 'cost_output': 0.864, 'context_window': 256000,
+        'best_for': 'code, agentic, reasoning',
+    },
+    'scw-qwen3.8-27b': {
+        # qwen3.8-27b: vision-language dense model (builds on 3.6-27B, improved
+        # coding + office productivity, text and visual). Scaleway price
+        # EUR 0.60 / 3.30 per 1M tokens; ×EUR_TO_USD.
+        'label': 'SCW Qwen3.8 27B', 'provider': 'scaleway',
+        'cost_input': 0.648, 'cost_output': 3.564, 'context_window': 256000,
+        'best_for': 'coding, vision, analysis',
     },
     'scw-gpt-oss-120b': {
         'label': 'SCW GPT-OSS 120B', 'provider': 'scaleway',
@@ -288,15 +334,17 @@ MODELS = {
     },
     'scw-qwen3.5-397b': {
         'label': 'SCW Qwen3.5 397B', 'provider': 'scaleway',
-        # Scaleway lists EUR 0.60 / 3.60 per 1M tokens; ×1.08, as every other
-        # scw-* entry here. Was 2.50/10.00, ~4x over, which made the Counselor
-        # rank the EU catalogue as far more expensive than it is — the one place
-        # where a wrong price actively steers EU-only projects away from Scaleway.
+        # Scaleway lists EUR 0.60 / 3.60 per 1M tokens; ×EUR_TO_USD, as every
+        # other scw-* entry here. Was 2.50/10.00, ~4x over, which made the
+        # Counselor rank the EU catalogue as far more expensive than it is —
+        # the one place where a wrong price actively steers EU-only projects
+        # away from Scaleway.
         'cost_input': 0.648, 'cost_output': 3.888, 'context_window': 250000,
         'best_for': 'complex reasoning, large projects',
     },
     'scw-glm-5.2': {
-        # Scaleway repriced GLM-5.2 to EUR 1.80 / 5.50 per 1M (2026-08); ×1.08.
+        # Scaleway repriced GLM-5.2 to EUR 1.80 / 5.50 per 1M (2026-08);
+        # ×EUR_TO_USD.
         'label': 'SCW GLM-5.2', 'provider': 'scaleway',
         'cost_input': 1.944, 'cost_output': 5.940, 'context_window': 128000,
         'best_for': 'general tasks, multilingual',
@@ -307,10 +355,40 @@ MODELS = {
     # codex-chatgpt) because billing is a subscription, not per-token. Budget is
     # governed by the dedicated slot-5 work session window (5h, matching Ollama's reset).
     # Actual cloud tags stored in agent_router._OLL_MODEL_MAP; oll-* are stable IDs.
-    'oll-qwen3.5-397b': {
-        'label': 'OLL Qwen3.5 397B', 'provider': 'ollama',
+    'oll-glm-5.3': {
+        'label': 'OLL GLM-5.3', 'provider': 'ollama',
+        'cost_input': 0.0, 'cost_output': 0.0, 'context_window': 1000000,
+        'best_for': 'coding, agentic, long context (subscription)',
+    },
+    'oll-glm-5.3-flash': {
+        'label': 'OLL GLM-5.3 Flash', 'provider': 'ollama',
+        'cost_input': 0.0, 'cost_output': 0.0, 'context_window': 1000000,
+        'best_for': 'fast coding, vision, agentic (subscription)',
+    },
+    'oll-mistral-large-4': {
+        'label': 'OLL Mistral-Large 4', 'provider': 'ollama',
+        'cost_input': 0.0, 'cost_output': 0.0, 'context_window': 1000000,
+        'best_for': 'reasoning, coding, multimodal (subscription)',
+    },
+    'oll-deepseek-v4-pro': {
+        'label': 'OLL DeepSeek-V4 Pro', 'provider': 'ollama',
+        'cost_input': 0.0, 'cost_output': 0.0, 'context_window': 1000000,
+        'best_for': 'reasoning, coding, agentic (subscription)',
+    },
+    'oll-deepseek-v4.1-flash': {
+        'label': 'OLL DeepSeek-V4.1 Flash', 'provider': 'ollama',
+        'cost_input': 0.0, 'cost_output': 0.0, 'context_window': 1000000,
+        'best_for': 'fast coding, vision, reasoning (subscription)',
+    },
+    'oll-kimi-k2.6': {
+        'label': 'OLL Kimi K2.6', 'provider': 'ollama',
         'cost_input': 0.0, 'cost_output': 0.0, 'context_window': 256000,
-        'best_for': 'coding, analysis, long context (subscription)',
+        'best_for': 'coding, agentic, vision (subscription)',
+    },
+    'oll-minimax-m2.7': {
+        'label': 'OLL MiniMax M2.7', 'provider': 'ollama',
+        'cost_input': 0.0, 'cost_output': 0.0, 'context_window': 200000,
+        'best_for': 'coding, reasoning, analysis (subscription)',
     },
     'oll-glm-5.2': {
         'label': 'OLL GLM-5.2', 'provider': 'ollama',
@@ -369,7 +447,7 @@ MODELS = {
     },
 }
 
-DEFAULT_MODEL = 'claude-sonnet-4-6'
+DEFAULT_MODEL = 'claude-sonnet-5-5'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EU data-residency boundary
@@ -486,26 +564,36 @@ def eu_audit(project_path, *, model, provider, allowed, caller='', bytes_out=0, 
 
 
 # Extended pricing table — USD per 1M tokens (superset of MODELS, covers all known providers)
+#
+# NOTE on cache pricing: Anthropic models include 'cache_write' and 'cache_read'
+# fields (prompt caching discounts/premiums). The cost calculation functions
+# (_cost, _pricing_cost, estimate_cost, estimate_*_prompt_tokens) currently use
+# only 'input' and 'output' prices — cache tokens are billed at the full input
+# rate. This means costs for Anthropic models with heavy prompt caching are
+# OVER-ESTIMATED (conservative upper bound). Tracking cache tokens separately
+# would require provider API changes to expose cache_creation_input_tokens and
+# cache_read_input_tokens in usage responses.
 PRICING = {
     # Anthropic
-    'claude-opus-4-7':           {'input': 15.00, 'output': 75.00, 'cache_write': 18.75, 'cache_read': 1.50},
+    'claude-fable-5-1':          {'input': 10.00, 'output': 50.00, 'cache_write': 12.50, 'cache_read': 0.25},
+    'claude-opus-5-5':           {'input':  4.00, 'output': 20.00, 'cache_write':  5.00, 'cache_read': 0.20},
+    'claude-opus-4-7':           {'input':  5.00, 'output': 25.00, 'cache_write':  6.25, 'cache_read': 0.50},
+    'claude-sonnet-5-5':         {'input':  2.00, 'output': 10.00, 'cache_write':  2.50, 'cache_read': 0.20},
     'claude-sonnet-4-6':         {'input':  3.00, 'output': 15.00, 'cache_write':  3.75, 'cache_read': 0.30},
     'claude-sonnet-4-5':         {'input':  3.00, 'output': 15.00, 'cache_write':  3.75, 'cache_read': 0.30},
-    'claude-haiku-4-7':          {'input':  1.00, 'output':  5.00, 'cache_write':  1.25, 'cache_read': 0.10},
-    'claude-haiku-4-6':          {'input':  1.00, 'output':  5.00, 'cache_write':  1.25, 'cache_read': 0.10},
-    'claude-haiku-4-5-20251001': {'input':  0.80, 'output':  4.00, 'cache_write':  1.00, 'cache_read': 0.08},
+    'claude-haiku-4-5-20251001': {'input':  1.00, 'output':  5.00, 'cache_write':  1.25, 'cache_read': 0.10},
     # Mistral — all `-latest` models route through the Vibe CLI and are covered
     # by the Le Chat Pro subscription (flat, not per-token), so priced at 0 like
     # the oll-* models. Must stay in step with MODELS. The `-3` legacy aliases
     # keep their published PAYG rates for the fuzzy get_pricing() fallback.
     'mistral-large-latest':      {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
+    'mistral-large-4':           {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
     'mistral-large-3':           {'input':  0.50, 'output':  1.50, 'cache_write': 0, 'cache_read': 0},
     'mistral-medium-latest':     {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
     'mistral-medium-3':          {'input':  0.40, 'output':  2.00, 'cache_write': 0, 'cache_read': 0},
     'mistral-small-latest':      {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
     'mistral-small-3':           {'input':  0.10, 'output':  0.30, 'cache_write': 0, 'cache_read': 0},
     'codestral-latest':          {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
-    'devstral-latest':           {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
     'mistral-glm-5-3':           {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
     'mistral-ocr-latest':        {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
     'mistral-ocr-2503':          {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
@@ -513,8 +601,9 @@ PRICING = {
     # OpenAI Codex CLI via ChatGPT login. CLI usage is subscription-metered,
     # not API-metered, so SuperAgent records zero API spend for this route.
     'codex-chatgpt':             {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
-    # Scaleway Generative API — EUR×1.08 → USD/M tokens
-    'scw-qwen3-coder-30b':       {'input': 0.216, 'output': 0.864, 'cache_write': 0, 'cache_read': 0},
+    # Scaleway Generative API — EUR×EUR_TO_USD → USD/M tokens
+    'scw-deepseek-v4-flash':     {'input': 0.432, 'output': 0.864, 'cache_write': 0, 'cache_read': 0},
+    'scw-qwen3.8-27b':           {'input': 0.648, 'output': 3.564, 'cache_write': 0, 'cache_read': 0},
     'scw-gpt-oss-120b':          {'input': 0.162, 'output': 0.648, 'cache_write': 0, 'cache_read': 0},
     'scw-llama-3.3-70b':         {'input': 0.972, 'output': 0.972, 'cache_write': 0, 'cache_read': 0},
     'scw-mistral-small-24b':     {'input': 0.162, 'output': 0.378, 'cache_write': 0, 'cache_read': 0},
@@ -525,7 +614,13 @@ PRICING = {
     'scw-qwen3.5-397b':         {'input': 0.648, 'output': 3.888, 'cache_write': 0, 'cache_read': 0},
     'scw-glm-5.2':              {'input': 1.944, 'output': 5.940, 'cache_write': 0, 'cache_read': 0},
     # Ollama Cloud — subscription-metered (GPU-time), so per-token cost is 0 (like codex-chatgpt)
-    'oll-qwen3.5-397b':         {'input': 0.0, 'output': 0.0, 'cache_write': 0, 'cache_read': 0},
+    'oll-glm-5.3':              {'input': 0.0, 'output': 0.0, 'cache_write': 0, 'cache_read': 0},
+    'oll-glm-5.3-flash':        {'input': 0.0, 'output': 0.0, 'cache_write': 0, 'cache_read': 0},
+    'oll-mistral-large-4':      {'input': 0.0, 'output': 0.0, 'cache_write': 0, 'cache_read': 0},
+    'oll-deepseek-v4-pro':      {'input': 0.0, 'output': 0.0, 'cache_write': 0, 'cache_read': 0},
+    'oll-deepseek-v4.1-flash':  {'input': 0.0, 'output': 0.0, 'cache_write': 0, 'cache_read': 0},
+    'oll-kimi-k2.6':            {'input': 0.0, 'output': 0.0, 'cache_write': 0, 'cache_read': 0},
+    'oll-minimax-m2.7':         {'input': 0.0, 'output': 0.0, 'cache_write': 0, 'cache_read': 0},
     'oll-glm-5.2':              {'input': 0.0, 'output': 0.0, 'cache_write': 0, 'cache_read': 0},
     'oll-gpt-oss-120b':         {'input': 0.0, 'output': 0.0, 'cache_write': 0, 'cache_read': 0},
     'oll-gpt-oss-20b':          {'input': 0.0, 'output': 0.0, 'cache_write': 0, 'cache_read': 0},
@@ -550,6 +645,7 @@ def get_pricing(model_id):
     for key in PRICING:
         if m.startswith(key):
             return PRICING[key]
+    if 'fable'     in m: return PRICING['claude-fable-5-1']
     if 'opus'      in m: return PRICING['claude-opus-4-7']
     if 'sonnet'    in m: return PRICING['claude-sonnet-4-6']
     if 'haiku'     in m: return PRICING['claude-haiku-4-5-20251001']
@@ -576,6 +672,18 @@ PROVIDER_COLORS = {
 # Work session configuration
 SESSION_DURATION_HOURS = 5
 SESSION_TOKEN_BUDGET   = 150000
+
+# EUR → USD conversion factor. Scaleway prices are quoted in EUR; this rate
+# converts them to USD for unified cost tracking. Update when the rate shifts
+# materially (currently ~1.08 as of 2026-10).
+EUR_TO_USD = 1.08
+
+# Estimated input/output token split for cost estimation when actual token
+# counts are unknown (task creation, Counselor scoring). 75/25 is a middle
+# ground between the previous 70/30 (estimate_cost) and 80/20 (_score_model).
+# Used by estimate_cost() and _score_model() so both agree.
+ESTIMATE_INPUT_RATIO  = 0.75
+ESTIMATE_OUTPUT_RATIO = 0.25
 
 
 def dynamic_models():

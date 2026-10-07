@@ -1405,10 +1405,12 @@ def _build_prompt(task, project_path, mode='inline'):
 
 
 def estimate_cost(model_id, tokens):
-    m = MODELS.get(model_id, MODELS[DEFAULT_MODEL])
-    tok_in  = int(tokens * 0.70)
-    tok_out = int(tokens * 0.30)
-    return round((tok_in * m['cost_input'] + tok_out * m['cost_output']) / 1_000_000, 5)
+    pricing = get_pricing(model_id)
+    if not pricing:
+        pricing = get_pricing(DEFAULT_MODEL)
+    tok_in  = int(tokens * agent_config.ESTIMATE_INPUT_RATIO)
+    tok_out = int(tokens * agent_config.ESTIMATE_OUTPUT_RATIO)
+    return round((tok_in * pricing['input'] + tok_out * pricing['output']) / 1_000_000, 5)
 
 
 # ── Pre-run cost estimation ───────────────────────────────────────────────────
@@ -2189,8 +2191,10 @@ def run_task(task_id=None):
     proj = db.get_project(task['project_id'])
     task = dict(task)  # shallow copy — we inject private keys without mutating the DB row
 
-    # Execution type — drives git behaviour and prompt construction
-    execution_type = (proj or {}).get('execution_type') or 'standard'
+    # Processing type, set per task: research (all memories in the prompt) or
+    # deployment (1:1 large-file transform, no auto-merge). Git does not depend
+    # on it — every project is versioned (agent_git.resolve_enabled).
+    execution_type = (task.get('execution_type') or '').strip() or 'standard'
     task['_execution_type'] = execution_type
     if execution_type == 'deployment':
         # Phase 6. A 'deployment' project processes a large document 1:1 — OCR
@@ -2320,7 +2324,7 @@ def run_task(task_id=None):
     _hb_stop = _start_heartbeat(exec_id, project_path=project_path)
     try:
 
-        # ── Git-validated execution: start a per-task branch (software projects) ──
+        # ── Git-validated execution: start a per-task branch (every project) ──
         # The AI edits files in project_path; isolating those edits on task/<id>-<slug>
         # makes the change reviewable (approve→merge) and revertible (reject→discard).
         # Mistral OCR is data-only (writes to Working Documents/OCR_mistral, not code) —
@@ -2330,9 +2334,6 @@ def run_task(task_id=None):
         git_branch = ''
         if task.get('model') == 'mistral-ocr-latest':
             start_git = False
-        elif execution_type == 'software':
-            # Force git on — software projects always run in git-validated mode
-            start_git = True
         elif project_path:
             start_git = agit.resolve_enabled((proj or {}).get('git_enabled'), project_path)
         else:
@@ -2432,6 +2433,7 @@ def run_task(task_id=None):
                     dep_titles=dep_titles,
                     budget_snapshot=db.get_project_budget(task['project_id']),
                     dep_outcomes=dep_outcomes,
+                    rag_provenance=rag_provenance,
                 )
                 gate = (h2.get('gate') or 'run').lower()
                 gate_state_db = 'hold' if gate in ('hold', 'skip') else 'open'
@@ -2692,9 +2694,11 @@ def run_task(task_id=None):
         except Exception:
             pass
 
-        # Software projects legitimately create files in the repo root.
+        # Software projects (project type) legitimately create files in the
+        # repo root; elsewhere stray root files are moved to the task's outputs.
+        _is_software_project = ((proj or {}).get('project_type') or '').strip().lower() == 'software'
         _root_before = (_root_files_snapshot(project_path)
-                        if project_path and execution_type != 'software' else None)
+                        if project_path and not _is_software_project else None)
         import time as _time
         _run_started_at = _time.time()
         import agent_tools as _agent_tools
@@ -3302,7 +3306,8 @@ def _task_status_section(project_path):
                    e.status        AS exec_status,
                    e.tokens_input,
                    e.tokens_output,
-                   e.started_at
+                   e.started_at,
+                   e.last_heartbeat_at
             FROM tasks t
             LEFT JOIN executions e ON e.id = (
                 SELECT e2.id FROM executions e2
@@ -3344,13 +3349,25 @@ def _task_status_section(project_path):
             # 2026-08-21 fix (task 10001088): Vibe CLI commits at END, so
             # checking git/filesystem mid-run is meaningless. Guard stuck
             # assessment with elapsed threshold — <10 min is always "in progress".
-            if (r['exec_status'] or '').lower() == 'running' and r.get('started_at'):
+            # The executor heartbeat (every 30s) is the liveness signal: a fresh
+            # heartbeat means the worker is alive however long it has run.
+            # (sqlite3.Row has no .get() — that AttributeError used to drop this
+            # whole table whenever a task was running; task 10001187.)
+            if (r['exec_status'] or '').lower() == 'running' and r['started_at']:
                 try:
                     from datetime import datetime as _dt
+                    _now = _dt.utcnow()
                     _started = _dt.strptime(r['started_at'][:19], '%Y-%m-%d %H:%M:%S')
-                    _age = int((_dt.utcnow() - _started).total_seconds() // 60)
+                    _age = int((_now - _started).total_seconds() // 60)
                     last_exec += f' · {_age} min'
-                    if _age < 10 and (r['tokens_input'] or 0) == 0 and (r['tokens_output'] or 0) == 0:
+                    if r['last_heartbeat_at']:
+                        _hb = _dt.strptime(r['last_heartbeat_at'][:19], '%Y-%m-%d %H:%M:%S')
+                        _hb_age = int((_now - _hb).total_seconds())
+                        if _hb_age <= 120:
+                            last_exec += f' · heartbeat {_hb_age}s ago – ALIVE, not stuck'
+                        else:
+                            last_exec += f' · heartbeat {_hb_age // 60} min ago – possibly stalled'
+                    elif _age < 10 and (r['tokens_input'] or 0) == 0 and (r['tokens_output'] or 0) == 0:
                         last_exec += ' · in progress (<10 min – not stuck, Vibe batches at end)'
                 except Exception:
                     pass
@@ -3368,9 +3385,11 @@ def _task_status_section(project_path):
         '> **Task completion is determined by the Last exec column above, not by file '
         '> modification times or git history.** If a task shows `running`, it is in '
         '> progress even if output files exist or git shows no commits / clean tree. '
-        '> Only report a task as stuck if it has been `running` with `0↑0↓` for '
-        '> **>10 min**. Tasks running <10 min are NOT stuck even if 0 tokens/commits — '
-        '> Vibe CLI and batch paths batch all writes at the end.'
+        '> A `running` task whose heartbeat is ≤2 min old is ALIVE — never call it stuck, '
+        '> whatever its age, token count, output folder or git state (token counts and '
+        '> files are only written when the run ends). Only report a task as stuck when '
+        '> its heartbeat is stale (>2 min) or, with no heartbeat, it has been `running` '
+        '> with `0↑0↓` for **>10 min**.'
     )
     return '\n'.join(lines)
 

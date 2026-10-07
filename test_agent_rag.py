@@ -122,6 +122,29 @@ class DetectIntentTests(unittest.TestCase):
         self.assertLessEqual(len(intent['query']), agent_rag._RAG_QUERY_CHAR_CAP)
 
 
+class AccidentalTriggerTests(unittest.TestCase):
+    """Example text must not start a RAG lookup (#10001184, #10001186)."""
+
+    PROJECT = {'use_rag': 1, 'project_type': 'Research'}
+
+    def test_example_citation_does_not_trigger(self):
+        task = {'description': 'Extract all clauses cited (e.g., "Art. 12(3) of Regulation Y").'}
+        self.assertIsNone(agent_rag.detect_rag_intent(task, self.PROJECT))
+
+    def test_real_citation_still_triggers_and_example_is_left_out_of_query(self):
+        task = {'description': 'Check art. 14aa ust. 3 (np. art. 5) of the railway act.'}
+        intent = agent_rag.detect_rag_intent(task, self.PROJECT)
+        self.assertIsNotNone(intent)
+        self.assertIn('14aa', intent['query'])
+        self.assertNotIn('art. 5', intent['query'])
+
+    def test_local_keyword_only_at_line_start(self):
+        self.assertFalse(agent_rag._has_rag_keyword(
+            {'description': 'Cite it as "RAG: [query], Source: [URL]".'}))
+        self.assertTrue(agent_rag._has_rag_keyword({'description': 'rag: art. 14aa ust. 3'}))
+        self.assertTrue(agent_rag._has_rag_keyword({'description': 'Intro\n  - RAG: prawo'}))
+
+
 class PrefetchTests(unittest.TestCase):
     def test_prefetch_returns_block_and_provenance(self):
         resp = {

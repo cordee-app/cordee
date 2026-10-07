@@ -3,6 +3,7 @@ import { useStore } from '../store';
 import { api } from '../api';
 import type { EstimateResult, ChatTranscriptEntry, AttachItem } from '../types';
 import { cn } from '../utils/cn';
+import { fmtUsd } from '../utils/currency';
 import { RightPanelResizer } from './RightPanelResizer';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
@@ -653,11 +654,11 @@ const ChatPanelInner = () => {
         {estimate && (
           <div className="px-3 py-0.5 text-xs text-text-soft">
             Est. ~{(estimate.total_input_tokens + estimate.estimated_output_tokens).toLocaleString()} tokens
-            {estimate.cost_min_usd != null && ` · $${estimate.cost_min_usd.toFixed(4)}`}
+            {estimate.cost_min_usd != null && ` · ${fmtUsd(estimate.cost_min_usd)}`}
             {estimate.cost_min_usd != null &&
               estimate.cost_max_usd != null &&
               estimate.cost_max_usd !== estimate.cost_min_usd &&
-              `–$${estimate.cost_max_usd.toFixed(4)}`}
+              `–${fmtUsd(estimate.cost_max_usd)}`}
           </div>
         )}
 

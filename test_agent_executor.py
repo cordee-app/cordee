@@ -443,3 +443,48 @@ class SimulationGapRegressionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TaskStatusSectionTests(unittest.TestCase):
+    """Guide's '## Task status' table must survive a running execution.
+
+    Regression (task 10001187): `r.get('started_at')` on a sqlite3.Row raised
+    AttributeError, the caller swallowed it, and the whole table vanished
+    whenever any task was running — Guide then guessed "stuck" from git/files.
+    """
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self._patch = patch.object(
+            agent_db, 'DB_PATH', os.path.join(self.td.name, 'aingel.db'))
+        self._patch.start()
+        agent_db.init_db()
+        self.path = os.path.join(self.td.name, 'proj')
+        os.makedirs(self.path, exist_ok=True)
+        proj = agent_db.upsert_project('P', 'p', self.path)
+        self.task_id = agent_db.create_task(proj['id'], 'T', project_path=self.path)
+        self.exec_id = agent_db.create_execution(self.task_id, 'm', project_path=self.path)
+
+    def tearDown(self):
+        self._patch.stop()
+        self.td.cleanup()
+
+    def _set_heartbeat(self, sql_offset):
+        conn = agent_db.get_project_db(self.path)
+        conn.execute("UPDATE executions SET status='running', "
+                     "started_at=datetime('now','-20 minutes'), "
+                     f"last_heartbeat_at=datetime('now','{sql_offset}') WHERE id=?",
+                     (self.exec_id,))
+        conn.commit()
+        conn.close()
+
+    def test_running_with_fresh_heartbeat_is_alive(self):
+        self._set_heartbeat('-10 seconds')
+        s = agent_executor._task_status_section(self.path)
+        self.assertIn(f'#{self.task_id}', s)
+        self.assertIn('ALIVE, not stuck', s)
+
+    def test_running_with_stale_heartbeat_is_flagged(self):
+        self._set_heartbeat('-15 minutes')
+        s = agent_executor._task_status_section(self.path)
+        self.assertIn('possibly stalled', s)

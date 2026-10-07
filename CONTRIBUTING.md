@@ -79,7 +79,7 @@ Follow the [Getting Started](README.md#getting-started) guide in the `README.md`
 ## 🇪🇺 EU Compliance — Important for Contributors
 Cordée's defining feature is **EU data sovereignty**. When contributing, keep these invariants in mind:
 
-- **Never weaken the EU guard.** `_eu_guard()` and `_is_eu_model()` in `agent_api.py` are the single source of truth for which models `eu_only` projects may use. Do not add bypasses or feature-flags that circumvent them.
+- **Never weaken the EU guard.** `eu_guard()` and `is_eu_model()` in `agent_config.py` are the single source of truth for which models `eu_only` projects may use (`agent_api._is_eu_model` is a thin alias). Do not add bypasses or feature-flags that circumvent them.
 - **EU-only models are Scaleway (`scw-*`) and Mistral.** If you add a new provider, it must be explicitly classified as EU or non-EU.
 - **Scaleway session storage uses KMS-encrypted buckets.** Do not introduce plaintext fallbacks for EU-only projects.
 - **No telemetry.** Cordée does not phone home. Do not add analytics, error reporting, or usage tracking that sends data to any server outside the user's own infrastructure.

@@ -22,8 +22,6 @@ export const NewProjectModal = () => {
   const [scaffoldingModel, setScaffoldingModel] = useState('');
   const [projectType, setProjectType] = useState('');
   const [euOnly, setEuOnly] = useState(false);
-  const [llmMode, setLlmMode] = useState('standard');
-  const [executionType, setExecutionType] = useState('standard');
   const [aingelNameVal, setAingelNameVal] = useState('');
   const [aingelModelVal, setAingelModelVal] = useState('');
   const [scwSession, setScwSession] = useState(false);
@@ -48,8 +46,9 @@ export const NewProjectModal = () => {
     const ok = (id: string) =>
       id.startsWith('claude-sonnet') ||
       id.startsWith('claude-opus') ||
-      id === 'mistral-large-latest' ||
-      id === 'mistral-medium-latest';
+      id.startsWith('claude-fable') ||
+      id.startsWith('mistral-large') ||
+      id.startsWith('mistral-medium');
     return models.filter(m => ok(m.id));
   }, [models, euOnly]);
 
@@ -60,8 +59,6 @@ export const NewProjectModal = () => {
     setScaffoldingModel('');
     setProjectType('');
     setEuOnly(false);
-    setLlmMode('standard');
-    setExecutionType('standard');
     setAingelNameVal('');
     setAingelModelVal('');
     setScwSession(false);
@@ -117,7 +114,6 @@ export const NewProjectModal = () => {
     setScwSession(checked);
     if (checked) {
       setEuOnly(true);
-      setExecutionType('software');
     }
   };
 
@@ -188,8 +184,6 @@ export const NewProjectModal = () => {
         scaffolding_model: scaffoldingModel || undefined,
         project_type: template?.name || undefined,
         eu_only: scwSession ? true : euOnly,
-        llm_mode: llmMode,
-        execution_type: scwSession ? 'software' : executionType,
         aingel_name: aingelNameVal.trim() || undefined,
         aingel_model: aingelModelVal || undefined,
       });
@@ -331,24 +325,6 @@ export const NewProjectModal = () => {
             </div>
           </div>
         )}
-
-        <div className="form-group mb-3">
-          <label className="block text-sm font-semibold text-text-soft mb-[3px]">LLM mode</label>
-          <select data-tip="Choose how the AI guide responds" className="w-full py-[7px] px-2.5 border border-default rounded text-base" value={llmMode} onChange={e => setLlmMode(e.target.value)}>
-            <option value="standard">Standard</option>
-            <option value="specific">Specific</option>
-          </select>
-        </div>
-
-        <div className="form-group mb-3">
-          <label className="block text-sm font-semibold text-text-soft mb-[3px]">Execution type</label>
-          <select data-tip="Choose how tasks are executed" className="w-full py-[7px] px-2.5 border border-default rounded text-base" value={executionType} onChange={e => setExecutionType(e.target.value)}>
-            <option value="standard">Standard</option>
-            <option value="software">Software</option>
-            <option value="research">Research</option>
-            <option value="deployment">Deployment</option>
-          </select>
-        </div>
 
         <div className="form-group mb-3">
           <label className="block text-sm font-semibold text-text-soft mb-[3px]">Guide name <span className="font-normal text-text-faint">— optional AI persona name</span></label>

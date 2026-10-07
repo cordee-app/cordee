@@ -46,7 +46,7 @@ function TooltipHost({ tip }: { tip: Tip }) {
         visibility: pos ? 'visible' : 'hidden',
       }}
       className={cn(
-        'pointer-events-none z-[10000] rounded-md border border-border/70 bg-ink px-2.5 py-1.5 text-xs font-medium text-white shadow-strong',
+        'pointer-events-none z-[10000] whitespace-pre-line rounded-md border border-border/70 bg-ink px-2.5 py-1.5 text-xs font-medium text-white shadow-strong',
         'dark:border-border-dark-DEFAULT dark:bg-surface-dark-raised dark:text-text-dark-DEFAULT',
       )}
     >

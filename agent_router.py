@@ -47,7 +47,10 @@ try:
         retry_if_exception_type,
     )
     VIBE_CLI_RETRY_AVAILABLE = True
-    VIBE_CLI_RETRYABLE_ERRORS = (RuntimeError, subprocess.TimeoutExpired)
+    # subprocess.TimeoutExpired is deliberately NOT retryable: each attempt
+    # starts the CLI cold, so a task that outran the wall-clock cap just
+    # redoes the same work and times out again (task 10001187: 3 x 15 min).
+    VIBE_CLI_RETRYABLE_ERRORS = (RuntimeError,)
 except ImportError:
     # Fallback: no retries if tenacity is not installed
     def retry(*args, **kwargs):
@@ -101,10 +104,10 @@ class _TransientHTTPError(Exception):
 # Update when new models are added to VIBE_MODELS.
 _VIBE_MODEL_ID_MAP = {
     'mistral-large-latest':  'mistral-large',
+    'mistral-large-4':       'mistral-large-4',
     'mistral-medium-latest': 'mistral-medium-3.5',
     'mistral-small-latest':  'mistral-small',
     'codestral-latest':      'codestral',
-    'devstral-latest':       'devstral',
     'mistral-glm-5-3':       'zai-glm-5-3',
 }
 
@@ -148,7 +151,7 @@ _SUPERAGENT_ONLY_VIBE_ENV = {
     'VIBE_CLI_RETRY_ATTEMPTS',
 }
 
-CODEX_CHATGPT_DEFAULT_MODEL = 'gpt-5.4-mini'
+CODEX_CHATGPT_DEFAULT_MODEL = 'gpt-6-luna'
 
 
 def _summarize_permission_denials(denials):
@@ -234,6 +237,11 @@ class VibeCLIError(RuntimeError):
         self.stderr = stderr
 
 
+class VibeCLITimeout(Exception):
+    """Raised when a Vibe CLI run exceeds VIBE_CLI_TIMEOUT_SECS. Not a
+    RuntimeError subclass, so the tenacity retry loop does not restart it."""
+
+
 class ExecutionCancelledError(Exception):
     """Raised when a provider subprocess is killed because the execution was
     cancelled. Deliberately NOT a RuntimeError subclass (and therefore not in
@@ -256,11 +264,16 @@ def _execution_cancelled(exec_id, project_path=None):
 
 
 def _cost(model_id, tok_in, tok_out):
+    """Per-token cost from MODELS. Does not account for Anthropic cache
+    read/write pricing — cache tokens are billed at the full input rate
+    (conservative upper bound). See PRICING comment in agent_config.py."""
     m = MODELS.get(model_id, MODELS[DEFAULT_MODEL])
     return round((tok_in * m['cost_input'] + tok_out * m['cost_output']) / 1_000_000, 6)
 
 
 def _pricing_cost(model_id, tok_in, tok_out):
+    """Per-token cost from PRICING (fuzzy fallback). Same cache-pricing
+    limitation as _cost() — see agent_config.py PRICING comment."""
     pricing = agent_config.get_pricing(model_id)
     if pricing:
         return round((tok_in * pricing['input'] + tok_out * pricing['output']) / 1_000_000, 6)
@@ -284,6 +297,8 @@ def _call_vibe_cli(model_id, prompt, max_tokens=4096, *, project_path=None, exec
 
     if not os.path.isdir(project_path):
         raise VibeCLIError(f'project_path does not exist or is not a directory: {project_path}')
+
+    _timeout = getattr(agent_config, 'VIBE_CLI_TIMEOUT_SECS', 2700)
 
     @retry(
         stop=stop_after_attempt(getattr(agent_config, 'VIBE_CLI_RETRY_ATTEMPTS', 3)),
@@ -316,11 +331,15 @@ def _call_vibe_cli(model_id, prompt, max_tokens=4096, *, project_path=None, exec
             except Exception:
                 pass
         try:
-            stdout, stderr = proc.communicate(timeout=900)
+            stdout, stderr = proc.communicate(timeout=_timeout)
         except subprocess.TimeoutExpired:
             _kill_process_group(proc)
-            stdout, stderr = proc.communicate()
-            raise
+            proc.communicate()
+            # Not a RuntimeError, so the retry loop stops here. Short message:
+            # TimeoutExpired's own str() embeds the whole argv (the prompt).
+            raise VibeCLITimeout(
+                f'Vibe CLI exceeded the {_timeout // 60}-min run limit '
+                f'(VIBE_CLI_TIMEOUT_SECS={_timeout}); run stopped, not retried.')
         # The cancel endpoint may have killed the child mid-run; treat that as
         # a terminal cancellation, not a retryable transport error.
         if _execution_cancelled(exec_id, project_path):
@@ -872,7 +891,9 @@ def call_mistral(model_id, prompt, max_tokens=4096, *, project_path=None,
     if _is_mistral_ocr_model(model_id):
         return _call_mistral_ocr(model_id, prompt, max_tokens, project_path=project_path, exec_id=exec_id)
 
-    effective_mode = force_mistral_mode or MISTRAL_MODE
+    # Read live: Settings › General changes agent_config.MISTRAL_MODE at run
+    # time; the name imported above is a startup copy and never sees that.
+    effective_mode = force_mistral_mode or agent_config.MISTRAL_MODE
 
     if effective_mode == 'vibe' and model_id not in VIBE_MODELS:
         _log.warning(f'Model {model_id} not in VIBE_MODELS allowlist; falling back to API mode')
@@ -1049,7 +1070,8 @@ def call_openai(model_id, prompt, max_tokens=4096, *, project_path=None, exec_id
 
 # Maps SuperAgent scw-* IDs → actual Scaleway Generative API model IDs
 _SCW_MODEL_MAP = {
-    'scw-qwen3-coder-30b':   'qwen3-coder-30b-a3b-instruct',
+    'scw-deepseek-v4-flash': 'deepseek-v4-flash-0731',
+    'scw-qwen3.8-27b':       'qwen3.8-27b',
     'scw-gpt-oss-120b':      'gpt-oss-120b',
     'scw-llama-3.3-70b':     'llama-3.3-70b-instruct',
     'scw-mistral-small-24b': 'mistral-small-3.2-24b-instruct-2506',
@@ -1076,7 +1098,13 @@ _SCW_API_URL = 'https://api.scaleway.ai/v1/chat/completions'
 #   curl -H "Authorization: Bearer $OLLAMA_API_KEY" https://ollama.com/api/tags
 # (or browse ollama.com/search?c=cloud). Stale tags surface as a 404 from the endpoint.
 _OLL_MODEL_MAP = {
-    'oll-qwen3.5-397b': 'qwen3.5:397b',
+    'oll-glm-5.3':      'glm-5.3',
+    'oll-glm-5.3-flash': 'glm-5.3-flash',
+    'oll-mistral-large-4': 'mistral-large-4',
+    'oll-deepseek-v4-pro': 'deepseek-v4-pro:0813',
+    'oll-deepseek-v4.1-flash': 'deepseek-v4.1-flash',
+    'oll-kimi-k2.6':    'kimi-k2.6',
+    'oll-minimax-m2.7': 'minimax-m2.7',
     'oll-glm-5.2':      'glm-5.2',
     'oll-gpt-oss-120b': 'gpt-oss:120b',
     'oll-gpt-oss-20b':  'gpt-oss:20b',
