@@ -212,9 +212,32 @@ const ChatPanelInner = () => {
     }
   }, []);
 
+  const isNearBottom = useCallback(() => {
+    const el = messagesRef.current;
+    if (!el) return true;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  }, []);
+
+  // Follow-mode for live transcript updates: the scroll listener keeps
+  // this at the PRE-append position, so an at-bottom user follows new
+  // messages (sends, AI replies, background posts) while a reader who
+  // scrolled up is never yanked. Programmatic scrollToBottom() fires a
+  // scroll event too, keeping the ref true after a follow.
+  const wasAtBottomRef = useRef(true);
+  const handleMessagesScroll = useCallback(() => {
+    wasAtBottomRef.current = isNearBottom();
+  }, [isNearBottom]);
+
+  // Open / chat switch: always jump to the newest message.
   useEffect(() => {
     scrollToBottom();
-  }, [chat.transcript, scrollToBottom, isSending]);
+  }, [chat.id, scrollToBottom]);
+
+  // Live transcript updates: follow while sending or in follow-mode —
+  // never yank a reader who scrolled up.
+  useEffect(() => {
+    if (isSending || wasAtBottomRef.current || isNearBottom()) scrollToBottom();
+  }, [chat.transcript, scrollToBottom, isSending, isNearBottom]);
 
   useEffect(() => {
     setInputText('');
@@ -577,7 +600,7 @@ const ChatPanelInner = () => {
         </div>
       )}
 
-      <div className="chat-messages flex-1 overflow-y-auto p-3" ref={messagesRef}>
+      <div className="chat-messages flex-1 overflow-y-auto p-3" ref={messagesRef} onScroll={handleMessagesScroll}>
         {transcript.length === 0 && !isSending ? (
           <p className="text-text-faint italic text-center pt-[30px]">
             No messages yet.

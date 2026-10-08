@@ -180,6 +180,29 @@ const App = () => {
       setExecutions(executions);
       setPhasesData(phases);
       setChats(chats);
+      // Backstop for dropped SSE chat_changed events: also refresh the
+      // open chat's transcript (e.g. a task-completion post landing in
+      // the Guide chat while it is open). Reads live state via
+      // useStore.getState() — the closured useCallback([]) values would
+      // be stale. Never while a reply is in flight (ChatPanel owns it).
+      // The transcript sentinel closes a straddle race: a stalled fetch
+      // started while idle must not overwrite a send that completed
+      // while it was in flight.
+      {
+        const st = useStore.getState();
+        const openChatId = st.activeChat?.id;
+        const beforeTranscript = st.activeChat?.transcript;
+        if (openChatId != null && !st.chatSending) {
+          api.chats.get(openChatId)
+            .then((fresh) => {
+              const now = useStore.getState();
+              if (now.activeChat?.id === openChatId && !now.chatSending && now.activeChat?.transcript === beforeTranscript) {
+                setActiveChat(fresh);
+              }
+            })
+            .catch(() => { /* open chat deleted or transient failure — ignore */ });
+        }
+      }
       setRoles(roles);
       setRoleTemplates(roleTemplates);
       setWorkSessions(sessions);

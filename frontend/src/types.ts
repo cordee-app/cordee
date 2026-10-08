@@ -132,6 +132,9 @@ export interface Execution {
   has_output_file?: boolean;
   rag_label?: string;
   rag_provenance_json?: string;
+  context_used?: string[];
+  context_binary?: string[];
+  context_review_needed?: boolean;
 }
 
 export interface Chat {
@@ -211,6 +214,7 @@ export interface AttachableTask {
   has_dependencies: boolean;
   status: string;
   color?: string;
+  phase_name?: string;
 }
 
 export interface Phase {

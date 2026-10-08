@@ -3638,6 +3638,13 @@ def create_task():
         execution_type = _norm_task_execution_type(data.get('execution_type'))
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
+    # Validate context_refs BEFORE creating the task so a malformed payload can't
+    # leave an orphaned task row behind (a client retry would then duplicate it).
+    if 'context_refs' in data:
+        pre_crefs = data.get('context_refs')
+        pre_crefs = [] if pre_crefs is None else pre_crefs
+        if not isinstance(pre_crefs, list) or any(not isinstance(c, str) for c in pre_crefs):
+            return jsonify({'error': 'context_refs must be an array of strings'}), 400
     task_id = db.create_task(
         project_id=data['project_id'],
         title=data['title'],
@@ -3672,9 +3679,11 @@ def create_task():
             crefs = data.get('context_refs')
             if crefs is None:
                 crefs = []
-            if not isinstance(crefs, list):
+            if not isinstance(crefs, list) or any(not isinstance(c, str) for c in crefs):
                 return jsonify({'error': 'context_refs must be an array of strings'}), 400
-            db.set_task_context_refs(task_id, proj.get('path'), crefs)
+            ok = db.set_task_context_refs(task_id, proj.get('path'), crefs)
+            if not ok:
+                return jsonify({'error': 'failed to save context_refs'}), 500
         except Exception as _e:
             app.logger.warning(f"set_task_context_refs failed for task {task_id}: {_e}")
     # If the user didn't supply an estimate, replace the 50k default with a real
@@ -3981,7 +3990,7 @@ def update_task(tid):
         crefs = data.pop('context_refs')
         if crefs is None:
             crefs = []
-        if not isinstance(crefs, list):
+        if not isinstance(crefs, list) or any(not isinstance(c, str) for c in crefs):
             return jsonify({'error': 'context_refs must be an array of strings'}), 400
         ok = db.set_task_context_refs(tid, task.get('path'), crefs)
         if not ok:
@@ -4856,6 +4865,27 @@ def _maybe_autochain_dependents(task_id):
 
 # ── Executions ────────────────────────────────────────────────────────────────
 
+def _expand_context_used(e):
+    """Replace the raw context_used_json column with context_used /
+    context_binary / context_review_needed fields for the UI."""
+    raw = e.pop('context_used_json', None)
+    used, binary, review = [], [], False
+    if raw:
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                if isinstance(obj.get('used'), list):
+                    used = obj['used']
+                if isinstance(obj.get('binary'), list):
+                    binary = obj['binary']
+                review = bool(obj.get('review_needed'))
+        except Exception:
+            pass
+    e['context_used'] = used
+    e['context_binary'] = binary
+    e['context_review_needed'] = review
+
+
 @app.route('/api/executions')
 @require_auth
 def list_executions():
@@ -4915,6 +4945,7 @@ def list_executions():
     for e in executions:
         e['aingel_review'] = e.get('aingel_brief') or None
         e['model_label'] = _model_label(e.get('model', ''), dep_labels)
+        _expand_context_used(e)
         pid = e.get('project_id')
         if pid:
             e['has_output_file'] = f'exec-{e["id"]}-output.md' in _outputs_by_proj.get(pid, set())
@@ -4935,6 +4966,7 @@ def get_execution_detail(exec_id):
         return jsonify({'error': 'Execution not found'}), 404
     result['aingel_review'] = result.get('aingel_brief') or None
     result['model_label'] = _model_label(result.get('model', ''))
+    _expand_context_used(result)
     return jsonify(result)
 
 

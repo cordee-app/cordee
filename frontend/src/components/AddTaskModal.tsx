@@ -1,12 +1,13 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import type { ReactElement } from 'react';
 import { useStore } from '../store';
 import { api } from '../api';
 import { cn } from '../utils/cn';
 import { fmtUsd } from '../utils/currency';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
-import type { Task, TaskDependencies, ModelRecommendation, TaskAttachment, HfCandidate } from '../types';
+import type { Task, TaskDependencies, ModelRecommendation, TaskAttachment, HfCandidate, FileEntry } from '../types';
 import { TaskAttachPicker } from './TaskAttachPicker';
+import { Paperclip } from 'lucide-react';
 
 interface PhaseDataItem {
   project: string;
@@ -103,10 +104,18 @@ export const AddTaskModal = () => {
 
   // Lane B: explicit context refs (file catalog picker)
   const [contextRefs, setContextRefs] = useState<string[]>([]);
-  const [catalogFiles, setCatalogFiles] = useState<string[]>([]);
+  const [catalogFiles, setCatalogFiles] = useState<FileEntry[]>([]);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [showContextPicker, setShowContextPicker] = useState(false);
   const [contextSearch, setContextSearch] = useState('');
+
+  // '@' file-mention autocomplete on the description textarea.
+  const [mentionOpen, setMentionOpen] = useState(false);
+  const [mentionQuery, setMentionQuery] = useState('');
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const [mentionAt, setMentionAt] = useState(-1);
+  const descRef = useRef<HTMLTextAreaElement>(null);
+  const mentionCaretRef = useRef<number | null>(null);
 
   // RAG: per-task opt-in + corpus override (library is shared across projects).
   const [requiresRag, setRequiresRag] = useState(false);
@@ -144,6 +153,11 @@ export const AddTaskModal = () => {
 
   const selectedPhaseData = phaseDataItems.find(
     (p) => project && p.project === project.name,
+  );
+
+  const phaseOrder = useMemo(
+    () => (selectedPhaseData?.phases.map((ph) => ph.title) ?? []),
+    [selectedPhaseData],
   );
 
   const initForm = useCallback(() => {
@@ -219,6 +233,10 @@ export const AddTaskModal = () => {
     setShowAttachPicker(false);
     setShowContextPicker(false);
     setContextSearch('');
+    setMentionOpen(false);
+    setMentionQuery('');
+    setMentionIndex(0);
+    setMentionAt(-1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showAddModal, modModalTaskId]);
 
@@ -246,9 +264,7 @@ export const AddTaskModal = () => {
     api.files.catalog(projectId)
       .then((catalog) => {
         if (cancelled) return;
-        const rels = (catalog.files || []).map((f) => f.rel).filter(Boolean) as string[];
-        // fallback: also include folders? rel already includes path
-        setCatalogFiles(rels);
+        setCatalogFiles((catalog.files || []).filter((f) => f.rel));
       })
       .catch(() => { if (!cancelled) setCatalogFiles([]); })
       .finally(() => { if (!cancelled) setCatalogLoading(false); });
@@ -581,6 +597,27 @@ export const AddTaskModal = () => {
     }
   };
 
+  // '@' mention candidates for the description textarea.
+  const mentionCandidates = useMemo(() => {
+    const q = mentionQuery.toLowerCase();
+    return catalogFiles
+      .filter((f) => !f.hidden && f.category !== 'system')
+      .filter((f) => !q || f.rel.toLowerCase().includes(q) || f.name.toLowerCase().includes(q))
+      .slice(0, 10);
+  }, [catalogFiles, mentionQuery]);
+
+  // After a mention is inserted, restore focus/caret to just after it.
+  useEffect(() => {
+    if (mentionCaretRef.current === null) return;
+    const caret = mentionCaretRef.current;
+    mentionCaretRef.current = null;
+    const el = descRef.current;
+    if (el) {
+      el.focus();
+      el.setSelectionRange(caret, caret);
+    }
+  }, [description]);
+
   if (!isOpen) return null;
   if (isEdit && !task) return null;
 
@@ -641,6 +678,38 @@ export const AddTaskModal = () => {
     </div>
   );
 
+  const recomputeMention = (value: string, caret: number) => {
+    const m = value.slice(0, caret).match(/(^|\s)@([^\s@]*)$/);
+    if (!m) {
+      setMentionOpen(false);
+      setMentionQuery('');
+      setMentionIndex(0);
+      setMentionAt(-1);
+      return;
+    }
+    const query = m[2];
+    setMentionOpen(true);
+    setMentionQuery(query);
+    setMentionIndex(0);
+    setMentionAt(caret - query.length - 1);
+  };
+
+  const selectMention = (file: FileEntry) => {
+    if (mentionAt < 0) return;
+    const next =
+      `${description.slice(0, mentionAt)}@${file.name} ${description.slice(mentionAt + mentionQuery.length + 1)}`
+        .slice(0, DESC_LIMIT);
+    setDescription(next);
+    if (!contextRefs.includes(file.rel)) setContextRefs([...contextRefs, file.rel]);
+    // Restore the caret just after the inserted "@name " so mid-text mentions
+    // don't yank the cursor to the end of the description.
+    mentionCaretRef.current = Math.min(mentionAt + file.name.length + 2, next.length);
+    setMentionOpen(false);
+    setMentionQuery('');
+    setMentionIndex(0);
+    setMentionAt(-1);
+  };
+
   return (
     <div className="modal-backdrop fixed inset-0 bg-black/40 dark:bg-black/75 flex items-center justify-center z-modal" onClick={(e) => { if (e.target === e.currentTarget) closeModal(); }}>
       <div
@@ -697,37 +766,95 @@ export const AddTaskModal = () => {
             <label className="block text-sm font-semibold text-text-soft mb-[3px] m-0">Prompt / Description</label>
             <div className="flex gap-1.5">
               {perms.canEdit && (
-                <>
-                  <button
-                    data-tip="Attach files, memories, tasks or working docs to use as context when improving"
-                    className="btn text-sm py-1 px-2 border border-dashed border-default rounded cursor-pointer text-text-soft"
-                    onClick={() => setShowAttachPicker(true)}
-                  >
-                    + Attach
-                  </button>
+                <div className="header-btn header-btn-primary overflow-hidden" style={{ padding: 0, gap: 0 }}>
                   <button
                     data-tip="Guide my prompt"
-                    className="header-btn header-btn-primary px-3.5 py-1 border rounded text-white text-md- font-heading font-normal cursor-pointer"
+                    className="inline-flex items-center gap-1.5 px-3.5 py-1 text-white text-md- font-heading font-normal cursor-pointer bg-transparent border-0 hover:bg-white/10"
                     onClick={handleImprove}
                     disabled={improveLoading}
                   >
                     <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style={{ opacity: 1 }}><circle cx="12" cy="12" r="12" fill="#fbf6ee"/><circle cx="12" cy="12" r="7.5" fill="none" stroke="#c67139" strokeWidth="3"/><circle cx="12" cy="12" r="2.4" fill="#c67139"/></svg>
                     {improveLoading ? 'Guiding…' : 'Guide my prompt'}
                   </button>
-                </>
+                  <span aria-hidden="true" className="self-stretch w-px bg-white/25" />
+                  <button
+                    data-tip="Attach context for 'Guide my prompt' only — use Context files below for run-time injection"
+                    className="inline-flex items-center px-2.5 py-1 text-white text-md- cursor-pointer bg-transparent border-0 hover:bg-white/10"
+                    onClick={() => setShowAttachPicker(true)}
+                    aria-label="Attach context for Guide my prompt"
+                  >
+                    <Paperclip size={13} />
+                  </button>
+                </div>
               )}
             </div>
           </div>
-          <textarea
-            data-tip="Describe what this task should do"
-            className="w-full py-[7px] px-2.5 border border-default rounded text-base"
-            value={description}
-            onChange={(e) => setDescription(e.target.value.slice(0, DESC_LIMIT))}
-            rows={8}
-            style={{ minHeight: 150 }}
-            maxLength={DESC_LIMIT}
-            placeholder="Task description"
-          />
+          <div className="relative">
+            <textarea
+              ref={descRef}
+              data-tip="Describe what this task should do"
+              className="w-full py-[7px] px-2.5 border border-default rounded text-base"
+              value={description}
+              onChange={(e) => {
+                const value = e.target.value.slice(0, DESC_LIMIT);
+                setDescription(value);
+                recomputeMention(value, e.target.selectionStart ?? value.length);
+              }}
+              onKeyDown={(e) => {
+                if (!mentionOpen || mentionCandidates.length === 0) return;
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  setMentionIndex((i) => Math.min(i + 1, mentionCandidates.length - 1));
+                } else if (e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  setMentionIndex((i) => Math.max(i - 1, 0));
+                } else if (e.key === 'Enter' || e.key === 'Tab') {
+                  // Don't hijack Enter/Tab while an IME composition is being confirmed.
+                  if (e.nativeEvent.isComposing) return;
+                  if (mentionCandidates[mentionIndex]) {
+                    e.preventDefault();
+                    selectMention(mentionCandidates[mentionIndex]);
+                  }
+                } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setMentionOpen(false);
+                }
+              }}
+              onBlur={() => {
+                window.setTimeout(() => setMentionOpen(false), 120);
+              }}
+              rows={8}
+              style={{ minHeight: 150 }}
+              maxLength={DESC_LIMIT}
+              placeholder="Task description"
+            />
+            {mentionOpen && mentionCandidates.length > 0 && (
+              <div
+                className="absolute left-0 right-0 mt-0.5 z-30 bg-surface-raised dark:bg-surface-dark-raised border border-default dark:border-border-dark-default rounded-md shadow-medium max-h-[240px] overflow-y-auto"
+              >
+                {mentionCandidates.map((f, i) => (
+                  <div
+                    key={f.rel}
+                    className={cn(
+                      'flex items-center gap-2 px-2 py-1 cursor-pointer',
+                      i === mentionIndex
+                        ? 'bg-surface-subtle dark:bg-surface-dark-subtle'
+                        : 'hover:bg-surface-subtle dark:hover:bg-surface-dark-subtle',
+                    )}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      selectMention(f);
+                    }}
+                  >
+                    <span className="text-xs flex-1 truncate text-text-default dark:text-text-dark-default" title={f.rel}>{f.rel}</span>
+                    {contextRefs.includes(f.rel) && (
+                      <span className="text-2xs text-accent shrink-0">attached</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
           <div
             className="mt-1 h-1.5 rounded-sm bg-[#eee7db] dark:bg-[#332f29] overflow-hidden"
           >
@@ -757,6 +884,9 @@ export const AddTaskModal = () => {
             }}
           >
             {remaining} characters remaining
+          </div>
+          <div className="text-2xs text-text-faint mt-0.5">
+            Tip: type @ to attach a file to the prompt
           </div>
           {attachments.length > 0 && (
             <div className="mt-1.5 flex flex-wrap gap-1 items-center">
@@ -1022,7 +1152,7 @@ export const AddTaskModal = () => {
         {/* Lane B: context_refs picker */}
         <div className="form-group mb-3 rounded-lg border border-default p-3 bg-bg-inset/30">
           <div className="flex items-center justify-between">
-            <label className="block text-sm font-semibold text-text-soft">Context files (explicit)</label>
+            <label className="block text-sm font-semibold text-text-soft">Context files (explicit){contextRefs.length > 0 ? ` — ${contextRefs.length} selected` : ''}</label>
             {perms.canEdit && (
               <button
                 data-tip={showContextPicker ? 'Close the context file picker' : 'Pick files to inject into the prompt'}
@@ -1034,7 +1164,7 @@ export const AddTaskModal = () => {
             )}
           </div>
           <p className="text-2xs text-text-faint mt-1">
-            Select Working Docs / outputs files to inject into the prompt. Empty = capped index fallback (≤5k tokens) with review flag.
+            Selected files are injected into the prompt when this task runs. Empty = capped index fallback (≤5k tokens) with review flag.
           </p>
           {contextRefs.length > 0 ? (
             <div className="flex flex-wrap gap-1.5 mt-2">
@@ -1074,26 +1204,26 @@ export const AddTaskModal = () => {
               ) : (
                 <>
                   {catalogFiles
-                    .filter((rel) => !contextSearch || rel.toLowerCase().includes(contextSearch.toLowerCase()))
+                    .filter((f) => !contextSearch || f.rel.toLowerCase().includes(contextSearch.toLowerCase()))
                     .slice(0, 100)
-                    .map((rel) => {
-                      const selected = contextRefs.includes(rel);
+                    .map((f) => {
+                      const selected = contextRefs.includes(f.rel);
                       return (
-                        <label key={rel} className="flex items-center gap-2 py-1 px-1.5 rounded cursor-pointer hover:bg-surface-subtle">
+                        <label key={f.rel} className="flex items-center gap-2 py-1 px-1.5 rounded cursor-pointer hover:bg-surface-subtle">
                           <input
                             type="checkbox"
                             data-tip="Include this file in the prompt context"
                             checked={selected}
                             onChange={() => {
-                              if (selected) setContextRefs(contextRefs.filter((r) => r !== rel));
-                              else setContextRefs([...contextRefs, rel]);
+                              if (selected) setContextRefs(contextRefs.filter((r) => r !== f.rel));
+                              else setContextRefs([...contextRefs, f.rel]);
                             }}
                           />
-                          <span className="text-xs flex-1 truncate" title={rel}>{rel}</span>
+                          <span className="text-xs flex-1 truncate" title={f.rel}>{f.rel}</span>
                         </label>
                       );
                     })}
-                  {catalogFiles.filter((rel) => !contextSearch || rel.toLowerCase().includes(contextSearch.toLowerCase())).length === 0 && (
+                  {catalogFiles.filter((f) => !contextSearch || f.rel.toLowerCase().includes(contextSearch.toLowerCase())).length === 0 && (
                     <div className="text-xs text-text-faint italic py-2">No files found.</div>
                   )}
                 </>
@@ -1526,6 +1656,7 @@ export const AddTaskModal = () => {
         picked={attachments}
         onChange={setAttachments}
         onClose={() => setShowAttachPicker(false)}
+        phaseOrder={phaseOrder}
       />
     </div>
   );

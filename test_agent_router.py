@@ -211,6 +211,54 @@ class AgentRouterCliTests(unittest.TestCase):
         self.assertIn('Context truncated', prompt_arg)
         self.assertTrue(prompt_arg.endswith('x' * 100))
 
+    def test_vibe_turn_limit_does_not_return_raw_conversation(self):
+        # Regression (exec 20001185, task #10001192): the run hit --max-turns and
+        # its last assistant message was a bare tool call. The parser fell back
+        # to the raw stdout (the whole conversation, system prompt included),
+        # whose "do not emit <bash>…</bash>" rule tripped the simulation
+        # detector, so 80 turns of real work were failed as "simulated".
+        conversation = [
+            {'role': 'user', 'content': 'Do NOT emit `<bash>…</bash>` or `<tool_code>…</tool_code>`.'},
+            {'role': 'assistant', 'content': 'Extracted 712 text elements.'},
+            {'role': 'assistant', 'content': [{'type': 'tool_call', 'name': 'write_file'}]},
+            {'role': 'tool', 'content': '{"bytes_written": 19929}'},
+        ]
+
+        class _VibeFakePopen(_FakePopen):
+            def __init__(self_inner, cmd, *a, **k):
+                super().__init__(returncode=1, stdout=json.dumps(conversation),
+                                 stderr='<vibe_stop_event>Turn limit of 80 reached</vibe_stop_event>')
+
+        with patch('shutil.which', return_value='/usr/bin/vibe'), \
+             patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'test-key'), \
+             patch('subprocess.Popen', side_effect=_VibeFakePopen):
+            text, _ti, _to, _cost = agent_router._call_vibe_cli(
+                'mistral-medium-latest', 'Translate the deck.',
+                project_path=os.getcwd())
+
+        self.assertTrue(text.startswith('Extracted 712 text elements.'))
+        self.assertIn(agent_router.VIBE_TURN_LIMIT_MARKER, text)
+        self.assertNotIn('<bash>', text)
+
+    def test_vibe_no_assistant_text_returns_empty_not_stdout(self):
+        conversation = [
+            {'role': 'user', 'content': 'Do NOT emit `<bash>…</bash>`.'},
+            {'role': 'assistant', 'content': [{'type': 'tool_call', 'name': 'bash'}]},
+        ]
+
+        class _VibeFakePopen(_FakePopen):
+            def __init__(self_inner, cmd, *a, **k):
+                super().__init__(returncode=0, stdout=json.dumps(conversation), stderr='')
+
+        with patch('shutil.which', return_value='/usr/bin/vibe'), \
+             patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'test-key'), \
+             patch('subprocess.Popen', side_effect=_VibeFakePopen):
+            text, _ti, _to, _cost = agent_router._call_vibe_cli(
+                'mistral-medium-latest', 'Translate the deck.',
+                project_path=os.getcwd())
+
+        self.assertEqual(text, '')
+
     def test_chat_transcript_normalizes_empty_permission_denial_envelope(self):
         payload = {
             'type': 'result',

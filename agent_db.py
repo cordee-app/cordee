@@ -256,6 +256,8 @@ def _init_project_db_schema(conn):
         # tool), which corpus/chunks, and a UI badge label.
         ('rag_provenance_json', 'TEXT'),
         ('rag_label', 'TEXT'),
+        # Lane B: files actually injected into the prompt ({"used": [...], "binary": [...], "review_needed": bool})
+        ('context_used_json', 'TEXT'),
         # Multi-tenancy (Phase 1): creating user; NULL = pre-multi-tenancy.
         ('created_by', 'INTEGER DEFAULT NULL'),
     ]:
@@ -2963,7 +2965,7 @@ def get_attachable_tasks(project_id, project_path=None):
         return []
     pconn = get_project_db(project_path)
     rows = pconn.execute('''
-        SELECT t.id, t.title, t.status, COALESCE(t.archived,0) archived,
+        SELECT t.id, t.title, t.status, t.phase_name, COALESCE(t.archived,0) archived,
                (SELECT e.id FROM executions e WHERE e.task_id = t.id AND e.status='done'
                 ORDER BY e.started_at DESC, e.id DESC LIMIT 1) AS latest_done_exec_id,
                (SELECT e.output_summary FROM executions e WHERE e.task_id = t.id AND e.status='done'
@@ -2997,6 +2999,7 @@ def get_attachable_tasks(project_id, project_path=None):
             'kind': 'task', 'ref': tid, 'id': tid,
             'name': f"#{tid} {row['title'] or ''}".strip(),
             'label': f"#{tid} {row['title'] or ''}".strip(),
+            'phase_name': row['phase_name'] or '',
             'has_dependencies': has_deps, 'status': status,
             'color': '#28a745' if status == 'done' else '#6c757d',
         })
@@ -3734,6 +3737,31 @@ def update_execution_rag(exec_id, label=None, provenance=None, project_path=None
     pconn.close()
 
 
+def update_execution_context(exec_id, used_refs=None, noted_binary=None, review_needed=None, project_path=None):
+    """Record which context files were injected into this execution's prompt.
+    Stores a JSON object {"used": [...], "binary": [...], "review_needed": bool}.
+    `binary` files are those noted but not inlined; a file may appear in both lists."""
+    if not project_path:
+        reg = _get_exec_reg(exec_id)
+        project_path = reg['project_path'] if reg else None
+    if not project_path:
+        return
+    payload = {}
+    if used_refs is not None:
+        payload['used'] = used_refs
+    if noted_binary is not None:
+        payload['binary'] = noted_binary
+    if review_needed is not None:
+        payload['review_needed'] = review_needed
+    if not payload:
+        return
+    pconn = get_project_db(project_path)
+    pconn.execute('UPDATE executions SET context_used_json=? WHERE id=?',
+                  (json.dumps(payload, ensure_ascii=False, default=str), exec_id))
+    pconn.commit()
+    pconn.close()
+
+
 def get_executions(limit=50):
     """Aggregate recent executions across all project DBs (task runs only, not chat).
     Excludes e.output_summary (2.7M for OCR) from the list view — detail endpoint
@@ -3749,7 +3777,7 @@ def get_executions(limit=50):
                        e.last_heartbeat_at, e.child_pid, e.chat_id, e.aingel_brief,
                        e.error_message, e.git_branch, e.git_commit, e.git_diffstat,
                        e.memory_status, e.gpu_cost_usd, e.batch_parent_id, e.session_id,
-                       e.rag_label, e.rag_provenance_json,
+                       e.rag_label, e.rag_provenance_json, e.context_used_json,
                        t.title task_title, t.external_id task_ext_id
                 FROM executions e
                 LEFT JOIN tasks t ON e.task_id = t.id

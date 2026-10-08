@@ -229,6 +229,13 @@ def _flatten_content(raw):
     return '' if raw is None else str(raw)
 
 
+# Vibe's per-run tool-turn budget (`--max-turns`). VIBE_TURN_LIMIT_MARKER is
+# appended to the recovered text when a run exhausts it; the executor keys on
+# it to skip the simulation detector (80 real turns prove the tools ran).
+VIBE_MAX_TURNS = 80
+VIBE_TURN_LIMIT_MARKER = 'Vibe CLI hit its turn limit'
+
+
 class VibeCLIError(RuntimeError):
     """Raised when the Vibe CLI subprocess fails or returns malformed output."""
     def __init__(self, message: str, returncode: int = None, stderr: str = None):
@@ -417,7 +424,7 @@ def _call_vibe_cli(model_id, prompt, max_tokens=4096, *, project_path=None, exec
         '--agent', 'accept-edits',     # MUST pass — programmatic default is 'auto-approve'
         '--auto-approve',              # approve all tool calls without prompting (programmatic mode)
         '--output', 'json',
-        '--max-turns', '80',
+        '--max-turns', str(VIBE_MAX_TURNS),
         '--max-price', str(VIBE_MAX_PRICE),
         '--trust',                     # trust project dir so .vibe/config.toml is loaded
     ]
@@ -431,14 +438,19 @@ def _call_vibe_cli(model_id, prompt, max_tokens=4096, *, project_path=None, exec
     vibe_turn_limit = getattr(result, '_vibe_turn_limit', False)
     try:
         data = json.loads(result.stdout)
-        # Vibe returns an array of messages; find the last assistant message
+        # Vibe returns an array of messages; use the last assistant message that
+        # carries text. Never fall back to the raw stdout: it is the whole
+        # conversation, system prompt included, and that prompt's "do not emit
+        # <bash>…</bash>" rule trips the simulation detector (exec 20001185,
+        # task #10001192: a turn-limit run whose last message was a bare tool
+        # call was failed as "simulated a tool call in text").
         if isinstance(data, list):
-            assistant_messages = [msg for msg in data if msg.get('role') == 'assistant']
-            if assistant_messages:
-                last_msg = assistant_messages[-1]
-                text = _flatten_content(last_msg.get('content')) or result.stdout.strip()
-            else:
-                text = result.stdout.strip()
+            text = ''
+            for msg in reversed(data):
+                if isinstance(msg, dict) and msg.get('role') == 'assistant':
+                    text = _flatten_content(msg.get('content')).strip()
+                    if text:
+                        break
         elif isinstance(data, dict):
             if data.get('is_error'):
                 raise RuntimeError(f'vibe CLI returned error: {data.get("result", "unknown error")}')
@@ -451,14 +463,14 @@ def _call_vibe_cli(model_id, prompt, max_tokens=4096, *, project_path=None, exec
         # (and the user, via the output file) knows the run was incomplete —
         # the model kept acting but never produced a final answer.
         if vibe_turn_limit:
-            text = (text or '').rstrip()
+            text = (text or '').rstrip() or '_(The model left no final text: its last action was a tool call.)_'
             text += (
-                "\n\n---\n⚠️ **Vibe CLI hit its turn limit (80 turns) before the "
-                "model produced a final answer.** The output above is the "
-                "partial conversation recovered from stdout. The task likely "
-                "needs tools the Vibe CLI doesn't provide (e.g. Proton MCP "
-                "email tools, external web research) — consider rewriting the "
-                "task or using a different execution route."
+                f"\n\n---\n⚠️ **{VIBE_TURN_LIMIT_MARKER} ({VIBE_MAX_TURNS} turns) before "
+                "the model produced a final answer.** The text above is the last "
+                "assistant message; files it wrote may be incomplete. The task is "
+                "likely too large for one run (split it into smaller tasks) or "
+                "needs tools the Vibe CLI doesn't provide (e.g. Proton MCP email "
+                "tools, external web research)."
             )
 
         # Vibe CLI output does not include cost/token fields (verified against v2.9.6).

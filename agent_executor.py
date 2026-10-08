@@ -13,7 +13,7 @@ import agent_db as db
 import agent_files
 import agent_config
 from agent_config import MODELS, DEFAULT_MODEL, get_pricing, resolve_def_filename, get_def_files_for_project
-from agent_router import route, _summarize_permission_denials, ExecutionCancelledError
+from agent_router import route, _summarize_permission_denials, ExecutionCancelledError, VIBE_TURN_LIMIT_MARKER
 from agent_memory import read_memory, phase_from_task, list_working_docs
 import agent_chats as chats
 from agent_skills import skills_context_summary
@@ -996,6 +996,10 @@ def _raise_if_unexecuted_tool_request(text, task):
         text *and* there is no CLI result envelope proving it actually ran.
     """
     if not text or not _looks_like_unexecuted_tool_request(text):
+        return
+    # A run that exhausted Vibe's turn budget executed real tools on every
+    # turn; report it as incomplete (the marker), not as a simulation.
+    if VIBE_TURN_LIMIT_MARKER in text:
         return
     model_id = ((task or {}).get('model') or '').strip() or 'model'
     if _task_uses_direct_text_route(task):
@@ -2382,6 +2386,18 @@ def run_task(task_id=None):
                 _log.warning('[exec] task %s: rag provenance persist failed: %s',
                              task['id'], _rag_err)
 
+        # Persist which Lane B context files were actually injected (used) vs.
+        # only noted as binary, so the UI can show the prompt's grounding.
+        try:
+            db.update_execution_context(exec_id,
+                                        used_refs=lane_used_refs or None,
+                                        noted_binary=noted_binary or None,
+                                        review_needed=lane_review_needed or None,
+                                        project_path=project_path)
+        except Exception as _ctx_err:
+            _log.warning('[exec] task %s: context refs persist failed: %s',
+                         task['id'], _ctx_err)
+
         # Model-fit guard: a small-context model cannot process a corpus many times
         # its window — chunking still "works" but at hundreds of map calls on a GPU
         # billed hourly (regression: task #10001078, 1.7M chars on a 4096-token
@@ -3111,6 +3127,21 @@ def run_task(task_id=None):
             _agent_tools._output_dir.reset(_out_token)
         except Exception:  # not set yet (early exit) or already reset
             pass
+        # Failed / cancelled / timed-out runs skip the success-path relocation,
+        # and discard_task_branch's `checkout -f` keeps untracked files — so the
+        # next run's "Checkpoint before task" commit swept them into the default
+        # branch (task #10001192: runs 1-2 left 16 scripts in the root). Move
+        # them now, before the project lock is released. No-op after a
+        # successful run (its root files were already moved).
+        try:
+            _residue = _relocate_new_root_files(
+                project_path, locals().get('_root_before'), task['_output_dir'])
+            if _residue:
+                _log.info('task %s: moved %d root file(s) left by the run to %s: %s',
+                          task['id'], len(_residue), task['_output_dir'], _residue)
+        except Exception as _rel_err:
+            _log.warning('root residue relocation failed for task %s: %s',
+                         task.get('id'), _rel_err)
         try:
             db.finish_execution(exec_id, 'failed',
                 error_message='Run ended without a terminal state (interrupted)',

@@ -131,6 +131,26 @@ const RagBadge = ({ exec }: { exec: Execution }) => {
   );
 };
 
+const FilesBadge = ({ exec }: { exec: Execution }) => {
+  const used = exec.context_used ?? [];
+  const binary = exec.context_binary ?? [];
+  const review = exec.context_review_needed ?? false;
+  if (used.length === 0 && binary.length === 0 && !review) return null;
+  const lines = [used.join('\n')];
+  if (binary.length > 0) lines.push(`Not inlined (binary): ${binary.join(', ')}`);
+  if (review) lines.push('Fallback capped index was used.');
+  const title = lines.filter(Boolean).join('\n');
+  return (
+    <span
+      className="inline-flex items-center rounded text-[10px] font-semibold px-1.5 py-px"
+      style={{ background: '#eee7db', color: '#645c50' }}
+      title={title}
+    >
+      📎 {used.length} file{used.length === 1 ? '' : 's'}
+    </span>
+  );
+};
+
 export const ExecutionLog = () => {
   const { executions, setExecutions, activeProject, tasks } = useStore();
   const isMobile = useIsMobile();
@@ -490,6 +510,7 @@ export const ExecutionLog = () => {
                             {getModelLabel(e)}
                           </span>
                           <RagBadge exec={e} />
+                          <FilesBadge exec={e} />
                         </span>
                       </td>
                       <td className={tdBase}>
@@ -729,9 +750,10 @@ export const ExecutionLog = () => {
                       <span className="text-xs text-status-done font-semibold" style={{ fontVariantNumeric: 'tabular-nums' }}>{fmtUsd(e.cost_usd)}</span>
                     </div>
                     <div className="text-sm+ text-ink dark:text-text-dark-DEFAULT mb-1">{truncate(e.instructions || e.task_title || '', 120)}</div>
-                    <div className="flex items-center gap-2 text-xs text-text-muted dark:text-text-dark-muted mb-1.5">
+                    <div className="flex items-center gap-2 flex-wrap text-xs text-text-muted dark:text-text-dark-muted mb-1.5">
                       <span className="rounded-[10px]" style={{ background: `${modelColor}22`, color: modelColor, padding: '1px 6px' }}>{getModelLabel(e)}</span>
                       <RagBadge exec={e} />
+                      <FilesBadge exec={e} />
                       <span>{fmtTimeFull(e.started_at)}</span>
                     </div>
                     <div className="flex gap-1.5 flex-wrap items-center">

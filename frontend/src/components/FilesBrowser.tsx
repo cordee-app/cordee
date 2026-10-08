@@ -275,7 +275,7 @@ export const FilesBrowser = ({ files, byCategory, byTask, projectId, projectSlug
   // F1: collapsed-by-default — seed all folder/task group keys as true (collapsed) on first load,
   // then ensure any newly appearing keys also start collapsed without overwriting user toggles.
   useEffect(() => {
-    const folderKeys = groupedByFolder ? groupedByFolder.map(([k]) => k) : [];
+    const folderKeys = groupedByFolder ? folderKeysWithAncestors(groupedByFolder) : [];
     const taskKeys = groupedTasks ? groupedTasks.map((g, idx) => (g.task_id !== null ? `t${g.task_id}` : `g${idx}`)) : [];
     const allKeys = [...folderKeys, ...taskKeys];
     if (allKeys.length === 0) return;
@@ -301,7 +301,7 @@ export const FilesBrowser = ({ files, byCategory, byTask, projectId, projectSlug
   }, [groupedByFolder, groupedTasks]);
 
   const expandAll = useCallback(() => {
-    const folderKeys = groupedByFolder ? groupedByFolder.map(([k]) => k) : [];
+    const folderKeys = groupedByFolder ? folderKeysWithAncestors(groupedByFolder) : [];
     const taskKeys = groupedTasks ? groupedTasks.map((g, idx) => (g.task_id !== null ? `t${g.task_id}` : `g${idx}`)) : [];
     const allKeys = [...folderKeys, ...taskKeys];
     const next: Record<string, boolean> = {};
@@ -310,7 +310,7 @@ export const FilesBrowser = ({ files, byCategory, byTask, projectId, projectSlug
   }, [groupedByFolder, groupedTasks]);
 
   const collapseAll = useCallback(() => {
-    const folderKeys = groupedByFolder ? groupedByFolder.map(([k]) => k) : [];
+    const folderKeys = groupedByFolder ? folderKeysWithAncestors(groupedByFolder) : [];
     const taskKeys = groupedTasks ? groupedTasks.map((g, idx) => (g.task_id !== null ? `t${g.task_id}` : `g${idx}`)) : [];
     const allKeys = [...folderKeys, ...taskKeys];
     const next: Record<string, boolean> = {};
@@ -445,7 +445,7 @@ export const FilesBrowser = ({ files, byCategory, byTask, projectId, projectSlug
         const parents = new Set(rels.map((r) => r.includes('/') ? r.slice(0, r.lastIndexOf('/')) : ''));
         setCollapsed((prev) => {
           const next = { ...prev };
-          for (const p of parents) if (p) next[p] = false;
+          for (const p of parents) for (const a of withAncestors(p)) next[a] = false;
           return next;
         });
         setHighlightRels(new Set(rels));
@@ -1305,11 +1305,32 @@ export const FilesBrowser = ({ files, byCategory, byTask, projectId, projectSlug
 
 // ── Sub-views ─────────────────────────────────────────────────────────────
 
-const FolderGroupedView = ({ groups, projectId, collapsed, setCollapsed, selected, onToggleSelected, editingRel, editingName, setEditingRel, setEditingName, onRename, onOpenTag, tagsMap, highlightRels, forceExpand }: {
-  groups: [string, FileEntry[]][];
-  projectId: number;
+// Nested folder tree: a folder's collapse key is its path, and intermediate
+// folders (no files of their own) need keys too, so expand-all / seeding /
+// upload-unfold must cover every ancestor, not just the leaf group paths.
+const withAncestors = (path: string): string[] => {
+  const segs = path.split('/').filter(Boolean);
+  return segs.map((_, i) => segs.slice(0, i + 1).join('/'));
+};
+
+const folderKeysWithAncestors = (groups: [string, FileEntry[]][]): string[] => {
+  const keys = new Set<string>();
+  for (const [k] of groups) {
+    if (k === '') keys.add('');
+    else for (const a of withAncestors(k)) keys.add(a);
+  }
+  return [...keys];
+};
+
+
+interface FolderNode { path: string; name: string; files: FileEntry[]; children: FolderNode[]; }
+
+const FolderTreeNode = ({ node, depth, collapsed, setCollapsed, projectId, selected, onToggleSelected, editingRel, editingName, setEditingRel, setEditingName, onRename, onOpenTag, tagsMap, highlightRels, forceExpand }: {
+  node: FolderNode;
+  depth: number;
   collapsed: Record<string, boolean>;
   setCollapsed: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  projectId: number;
   selected: Set<string>;
   onToggleSelected: (rel: string) => void;
   editingRel: string | null;
@@ -1322,35 +1343,106 @@ const FolderGroupedView = ({ groups, projectId, collapsed, setCollapsed, selecte
   highlightRels?: Set<string>;
   forceExpand?: boolean;
 }) => {
+  const isCollapsed = forceExpand ? false : (collapsed[node.path] ?? true);
+  const totalSize = node.files.reduce((s, f) => s + f.size, 0);
+  const isRoot = depth === 0;
+  return (
+    <div key={node.path || '__root'} className={isRoot ? 'border border-border-muted rounded bg-surface-soft' : ''}>
+      <button
+        data-tip={isCollapsed ? 'Expand this folder' : 'Collapse this folder'}
+        onClick={() => setCollapsed((c) => ({ ...c, [node.path]: !(c[node.path] ?? true) }))}
+        className={isRoot
+          ? 'w-full flex items-center gap-1.5 py-1.5 px-2 text-sm bg-surface-muted hover:bg-surface-raised border-none cursor-pointer text-left'
+          : 'w-full flex items-center gap-1.5 py-1.5 px-2 text-sm bg-transparent hover:bg-surface-muted border-none cursor-pointer text-left'}
+        aria-expanded={!isCollapsed}
+      >
+        {isCollapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+        <Folder size={12} className="text-text-soft" />
+        <span className="font-medium flex-1">{node.name}</span>
+        <span className="text-xs text-text-faint">
+          {node.files.length} file{node.files.length === 1 ? '' : 's'} · {fmtBytes(totalSize)}
+        </span>
+      </button>
+      {!isCollapsed ? (
+        <>
+          {node.children.length > 0 ? (
+            <div className="ml-3 flex flex-col gap-1 mt-1">
+              {node.children.map((child) => (
+                <FolderTreeNode key={child.path || '__root'} node={child} depth={depth + 1} collapsed={collapsed} setCollapsed={setCollapsed} projectId={projectId} selected={selected} onToggleSelected={onToggleSelected} editingRel={editingRel} editingName={editingName} setEditingRel={setEditingRel} setEditingName={setEditingName} onRename={onRename} onOpenTag={onOpenTag} tagsMap={tagsMap} highlightRels={highlightRels} forceExpand={forceExpand} />
+              ))}
+            </div>
+          ) : null}
+          {node.files.length > 0 ? (
+            <div className="p-1">
+              <FlatList files={node.files} projectId={projectId} selected={selected} onToggleSelected={onToggleSelected} editingRel={editingRel} editingName={editingName} setEditingRel={setEditingRel} setEditingName={setEditingName} onRename={onRename} onOpenTag={onOpenTag} tagsMap={tagsMap} highlightRels={highlightRels} />
+            </div>
+          ) : null}
+        </>
+      ) : null}
+    </div>
+  );
+};
+
+const FolderGroupedView = ({ groups, projectId, collapsed, setCollapsed, selected, onToggleSelected, editingRel, editingName, setEditingRel, setEditingName, onRename, onOpenTag, tagsMap, highlightRels, forceExpand }: {
+  groups: [string, FileEntry[]][];
+  projectId: number;
+  collapsed: Record<string, boolean>;
+  setCollapsed: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  selected: Set<string>;
+  onToggleSelected: (rel: string) => void;
+  editingRel: string | null;
+  editingName: string;
+  setEditingRel: (v: string | null) => void;
+  setEditingName: (v: string) => void;
+  onRename: (rel: string) => void;
+  onOpenTag: (f: FileEntry) => void;
+  tagsMap?: Record<string, { tags: string[]; note: string }>;
+  highlightRels?: Set<string>;
+  forceExpand?: boolean;
+}) => {
+  const tree = useMemo(() => {
+    const byPath = new Map<string, FolderNode>();
+    const roots: FolderNode[] = [];
+    const getOrCreate = (path: string, name: string): FolderNode => {
+      let n = byPath.get(path);
+      if (!n) {
+        n = { path, name, files: [], children: [] };
+        byPath.set(path, n);
+      }
+      return n;
+    };
+    for (const [folderPath, folderFiles] of groups) {
+      if (folderPath === '') {
+        const root = getOrCreate('', '(project root)');
+        root.files = [...root.files, ...folderFiles];
+        if (!roots.includes(root)) roots.push(root);
+        continue;
+      }
+      const segs = folderPath.split('/').filter(Boolean);
+      let parent: FolderNode | null = null;
+      let acc = '';
+      for (let i = 0; i < segs.length; i++) {
+        acc = acc ? `${acc}/${segs[i]}` : segs[i];
+        const isLeaf = i === segs.length - 1;
+        const n = getOrCreate(acc, segs[i]);
+        if (parent && !parent.children.includes(n)) parent.children.push(n);
+        if (!parent && !roots.includes(n)) roots.push(n);
+        if (isLeaf) n.files = [...n.files, ...folderFiles];
+        parent = n;
+      }
+    }
+    const sortKids = (n: FolderNode) => {
+      n.children.sort((a, b) => a.name.localeCompare(b.name));
+      for (const c of n.children) sortKids(c);
+    };
+    for (const r of roots) sortKids(r);
+    return roots;
+  }, [groups]);
   return (
     <div className="flex flex-col gap-2">
-      {groups.map(([folder, folderFiles]) => {
-        const isCollapsed = forceExpand ? false : collapsed[folder];
-        const totalSize = folderFiles.reduce((s, f) => s + f.size, 0);
-        const label = folder || '(project root)';
-        return (
-          <div key={folder || '__root'} className="border border-border-muted rounded bg-surface-soft">
-            <button
-              data-tip={isCollapsed ? 'Expand this folder' : 'Collapse this folder'}
-              onClick={() => setCollapsed((c) => ({ ...c, [folder]: !c[folder] }))}
-              className="w-full flex items-center gap-1.5 py-1.5 px-2 text-sm bg-surface-muted hover:bg-surface-raised border-none cursor-pointer text-left"
-              aria-expanded={!isCollapsed}
-            >
-              {isCollapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
-              <Folder size={12} className="text-text-soft" />
-              <span className="font-medium flex-1">{label}</span>
-              <span className="text-xs text-text-faint">
-                {folderFiles.length} file{folderFiles.length === 1 ? '' : 's'} · {fmtBytes(totalSize)}
-              </span>
-            </button>
-            {!isCollapsed ? (
-              <div className="p-1">
-                <FlatList files={folderFiles} projectId={projectId} selected={selected} onToggleSelected={onToggleSelected} editingRel={editingRel} editingName={editingName} setEditingRel={setEditingRel} setEditingName={setEditingName} onRename={onRename} onOpenTag={onOpenTag} tagsMap={tagsMap} highlightRels={highlightRels} />
-              </div>
-            ) : null}
-          </div>
-        );
-      })}
+      {tree.map((node) => (
+        <FolderTreeNode key={node.path || '__root'} node={node} depth={0} collapsed={collapsed} setCollapsed={setCollapsed} projectId={projectId} selected={selected} onToggleSelected={onToggleSelected} editingRel={editingRel} editingName={editingName} setEditingRel={setEditingRel} setEditingName={setEditingName} onRename={onRename} onOpenTag={onOpenTag} tagsMap={tagsMap} highlightRels={highlightRels} forceExpand={forceExpand} />
+      ))}
     </div>
   );
 };

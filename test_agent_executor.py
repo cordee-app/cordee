@@ -48,6 +48,28 @@ class RunTaskLifecycleTests(unittest.TestCase):
         self.assertEqual(agent_db.get_task(self.task_id, project_path=self.path)['status'],
                          'failed')
 
+    def test_failed_run_moves_its_root_files_to_the_output_folder(self):
+        # Regression (task #10001192): a failed run skipped the success-path
+        # root relocation and `checkout -f` kept its untracked scripts, so the
+        # next run's checkpoint commit swept 16 files into the default branch.
+        def fake_route(*a, **k):
+            with open(os.path.join(self.path, 'stray_script.py'), 'w') as f:
+                f.write('print(1)')
+            raise RuntimeError('provider failed')
+
+        built = {'mode': 'inline', 'prompt': 'do it', 'max_tokens': 1000}
+        with patch.object(agent_executor.agit, 'resolve_enabled', return_value=False), \
+             patch('agent_scw_session.sync_bucket_to_working_docs', return_value=None), \
+             patch('prompt_builder.build', return_value=built), \
+             patch.object(agent_executor, 'route', side_effect=fake_route):
+            result = agent_executor.run_task(self.task_id)
+
+        self.assertEqual(result.get('status'), 'failed')
+        self.assertFalse(os.path.exists(os.path.join(self.path, 'stray_script.py')))
+        task = agent_db.get_task(self.task_id, project_path=self.path)
+        out_dir = agent_executor.task_output_dir(task, self.path)
+        self.assertTrue(os.path.exists(os.path.join(self.path, out_dir, 'stray_script.py')))
+
     def test_over_budget_run_is_refused(self):
         agent_db.update_project_budget(self.proj_id, monthly_budget=10.0)
         agent_db.update_budget_spend(self.proj_id, 10.0)
@@ -433,6 +455,17 @@ class SimulationGapRegressionTests(unittest.TestCase):
     def test_plain_prose_not_detected(self):
         self.assertFalse(agent_executor._looks_like_unexecuted_tool_request(
             'Here is the report content. All done.'))
+
+    def test_vibe_turn_limit_is_not_reported_as_simulation(self):
+        # Regression (exec 20001185, task #10001192): a run that exhausted the
+        # Vibe turn budget executed real tools; quoted markup in its text must
+        # not fail it as a simulation.
+        task = {'model': 'mistral-large-latest', 'work_session_slot': None}
+        text = ('Quoted: <bash>ls</bash>\n\n---\n⚠️ **'
+                + agent_executor.VIBE_TURN_LIMIT_MARKER + ' (80 turns)**')
+        agent_executor._raise_if_unexecuted_tool_request(text, task)  # no raise
+        with self.assertRaises(RuntimeError):
+            agent_executor._raise_if_unexecuted_tool_request('<bash>ls</bash>', task)
 
     def test_markup_stripper_removes_pseudo_json(self):
         stripped = agent_executor._strip_tool_markup(

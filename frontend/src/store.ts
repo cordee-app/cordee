@@ -264,7 +264,7 @@ function _refreshQuotasThrottled() {
 
 export const useStore = create<Store>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       user: null,
       quotas: null,
       projects: [],
@@ -591,6 +591,23 @@ export const useStore = create<Store>()(
             case 'chat_changed': {
               const chats = await api.chats.list({ status: 'active' });
               set({ chats, _lastChangedChatId: evt.chat_id ?? null });
+              // Live-refresh the open transcript (e.g. a task-completion
+              // post landing in the Guide chat), but never while a
+              // user-initiated reply is in flight — ChatPanel's send flow
+              // owns the transcript then and refetches on completion.
+              // The transcript sentinel closes a straddle race: a stalled
+              // fetch started while idle must not overwrite a send that
+              // completed while it was in flight.
+              const cid = evt.chat_id;
+              if (typeof cid === 'number' && !get().chatSending && get().activeChat?.id === cid) {
+                const before = get().activeChat?.transcript;
+                try {
+                  const fresh = await api.chats.get(cid);
+                  if (get().activeChat?.id === cid && !get().chatSending && get().activeChat?.transcript === before) {
+                    set({ activeChat: fresh });
+                  }
+                } catch { /* open chat deleted or transient failure — ignore */ }
+              }
               break;
             }
             case 'work_session_changed':
