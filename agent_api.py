@@ -2628,6 +2628,8 @@ def _hf_queue_group(allowed_ids=None):
     tasks = db.hf_queue_tasks()
     if allowed_ids is not None:
         tasks = [t for t in tasks if t.get('project_id') in allowed_ids]
+    # Finished tasks no longer need a GPU; failed ones stay visible for retry.
+    tasks = [t for t in tasks if t.get('status') not in ('done', 'cancelled')]
     imports = _import_map()
     groups = {}
     for t in tasks:

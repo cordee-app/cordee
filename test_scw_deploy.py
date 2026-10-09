@@ -92,6 +92,35 @@ class ScwDeployListModelsTests(unittest.TestCase):
         }
         self.assertEqual(self._list(wrong), [])
 
+    def test_stock_status_filled_from_node_types_endpoint(self):
+        # The per-model `stock_status` is null on the live API; the real signal
+        # comes from GET /node-types and must be merged in per node type.
+        node_types = {'node_types': [
+            {'name': 'L40S', 'stock_status': 'unknown_stock'},
+            {'name': 'H100-SXM-2', 'stock_status': 'out_of_stock'},
+        ]}
+
+        def fake_get(url):
+            return node_types if '/node-types' in url else _LIVE_PAYLOAD
+
+        with patch.object(agent_scw_deploy, '_SCW_SECRET_KEY', 'test-key'), \
+             patch.object(agent_scw_deploy, '_scw_get', side_effect=fake_get):
+            models = agent_scw_deploy.list_models(region='fr-par')
+        custom = {m['name']: m for m in models}['Polish_Law_Bielik']
+        self.assertEqual(custom['stock_status'],
+                         {'L40S': 'unknown_stock', 'H100-SXM-2': 'out_of_stock'})
+
+    def test_open_window_refuses_out_of_stock_node(self):
+        model = {'id': 'm1', 'name': 'Bielik', 'custom': False,
+                 'stock_status': {'H100-SXM-2': 'out_of_stock'}}
+        with patch.object(agent_scw_deploy, '_SCW_SECRET_KEY', 'k'), \
+             patch.object(agent_scw_deploy, '_find_model', return_value=model), \
+             patch.object(agent_scw_deploy, '_scw_create_deployment') as create:
+            out = agent_scw_deploy.open_shared_window('Bielik', node_type='H100-SXM-2')
+        self.assertFalse(out['ok'])
+        self.assertEqual(out['error_code'], 'out_of_stock')
+        create.assert_not_called()
+
     def test_pick_quantization_highest_bits(self):
         model = {'quantizations': {'H100-SXM-2': [16, 32], 'L4': [8]}}
         self.assertEqual(agent_scw_deploy._pick_quantization(model, 'H100-SXM-2'), 32)
@@ -353,6 +382,113 @@ class WaitModelReadyTests(unittest.TestCase):
             out = agent_scw_deploy.wait_model_ready('m1', timeout=5)
         self.assertEqual(out['status'], 'error')
         self.assertEqual(out['error_message'], 'boom')
+
+
+class WaitReadyReasonTests(unittest.TestCase):
+    def test_provider_error_reason(self):
+        with patch.object(agent_scw_deploy, '_scw_get',
+                          return_value={'status': 'error', 'error_message': 'no gpu'}):
+            data, reason = agent_scw_deploy._wait_ready('d1', 'fr-par')
+        self.assertIsNone(data)
+        self.assertIn('"error"', reason)
+        self.assertIn('no gpu', reason)
+
+    def test_timeout_reason_names_stock(self):
+        def fake_get(url):
+            if '/node-types' in url:
+                return {'node_types': [{'name': 'L40S', 'stock_status': 'out_of_stock'}]}
+            return {'status': 'creating'}
+
+        with patch.object(agent_scw_deploy, '_READY_TIMEOUT', 0), \
+             patch.object(agent_scw_deploy, '_scw_get', side_effect=fake_get):
+            data, reason = agent_scw_deploy._wait_ready('d1', 'fr-par', node_type='L40S')
+        self.assertIsNone(data)
+        self.assertIn('L40S GPUs are out of stock', reason)
+
+    def test_ready_returns_data(self):
+        with patch.object(agent_scw_deploy, '_scw_get', return_value={'status': 'ready'}):
+            data, reason = agent_scw_deploy._wait_ready('d1', 'fr-par')
+        self.assertEqual(data['status'], 'ready')
+        self.assertIsNone(reason)
+
+
+class WindowUpkeepTests(unittest.TestCase):
+    """Cost accrual and auto-close for GPU windows (task 10001193 follow-up)."""
+
+    def setUp(self):
+        import os
+        import tempfile
+        import agent_db
+        self.agent_db = agent_db
+        self._tmp = tempfile.mkdtemp()
+        self._orig = agent_db.DB_PATH
+        agent_db.DB_PATH = os.path.join(self._tmp, 'aingel.db')
+        agent_db.init_db()
+
+    def tearDown(self):
+        self.agent_db.DB_PATH = self._orig
+        import shutil as _sh
+        _sh.rmtree(self._tmp, ignore_errors=True)
+
+    def _ago(self, minutes):
+        from datetime import datetime, timedelta, timezone
+        return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+
+    def _add(self, status, created_min, **cols):
+        conn = self.agent_db.get_db()
+        row = {'scw_deployment_id': 'dep-1', 'model_name': 'Bielik', 'node_type': 'L40S',
+               'status': status, 'provider_status': status, 'hourly_eur': 1.72,
+               'idle_delete_minutes': 30, 'accrued_cost_usd': 0.0,
+               'created_at': self._ago(created_min), 'last_billed_at': self._ago(created_min),
+               'is_shared': 1}
+        row.update(cols)
+        conn.execute(f"INSERT INTO scw_deployments ({','.join(row)}) VALUES ({','.join('?' * len(row))})",
+                     list(row.values()))
+        conn.commit()
+        dep_id = conn.execute('SELECT max(id) FROM scw_deployments').fetchone()[0]
+        conn.close()
+        return dep_id
+
+    def _row(self, dep_id):
+        conn = self.agent_db.get_db()
+        row = dict(conn.execute('SELECT * FROM scw_deployments WHERE id=?', (dep_id,)).fetchone())
+        conn.close()
+        return row
+
+    def test_creating_window_accrues_nothing(self):
+        # Scaleway bills node-minutes; a window waiting for a GPU costs nothing.
+        dep_id = self._add('creating', 40)
+        self.assertEqual(agent_scw_deploy.accrue_cost(dep_id), 0.0)
+        self.assertEqual(self._row(dep_id)['accrued_cost_usd'], 0.0)
+
+    def test_ready_window_accrues(self):
+        dep_id = self._add('ready', 60, last_billed_at=self._ago(60))
+        self.assertGreater(agent_scw_deploy.accrue_cost(dep_id), 1.5)
+
+    def test_idle_measured_from_last_use_not_billing_tick(self):
+        # Billing ticks every minute; idleness must come from last inference.
+        busy = self._add('ready', 120, ready_at=self._ago(120), last_used_at=self._ago(5))
+        idle = self._add('ready', 120, ready_at=self._ago(120), last_used_at=self._ago(45),
+                         scw_deployment_id='dep-2')
+        with patch.object(agent_scw_deploy, '_delete_deployment') as delete:
+            agent_scw_deploy.accrue_all()
+            agent_scw_deploy.auto_cleanup_check()
+        self.assertEqual(self._row(busy)['status'], 'ready')
+        self.assertEqual(self._row(idle)['status'], 'deleted')
+        delete.assert_called_once_with('dep-2', 'fr-par')
+
+    def test_stuck_creating_window_failed_by_sweeper(self):
+        # After a restart the open_window thread is gone; the sweeper takes over.
+        stuck = self._add('creating', 40)
+        fresh = self._add('creating', 10, scw_deployment_id='dep-2')
+        with patch.object(agent_scw_deploy, '_delete_deployment') as delete, \
+             patch.object(agent_scw_deploy, 'node_stock', return_value={'L40S': 'unknown_stock'}):
+            agent_scw_deploy.auto_cleanup_check()
+        row = self._row(stuck)
+        self.assertEqual(row['status'], 'error')
+        self.assertIn('L40S stock is uncertain', row['error_message'])
+        self.assertEqual(self._row(fresh)['status'], 'creating')
+        delete.assert_called_once_with('dep-1', 'fr-par')
 
 
 class ModelImportDbTests(unittest.TestCase):

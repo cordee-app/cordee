@@ -349,6 +349,30 @@ class OverseerOutputNameTests(unittest.TestCase):
         self.assertEqual(agent_overseer._extract_referenced_files("Read 'Uchwala_XXXIV.pdf'."),
                          ['Uchwala_XXXIV.pdf'])
 
+    def test_mentions_with_spaces_yield_whole_names_not_fragments(self):
+        # #10001193: `@Name after 2031.docx` was dropped as an "@domain" token
+        # while the bare scan kept the fragment `2031.docx` -> strict hold.
+        en = 'ALLRAIL – Press release Framework after 2031.docx'
+        pl = 'ALLRAIL – PL Press release Framework after 2030 PL.docx'
+        ex = agent_overseer._extract_referenced_files
+        self.assertEqual(ex(f"Open `@{en}` and `@{pl}`."), sorted([en, pl]))
+        # Unquoted mentions as the UI inserts them, resolved via attached names.
+        self.assertEqual(ex(f"Validate @{pl} against @{en} now.", [en, pl]), sorted([en, pl]))
+
+    def test_clarification_shorthand_maps_to_attached_file(self):
+        en = 'ALLRAIL – Press release Framework after 2031.docx'
+        desc = "Check it.\n\n**User clarifications (Guide pre-run check):**\n- q1: 2031.docx\n"
+        ex = agent_overseer._extract_referenced_files
+        self.assertEqual(ex(desc, [en]), [en])
+        # Without attachments, or when ambiguous, the name stays as written.
+        self.assertEqual(ex(desc), ['2031.docx'])
+        self.assertEqual(ex(desc, [en, 'Other after 2031.docx']), ['2031.docx'])
+
+    def test_context_ref_names(self):
+        task = {'context_refs': '["Working Documents/A/x y.docx", "b.pdf"]'}
+        self.assertEqual(agent_overseer.context_ref_names(task), ['x y.docx', 'b.pdf'])
+        self.assertEqual(agent_overseer.context_ref_names({'context_refs': 'bad'}), [])
+
     def test_imperative_name_marks_an_output(self):
         desc = "Name the output file using the decision number: `DPP-WOPN.718.4.2021.PP.md`."
         refs = agent_overseer._extract_referenced_files(desc)

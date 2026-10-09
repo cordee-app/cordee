@@ -33,6 +33,9 @@ _HOURLY_RATES = {
 }
 _DEPLOYED_NODE_TYPES = ('L4', 'L40S', 'H100', 'H100-2', 'H100-SXM-2', 'H100-SXM-4', 'H100-SXM-8')
 _READY_TIMEOUT = 1800
+# Extra wait before the upkeep sweeper fails a still-'creating' window itself, so
+# it only acts when the open_window thread is gone (e.g. after a restart).
+_STUCK_GRACE = 300
 _POLL_INTERVAL = 20
 # Downloading a custom model (e.g. a ~55 GB 27B fp16 repo) can run long; allow
 # an hour before giving up. Import itself is free — billing only starts when the
@@ -94,12 +97,29 @@ def _parse_iso(ts):
         return None
 
 
+def node_stock(region='fr-par'):
+    """Live per-node-type stock from Scaleway: {node_type: stock_status}, where
+    stock_status is available / out_of_stock / unknown_stock. The per-model
+    ``nodes_support[].nodes[].stock_status`` field is always null on the live
+    API, so this endpoint is the only real stock signal. Empty on any failure."""
+    url = f'{_INFER_BASE}/{region}/node-types?include_disabled_types=true&page_size=100'
+    try:
+        data = _scw_get(url)
+    except Exception as e:
+        _log.warning('node_stock failed: %s', e)
+        return {}
+    nodes = data.get('node_types', []) if isinstance(data, dict) else []
+    return {n['name']: n['stock_status'] for n in nodes
+            if isinstance(n, dict) and n.get('name') and n.get('stock_status')}
+
+
 def list_models(region='fr-par', **_):
     if not _SCW_SECRET_KEY:
         _log.warning('list_models: SCW_SECRET_KEY not set')
         return []
     url = f'{_INFER_BASE}/{region}/models'
     try:
+        live_stock = node_stock(region)
         data = _scw_get(url)
         models = data.get('models', []) if isinstance(data, dict) else data
         result = []
@@ -130,8 +150,8 @@ def list_models(region='fr-par', **_):
                     if nt not in node_types:
                         node_types.append(nt)
                     quantizations[nt] = allowed_bits
-                    if n.get('stock_status'):
-                        stock_status[nt] = n['stock_status']
+                    if n.get('stock_status') or live_stock.get(nt):
+                        stock_status[nt] = n.get('stock_status') or live_stock[nt]
             if not any(nt in node_types for nt in _DEPLOYED_NODE_TYPES):
                 continue
             tags = [str(t).lower() for t in (m.get('tags') or [])]
@@ -416,28 +436,79 @@ def _extract_endpoint_url(deployment):
     return endpoint.get('url')
 
 
-def _wait_ready(scw_deployment_id, region, status_cb=None):
+def _wait_ready(scw_deployment_id, region, status_cb=None, node_type=None):
+    """Poll until the deployment is ready. Returns ``(data, None)`` on success or
+    ``(None, reason)`` on failure, where ``reason`` is a user-facing sentence
+    stored on the window so the UI can say why it failed."""
     url = f'{_INFER_BASE}/{region}/deployments/{scw_deployment_id}'
     deadline = time.time() + _READY_TIMEOUT
+    last_status = ''
     while time.time() < deadline:
         try:
             data = _scw_get(url)
             status = data.get('status', '')
+            last_status = status or last_status
             if status_cb:
                 try:
                     status_cb(status)
                 except Exception:
                     pass
             if status == 'ready':
-                return data
+                return data, None
             if status in ('error', 'failed'):
                 _log.error('deployment %s entered status %s', scw_deployment_id, status)
-                return None
+                detail = data.get('error_message') or ''
+                return None, (f'Scaleway reported the deployment as "{status}"'
+                              + (f': {detail}' if detail else '.'))
         except Exception as e:
             _log.warning('poll deployment %s failed: %s', scw_deployment_id, e)
         time.sleep(_POLL_INTERVAL)
     _log.error('deployment %s did not become ready within %ds', scw_deployment_id, _READY_TIMEOUT)
-    return None
+    return None, _stuck_reason(last_status, node_type, region)
+
+
+def _stuck_reason(last_status, node_type, region):
+    """User-facing reason for a deployment that never became ready. Scaleway
+    gives none; the usual cause is that no GPU of this type is free, so report
+    the node's stock at the time we gave up."""
+    stock = node_stock(region).get(node_type) if node_type else None
+    reason = (f'Scaleway kept the deployment in "{last_status or "unknown"}" for '
+              f'{_READY_TIMEOUT // 60} min without making it ready')
+    if stock == 'out_of_stock':
+        reason += f' — {node_type} GPUs are out of stock. Try another node type or retry later.'
+    elif stock == 'unknown_stock':
+        reason += f' — {node_type} stock is uncertain, so no GPU was likely free. Try another node type or retry later.'
+    else:
+        reason += '.'
+    return reason
+
+
+def _fail_window(scw_deployment_id, region, reason):
+    """Delete a deployment that never became ready and mark its row 'error'
+    with ``reason``, keeping the last provider status for the UI."""
+    _delete_deployment(scw_deployment_id, region)
+    conn = agent_db.get_db()
+    row = conn.execute(
+        'SELECT provider_status FROM scw_deployments WHERE scw_deployment_id=?',
+        (scw_deployment_id,)).fetchone()
+    final_status = (row['provider_status'] if row else None) or 'failed'
+    conn.execute('UPDATE scw_deployments SET status=?, provider_status=?, error_message=? '
+                 'WHERE scw_deployment_id=?',
+                 ('error', final_status, reason, scw_deployment_id))
+    conn.commit()
+    conn.close()
+
+
+def _touch_used(deployment_db_id):
+    """Stamp the window's last inference activity (drives idle auto-close)."""
+    try:
+        conn = agent_db.get_db()
+        conn.execute('UPDATE scw_deployments SET last_used_at=? WHERE id=?',
+                     (_now(), deployment_db_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        _log.warning('touch last_used_at for deployment %s failed: %s', deployment_db_id, e)
 
 
 def _warmup(endpoint_url, model_name):
@@ -554,6 +625,12 @@ def _open_window(project_id, model_name, node_type='L4', endpoint_kind='public',
     resolved_name = model['name'] or model_name
     # Custom models (tag `custom`) need an explicit quantization on create.
     quant_bits = _pick_quantization(model, node_type) if model.get('custom') else None
+    # Scaleway accepts a deployment on an out-of-stock node and then leaves it in
+    # "creating" until the ready timeout, billing the whole wait — refuse up front.
+    if (model.get('stock_status') or {}).get(node_type) == 'out_of_stock':
+        return {'ok': False, 'error_code': 'out_of_stock',
+                'error': f'{node_type} GPUs are out of stock on Scaleway right now. '
+                         'Pick another node type, or retry later.'}
 
     name = f'aingel-dep-{_rand6()}'
     scw_deployment_id = None
@@ -595,28 +672,24 @@ def _open_window(project_id, model_name, node_type='L4', endpoint_kind='public',
                 connp.commit()
                 connp.close()
 
-            ready_dep = _wait_ready(scw_deployment_id, region, status_cb=_set_provider_status)
+            ready_dep, fail_reason = _wait_ready(scw_deployment_id, region,
+                                                 status_cb=_set_provider_status,
+                                                 node_type=node_type)
             if not ready_dep:
                 # Never leave a half-provisioned deployment billing hourly: delete
                 # the remote deployment and surface the real provider status.
-                _log.error('deployment %s did not become ready — deleting to stop billing',
-                           scw_deployment_id)
-                _delete_deployment(scw_deployment_id, region)
-                conn2 = agent_db.get_db()
-                row2 = conn2.execute(
-                    'SELECT provider_status FROM scw_deployments WHERE scw_deployment_id=?',
-                    (scw_deployment_id,)).fetchone()
-                final_status = (row2['provider_status'] if row2 else None) or 'failed'
-                conn2.execute('UPDATE scw_deployments SET status=?, provider_status=? WHERE scw_deployment_id=?',
-                              ('error', final_status, scw_deployment_id))
-                conn2.commit()
-                conn2.close()
+                _log.error('deployment %s did not become ready (%s) — deleting to stop billing',
+                           scw_deployment_id, fail_reason)
+                _fail_window(scw_deployment_id, region, fail_reason)
                 return
             url = _extract_endpoint_url(ready_dep) or endpoint_url
             _warmup(url, resolved_name)
             conn2 = agent_db.get_db()
-            conn2.execute('UPDATE scw_deployments SET status=?, endpoint_url=?, provider_status=? WHERE scw_deployment_id=?',
-                          ('ready', url, 'ready', scw_deployment_id))
+            # Billing and the idle clock both start when the GPU is serving.
+            ready_iso = _now()
+            conn2.execute('UPDATE scw_deployments SET status=?, endpoint_url=?, provider_status=?, '
+                          'ready_at=?, last_used_at=?, last_billed_at=? WHERE scw_deployment_id=?',
+                          ('ready', url, 'ready', ready_iso, ready_iso, ready_iso, scw_deployment_id))
             conn2.commit()
             conn2.close()
             _log.info('deployment %s ready at %s', scw_deployment_id, url)
@@ -759,8 +832,19 @@ def accrue_cost(deployment_db_id, region='fr-par', **_):
         conn.close()
         return row.get('accrued_cost_usd', 0.0)
 
-    last = _parse_iso(row.get('last_billed_at')) or _parse_iso(row.get('created_at'))
     now_dt = datetime.now(timezone.utc)
+    if row['status'] == 'creating':
+        # Scaleway bills node-minutes, i.e. only once a GPU is assigned: a
+        # deployment waiting for a free node (size 0) costs nothing (Oct 2026
+        # billing: ~75 min of stuck L40S windows, no deployment line). Move the
+        # clock so the wait is never billed retroactively once it turns ready.
+        conn.execute('UPDATE scw_deployments SET last_billed_at=? WHERE id=?',
+                     (now_dt.isoformat(), deployment_db_id))
+        conn.commit()
+        conn.close()
+        return row.get('accrued_cost_usd', 0.0) or 0.0
+
+    last = _parse_iso(row.get('last_billed_at')) or _parse_iso(row.get('created_at'))
     if last:
         elapsed_hours = max(0.0, (now_dt - last).total_seconds() / 3600.0)
     else:
@@ -822,6 +906,7 @@ def call_deployment(model_id, prompt, max_tokens=8192, *, project_path=None, **_
         raise RuntimeError(f'deployment {model_id} status is {dep["status"]}, not ready')
 
     accrue_cost(dep['id'])
+    _touch_used(dep['id'])
 
     endpoint_url = dep['endpoint_url']
     body = json.dumps({
@@ -845,6 +930,8 @@ def call_deployment(model_id, prompt, max_tokens=8192, *, project_path=None, **_
         body = e.read().decode(errors='replace')
         raise RuntimeError(
             f'deployment {scw_deployment_id} HTTP {e.code}: {body[:600]}') from e
+    finally:
+        _touch_used(dep['id'])
 
     text = ''
     choices = data.get('choices') or []
@@ -867,8 +954,23 @@ def auto_cleanup_check(region='fr-par', **_):
     closed = 0
     now_dt = datetime.now(timezone.utc)
     for dep in deployments:
+        if dep['status'] == 'creating':
+            # The open_window thread gives up at _READY_TIMEOUT, but a service
+            # restart kills it; this is the backstop for windows it left behind.
+            created = _parse_iso(dep.get('created_at'))
+            if created and (now_dt - created).total_seconds() > _READY_TIMEOUT + _STUCK_GRACE:
+                reason = _stuck_reason(dep.get('provider_status') or 'creating',
+                                       dep.get('node_type'), region)
+                _log.error('auto_cleanup: deployment %s stuck creating (%s)', dep['id'], reason)
+                _fail_window(dep['scw_deployment_id'], region, reason)
+                closed += 1
+            continue
+
         idle_min = dep.get('idle_delete_minutes', 30) or 30
-        last = _parse_iso(dep.get('last_billed_at')) or _parse_iso(dep.get('created_at'))
+        # Idle = no inference since the last call (or since it became ready).
+        # last_billed_at moves every upkeep tick, so it never showed idleness.
+        last = (_parse_iso(dep.get('last_used_at')) or _parse_iso(dep.get('ready_at'))
+                or _parse_iso(dep.get('created_at')))
         idle = False
         if last:
             elapsed_min = (now_dt - last).total_seconds() / 60.0

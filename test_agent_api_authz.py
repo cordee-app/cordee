@@ -542,6 +542,18 @@ class CustomModelImportAuthzTests(_TwoTenantApp, unittest.TestCase):
         self.assertFalse(g['import_ready'])
         self.assertIsNone(g['import_status'])
 
+    def test_hf_queue_hides_done_and_cancelled_tasks(self):
+        # Finished tasks no longer need a GPU window; failed ones stay for retry.
+        agent_db.update_task(self.task_a, project_path=self.path_a,
+                             hf_repo_id='done/repo', status='done')
+        self._login(self.user_a)
+        repos = {gr['repo_id'] for gr in self.client.get('/api/hf-queue').get_json()['groups']}
+        self.assertNotIn('done/repo', repos)
+
+        agent_db.update_task(self.task_a, project_path=self.path_a, status='failed')
+        repos = {gr['repo_id'] for gr in self.client.get('/api/hf-queue').get_json()['groups']}
+        self.assertIn('done/repo', repos)
+
     def test_register_import_roster_is_global_via_adopted(self):
         # A repo adopted by project A shows up in the cross-project adopted list
         # (any project can use it).

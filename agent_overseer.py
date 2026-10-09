@@ -207,7 +207,22 @@ def _decode_url_escapes(text: str) -> str:
     return unquote(text)
 
 
-def _extract_referenced_files(description: str) -> List[str]:
+def context_ref_names(task: Optional[Dict[str, Any]]) -> List[str]:
+    """Basenames of the task's attached files (``context_refs``, a JSON list of
+    project-relative paths, or already a list)."""
+    raw = (task or {}).get('context_refs')
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            raw = []
+    if not isinstance(raw, list):
+        return []
+    return [os.path.basename(r) for r in raw if isinstance(r, str) and r.strip()]
+
+
+def _extract_referenced_files(description: str,
+                              known_names: Optional[List[str]] = None) -> List[str]:
     """Pull file-like tokens out of the task description.
 
     Catches: `foo.txt`, "foo.json", 'foo.pdf', /path/to/foo.py, FULL_TEXT_OCR.txt,
@@ -218,6 +233,10 @@ def _extract_referenced_files(description: str) -> List[str]:
     these are not filesystem paths and previously caused false-positive
     "containment breach" gates (e.g. `//www.example.com`, `@example.com`,
     `user@example.org`). See `_looks_like_url_or_email`.
+
+    ``known_names`` are the basenames of the task's attached files
+    (``context_refs``, see `context_ref_names`); their @-mentions are matched
+    whole even when the name contains spaces.
     """
     if not description:
         return []
@@ -228,30 +247,56 @@ def _extract_referenced_files(description: str) -> List[str]:
     # An extension needs a letter: 'DPN-WPOA.501.282.2026' is a case number,
     # not a file with a '.2026' extension (#10001184, strict-mode false hold).
     refs = set()
+    # Spans consumed as whole file names; the bare scans below must not re-read
+    # them, or `@Report after 2031.docx` also yields the fragment `2031.docx`,
+    # which does not exist and strict-holds the task (#10001193).
+    consumed = []
+
+    def _quoted(pattern, text):
+        for m in re.finditer(pattern, text):
+            consumed.append(m.span())
+            # A leading '@' is the UI's @-mention marker, not part of the name;
+            # left on, `@Name.docx` was dropped as an "@domain" token.
+            name = m.group(1).lstrip('@')
+            if name and not _looks_like_url_or_email(name):
+                refs.add(name)
+
     # Backtick-quoted: `foo.txt` or `/path/to/foo.py`
-    for m in re.findall(r'`([^`]+\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})`', description):
-        if not _looks_like_url_or_email(m):
-            refs.add(m)
+    _quoted(r'`([^`]+\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})`', description)
     # Double-quoted: "foo.json"
-    for m in re.findall(r'"([^"]+\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})"', description):
-        if not _looks_like_url_or_email(m):
-            refs.add(m)
+    _quoted(r'"([^"]+\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})"', description)
     # Single-quoted: 'foo.json' or 'Working Documents/CUPT/II Etap/foo.pdf'
-    for m in re.findall(r"'([^']+\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})'", description):
-        if not _looks_like_url_or_email(m):
-            refs.add(m)
+    _quoted(r"'([^']+\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})'", description)
+    # Unquoted @-mentions of attached files: the UI inserts `@<file name>`, and
+    # names may contain spaces, so match the known names exactly (longest first).
+    for name in sorted({n for n in (known_names or ()) if n}, key=len, reverse=True):
+        _quoted(r'(@?' + re.escape(name) + r')', description)
+    bare = description
+    for a, b in consumed:
+        bare = bare[:a] + ' ' * (b - a) + bare[b:]
     # Bare paths: /foo/bar/baz.ext  or  ./foo/bar.ext
-    for m in re.findall(r'(?<![\w/])(\.{0,2}/[\w./\-]+\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})', description):
+    for m in re.findall(r'(?<![\w/])(\.{0,2}/[\w./\-]+\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})', bare):
         if not _looks_like_url_or_email(m):
             refs.add(m)
     # Bare filenames: word chars + .ext  (only if the stem looks identifier-ish
     # to avoid catching English prose like "this is")
-    for m in re.findall(r'(?<![\w./\-])([A-Za-z0-9_\-./]{4,}\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})\b', description):
+    for m in re.findall(r'(?<![\w./\-])([A-Za-z0-9_\-./]{4,}\.(?=[0-9]*[a-zA-Z])[a-zA-Z0-9]{1,10})\b', bare):
         if _looks_like_url_or_email(m):
             continue
         stem = os.path.splitext(m)[0]
         if any(c in stem for c in '_-') or any(c.isdigit() for c in stem) or any(c.isupper() for c in stem):
             refs.add(m)
+    # A short name that ends exactly one attached file's name is shorthand for
+    # it: a clarification answer "2031.docx" means "...Framework after 2031.docx"
+    # and was strict-held as a missing file (#10001193).
+    known = {n for n in (known_names or ()) if n}
+    for r in list(refs):
+        if r in known or os.path.dirname(r):
+            continue
+        owners = [n for n in known if n.endswith(r) and n[:-len(r)][-1:] in (' ', '_', '-')]
+        if len(owners) == 1:
+            refs.discard(r)
+            refs.add(owners[0])
     # Name templates ("e.g., 'DPP-XXXXXX.md'", '<decision>.md') describe a file
     # to create, not one to read; H2 reported them as missing inputs (#10001185).
     return sorted(r for r in refs
@@ -542,7 +587,8 @@ def pre_run_check(task: Dict[str, Any],
     if not aingel_model:
         return _permissive_h2()
 
-    referenced = _extract_referenced_files(task.get('description') or '')
+    referenced = _extract_referenced_files(task.get('description') or '',
+                                           context_ref_names(task))
     # Distinguish caught (inlined/batched) from missing
     caught_set = set(caught_files or [])
     file_access = (model_caps or {}).get('file_access', 'none')
@@ -969,7 +1015,7 @@ def pre_check_questions(task: Dict[str, Any],
     root_refs = []
     _pp = (project or {}).get('path') or ''
     if _pp:
-        for ref in _extract_referenced_files(desc):
+        for ref in _extract_referenced_files(desc, context_ref_names(task)):
             if not os.path.dirname(ref) and os.path.isfile(os.path.join(_pp, ref)) \
                     and not any(os.path.basename(n) == ref for n in file_list):
                 root_refs.append(ref)

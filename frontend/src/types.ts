@@ -514,6 +514,7 @@ export interface GpuWindow {
   endpoint_url: string;
   status: string;
   provider_status?: string;
+  error_message?: string;
   max_context_size?: number;
   hourly_eur: number;
   idle_delete_minutes: number;

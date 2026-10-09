@@ -17,6 +17,10 @@ const timeAgo = (s: string) => {
   return `${Math.floor(hrs / 24)}d`;
 };
 
+// Scaleway node-type stock (from /node-types), suffixed to the node picker options.
+const stockLabel = (s?: string) =>
+  s === 'available' ? ' · in stock' : s === 'out_of_stock' ? ' · out of stock' : s === 'unknown_stock' ? ' · stock uncertain' : '';
+
 export const GpuWindowModal = () => {
   const { showGpuWindowModal, setShowGpuWindowModal, projects, executions } = useStore();
   const perms = useProjectPermissions();
@@ -121,7 +125,9 @@ export const GpuWindowModal = () => {
 
   const recommendedNode = (o: GpuWindowModel['options'][number] | undefined) => {
     if (!o || !o.node_types?.length) return 'L4';
-    return o.node_types.find((nt) => o.stock_status?.[nt] === 'available') || o.node_types[0];
+    return o.node_types.find((nt) => o.stock_status?.[nt] === 'available')
+      || o.node_types.find((nt) => o.stock_status?.[nt] !== 'out_of_stock')
+      || o.node_types[0];
   };
 
   if (!showGpuWindowModal) return null;
@@ -382,6 +388,9 @@ export const GpuWindowModal = () => {
                       )}
                     </span>
                   </div>
+                  {w.status === 'error' && w.error_message && (
+                    <div className="mt-1 text-xs text-status-pending font-semibold">{w.error_message}</div>
+                  )}
                   {w.cost_by_project && Object.keys(w.cost_by_project).length > 0 && (
                     <div className="mt-1 text-xs text-text-faint">
                       Cost split: {Object.entries(w.cost_by_project).map(([pid, usd]) => `${projectName(Number(pid))} ${fmtUsd(usd)}`).join(' · ')}
@@ -440,9 +449,19 @@ export const GpuWindowModal = () => {
                         {selectedDeployable && (
                           <select data-tip="Choose GPU node type" className="w-full py-[7px] px-2.5 border border-default rounded text-base" value={depNodeType} onChange={(e) => setDepNodeType(e.target.value)}>
                             {selectedDeployable.node_types.map((nt) => (
-                              <option key={nt} value={nt}>{nt} — {fmtEur(selectedDeployable.hourly_eur?.[nt] ?? 0)}/h</option>
+                              <option key={nt} value={nt}>{nt} — {fmtEur(selectedDeployable.hourly_eur?.[nt] ?? 0)}/h{stockLabel(selectedDeployable.stock_status?.[nt])}</option>
                             ))}
                           </select>
+                        )}
+                        {selectedDeployable && selectedDeployable.stock_status?.[depNodeType] === 'out_of_stock' && (
+                          <div className="text-xs text-status-pending font-semibold">
+                            {depNodeType} GPUs are out of stock on Scaleway — the window would never start. Pick another node type.
+                          </div>
+                        )}
+                        {selectedDeployable && selectedDeployable.stock_status?.[depNodeType] === 'unknown_stock' && (
+                          <div className="text-xs text-text-faint">
+                            Scaleway can't confirm a free {depNodeType} GPU. The window may wait up to 30 min in "creating" (billed) and then fail.
+                          </div>
                         )}
 
                         <div className="text-xs text-text-faint">

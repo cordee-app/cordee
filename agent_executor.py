@@ -2887,7 +2887,8 @@ def run_task(task_id=None):
             if _briefs_ok:
                 try:
                     import agent_overseer as _overseer
-                    h3_referenced = _overseer._extract_referenced_files(task.get('description') or '')
+                    h3_referenced = _overseer._extract_referenced_files(
+                        task.get('description') or '', _overseer.context_ref_names(task))
                 except Exception:
                     h3_referenced = []
                 h3_caught = caught_files

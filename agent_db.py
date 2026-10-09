@@ -832,6 +832,9 @@ def init_db():
             endpoint_url         TEXT,
             status               TEXT DEFAULT 'creating',
             provider_status      TEXT,
+            error_message        TEXT,
+            ready_at             TEXT,
+            last_used_at         TEXT,
             hourly_eur           REAL DEFAULT 0.0,
             idle_delete_minutes  INTEGER DEFAULT 30,
             max_context_size     INTEGER,
@@ -1089,6 +1092,16 @@ def init_db():
         conn.execute('ALTER TABLE scw_deployments ADD COLUMN max_context_size INTEGER DEFAULT NULL')
     if 'provider_status' not in dep_cols2:
         conn.execute('ALTER TABLE scw_deployments ADD COLUMN provider_status TEXT')
+    # Why a window failed to come up (e.g. a node stuck in "creating" because the
+    # GPU type is out of stock), shown on the window in the GPU modal.
+    if 'error_message' not in dep_cols2:
+        conn.execute('ALTER TABLE scw_deployments ADD COLUMN error_message TEXT')
+    # When the GPU started serving and when it last ran inference: billing and
+    # idle auto-close are measured from these, not from creation.
+    if 'ready_at' not in dep_cols2:
+        conn.execute('ALTER TABLE scw_deployments ADD COLUMN ready_at TEXT')
+    if 'last_used_at' not in dep_cols2:
+        conn.execute('ALTER TABLE scw_deployments ADD COLUMN last_used_at TEXT')
 
     # ── Legacy task/execution/chat column migrations — RETIRED ────────────────
     # These ALTER TABLE / CREATE INDEX migrations targeted the legacy tasks,
