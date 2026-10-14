@@ -5,6 +5,7 @@ import { api } from '../api';
 import { cn } from '../utils/cn';
 import { fmtUsd } from '../utils/currency';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
+import { taskChip, taskChipById, isTaskCode } from '../utils/taskCode';
 import type { Task, TaskDependencies, ModelRecommendation, TaskAttachment, HfCandidate, FileEntry } from '../types';
 import { TaskAttachPicker } from './TaskAttachPicker';
 import { Paperclip } from 'lucide-react';
@@ -558,6 +559,21 @@ export const AddTaskModal = () => {
     else handleAddEditDep(id);
   };
 
+  const handleAddDepInput = async () => {
+    const raw = depsAddInput.trim();
+    if (isTaskCode(raw)) {
+      try {
+        const resolved = await api.tasks.resolveTaskCode(raw);
+        handleAddEditDep(resolved.task_id);
+      } catch {
+        setDepsError('Task code not found');
+      }
+      return;
+    }
+    const id = Number(raw);
+    if (id && Number.isInteger(id)) handleAddEditDep(id);
+  };
+
   const depsProjectId = isEdit ? projectId : (typeof projectId === 'number' ? projectId : null);
 
   const siblingTasks = useMemo(() => {
@@ -576,6 +592,7 @@ export const AddTaskModal = () => {
     return siblingTasks.filter(
       (t) =>
         t.title.toLowerCase().includes(depsSearch.toLowerCase()) ||
+        t.display_code?.toLowerCase().includes(depsSearch.toLowerCase()) ||
         String(t.id).includes(depsSearch),
     );
   }, [siblingTasks, depsSearch]);
@@ -651,7 +668,7 @@ export const AddTaskModal = () => {
                 onChange={() => onToggle(t.id)}
               />
               <span className="font-mono text-xs text-text-faint">
-                #{t.id}
+                {taskChip(t)}
               </span>
               <span className="flex-1 text-sm overflow-hidden text-ellipsis whitespace-nowrap">
                 {t.title}
@@ -719,7 +736,7 @@ export const AddTaskModal = () => {
       >
         <div className="flex justify-between items-center mb-4">
           <h3 className="m-0 text-base text-text-default dark:text-text-dark-default">
-            {isEdit ? `Edit Task #${modModalTaskId}` : 'Add Task'}
+            {isEdit ? `Edit Task ${task ? taskChip(task) : `#${modModalTaskId}`}` : 'Add Task'}
           </h3>
           <button
             data-tip="Close without saving"
@@ -1419,10 +1436,10 @@ export const AddTaskModal = () => {
                           >
                             <div className="flex items-center gap-2">
                               <span className="font-mono text-xs text-text-faint">
-                                #{depId}
+                                {taskChip(depTask)}
                               </span>
                               <span className="text-sm+">
-                                {depTask?.title ?? `Task #${depId}`}
+                                {depTask?.title ?? `Task ${taskChip(depTask)}`}
                               </span>
                               {depTask && (
                                 <span
@@ -1470,10 +1487,10 @@ export const AddTaskModal = () => {
                             className="flex items-center py-1 px-2 bg-surface-subtle rounded mb-1"
                           >
                             <span className="font-mono text-sm+ text-text-faint">
-                              #{depTaskId}
+                              {taskChip(depTask)}
                             </span>
                             <span className="text-sm+ ml-2">
-                              {depTask?.title ?? `Task #${depTaskId}`}
+                              {depTask?.title ?? `Task ${taskChip(depTask)}`}
                             </span>
                             {depTask && (
                               <span
@@ -1520,13 +1537,13 @@ export const AddTaskModal = () => {
                   {perms.canEdit && (
                     <details className="mb-2">
                       <summary className="text-sm+ text-text-faint cursor-pointer select-none">
-                        Add by ID
+                        Add by ID or code
                       </summary>
                       <div className="flex gap-2 items-start mt-1.5">
                         <div className="flex-1">
                           <input
-                            type="number"
-                            data-tip="Enter the ID of the task to depend on"
+                            type="text"
+                            data-tip="Enter the ID or code of the task to depend on"
                             className={cn(
                               'w-full py-1 px-2 rounded text-sm',
                               depsError ? 'border border-danger' : 'border border-default',
@@ -1537,12 +1554,9 @@ export const AddTaskModal = () => {
                               setDepsError('');
                             }}
                             onKeyDown={(e) => {
-                              if (e.key === 'Enter') {
-                                const id = Number(depsAddInput.trim());
-                                if (id && Number.isInteger(id)) handleAddEditDep(id);
-                              }
+                              if (e.key === 'Enter') handleAddDepInput();
                             }}
-                            placeholder="Task ID"
+                            placeholder="Task ID or code"
                           />
                           {depsError && (
                             <div className="text-sm+ text-danger mt-1">
@@ -1553,10 +1567,7 @@ export const AddTaskModal = () => {
                         <button
                           data-tip="Add the entered task as a dependency"
                           className="btn btn-primary py-[7px] px-[18px] border border-accent rounded cursor-pointer text-sm+ bg-accent text-white shrink-0"
-                          onClick={() => {
-                            const id = Number(depsAddInput.trim());
-                            if (id && Number.isInteger(id)) handleAddEditDep(id);
-                          }}
+                          onClick={handleAddDepInput}
                         >
                           Add
                         </button>
@@ -1605,10 +1616,10 @@ export const AddTaskModal = () => {
                         }}
                       >
                         <span className="font-mono text-2xs text-text-faint">
-                          #{id}
+                          {taskChipById(id, tasks)}
                         </span>
-                        <span className="max-w-[140px] overflow-hidden text-ellipsis whitespace-nowrap" title={t?.title ?? `Task #${id}`}>
-                          {t?.title ?? `Task #${id}`}
+                        <span className="max-w-[140px] overflow-hidden text-ellipsis whitespace-nowrap" title={t?.title ?? `Task ${taskChipById(id, tasks)}`}>
+                          {t?.title ?? `Task ${taskChipById(id, tasks)}`}
                         </span>
                         <button
                           data-tip="Remove this pending dependency"

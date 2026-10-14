@@ -8,6 +8,7 @@ import { PROVIDER_BUCKETS } from './providers';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
 import { cn } from '../utils/cn';
+import { taskChipById } from '../utils/taskCode';
 import type { WorkSession, Task } from '../types';
 
 const STATUSES = ['pending', 'confirmed', 'done', 'failed'] as const;
@@ -438,7 +439,7 @@ export const TaskBoard = () => {
         const skipped = res.skipped_by_deps;
         if (skipped && skipped.length > 0) {
           const summary = skipped
-            .map((s) => `#${s.task_id} depends on pending task #${s.unmet.map((u) => `#${u.id} (${u.status})`).join(', ')}`)
+            .map((s) => `${taskChipById(s.task_id, tasks)} depends on pending task ${s.unmet.map((u) => `${taskChipById(u.id, tasks)} (${u.status})`).join(', ')}`)
             .join('; ');
           if (res.queued === 0) {
             showToast(`Nothing ran — unmet dependency discovered: ${summary}. A task cannot run before the task it depends on is done.`, 'error');
@@ -459,7 +460,7 @@ export const TaskBoard = () => {
         showToast(msg);
       }
     },
-    [activeProject, reload, showToast]
+    [activeProject, reload, showToast, tasks]
   );
 
   // Count confirmed runnable tasks for a slot (slot-1 sub-session rule).

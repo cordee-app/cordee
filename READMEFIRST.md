@@ -83,6 +83,15 @@ Two independent counters, easy to confuse in the Execution Log:
 
 A task can have multiple executions (retries, resumes, re-runs), so the "Task #" and the execution's own id on the same Execution Log row are unrelated numbers — that's expected, not a bug. Rendered in the dashboard's ExecutionLog component.
 
+### Human display codes (RP-014)
+
+The integer ids above are unchanged and stay authoritative everywhere (keys, FKs, URLs, filenames, branches). Alongside them, purely for humans:
+
+- **`projects.short_code`** — a 2-6 char prefix generated from the project name's significant-word initials (stopwords skipped, editable via the project PATCH route, unique per instance, `^[A-Z][A-Z0-9]{1,5}$`).
+- **`tasks.display_no` / `tasks.display_code`** — a per-project 1-based sequence assigned at creation (`create_task` / `upsert_task` / `copy_task`), shown as `RP-014` = `<short_code>-<no:03d>`. Executions carry `exec_no` (per-task 1-based) and `task_display_code`, rendered `RP-014·E2`.
+
+Rows created before the feature are backfilled by `ops/backfill_display_numbers.py` (dry run by default, `--apply` to write). `GET /api/tasks/resolve?code=RP-014` maps a code back to the integer task id (404 for unknown codes or non-member projects).
+
 ## Three-Layer Project Structure (per project)
 
 ```

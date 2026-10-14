@@ -4,6 +4,7 @@ import { api } from '../api';
 import { cn } from '../utils/cn';
 import { fmtEur, fmtUsd } from '../utils/currency';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
+import { taskChipById, execChip } from '../utils/taskCode';
 import type { HfQueueGroup, GpuWindow, GpuWindowModel, GpuRunStatus, HfImportVerify } from '../types';
 
 const timeAgo = (s: string) => {
@@ -22,7 +23,7 @@ const stockLabel = (s?: string) =>
   s === 'available' ? ' · in stock' : s === 'out_of_stock' ? ' · out of stock' : s === 'unknown_stock' ? ' · stock uncertain' : '';
 
 export const GpuWindowModal = () => {
-  const { showGpuWindowModal, setShowGpuWindowModal, projects, executions } = useStore();
+  const { showGpuWindowModal, setShowGpuWindowModal, projects, tasks, executions } = useStore();
   const perms = useProjectPermissions();
 
   const [groups, setGroups] = useState<HfQueueGroup[]>([]);
@@ -336,7 +337,7 @@ export const GpuWindowModal = () => {
                         disabled={!perms.canAdminister || !readyWindow || !(t.status === 'confirmed' || t.status === 'pending')}
                         onChange={() => toggleTask(t.id)}
                       />
-                      <span className="text-text-faint">#{t.id}</span>
+                      <span className="text-text-faint">{taskChipById(t.id, tasks)}</span>
                       <span className="flex-1 truncate">{t.title}</span>
                       <span className="text-xs text-text-faint">{t.project_name}</span>
                       <span className="text-xs text-text-muted">{t.status}</span>
@@ -402,7 +403,7 @@ export const GpuWindowModal = () => {
                   {w.id === activeRunDep && runProgress && (
                     <div className="mt-1 text-xs text-text-faint">
                       {Object.entries(runProgress.tasks).map(([tid, s]) => (
-                        <div key={tid}>#{tid}: {s.status}{s.error ? ` — ${s.error}` : ''}</div>
+                        <div key={tid}>{taskChipById(Number(tid), tasks)}: {s.status}{s.error ? ` — ${s.error}` : ''}</div>
                       ))}
                     </div>
                   )}
@@ -412,7 +413,7 @@ export const GpuWindowModal = () => {
                     if (running.length === 0) return null;
                     return (
                       <div className="mt-1 text-xs text-text-faint">
-                        {running.map((e) => <div key={e.id}>#{e.task_id}: running</div>)}
+                         {running.map((e) => <div key={e.id}>{execChip(e)}: running</div>)}
                       </div>
                     );
                   })()}

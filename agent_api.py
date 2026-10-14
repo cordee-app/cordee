@@ -570,6 +570,7 @@ def _write_aingel_json(project_path, proj):
         return
     data = {
         'name': proj.get('name', ''),
+        'short_code': proj.get('short_code'),
         'type': proj.get('project_type', ''),
         'execution_type': proj.get('execution_type') or 'standard',
         'eu_only': bool(proj.get('eu_only', False)),
@@ -774,6 +775,7 @@ def get_dashboard():
             'id': p['id'],
             'name': p['name'],
             'slug': p['slug'],
+            'short_code': p.get('short_code'),
             'eu_only': bool(p.get('eu_only', False)),
             'scw_session_enabled': bool(p.get('scw_session_enabled', False)),
             'scw_session_bucket': p.get('scw_session_bucket') or '',
@@ -799,6 +801,8 @@ def get_dashboard():
             'recent_executions': [{
                 'id': e['id'],
                 'task_title': e.get('task_title', ''),
+                'task_display_code': e.get('task_display_code'),
+                'exec_no': e.get('exec_no'),
                 'status': e['status'],
                 'cost_usd': e.get('cost_usd', 0),
                 'started_at': e.get('started_at', ''),
@@ -1271,8 +1275,17 @@ def _project_running_executions(project):
     try:
         pconn = db.get_project_db(path)
         rows = pconn.execute(
-            "SELECT id, task_id, status, started_at FROM executions "
-            "WHERE status='running' ORDER BY id"
+            "SELECT e.id, e.task_id, e.status, e.started_at, "
+            "t.display_code AS task_display_code, "
+            # exec_no: same semantics as get_executions — 1-based position
+            # among the task's executions (chat_id IS NULL population) ordered
+            # by id, so the block list matches the execution log's numbering.
+            "CASE WHEN e.task_id IS NULL OR e.chat_id IS NOT NULL THEN NULL "
+            "ELSE (SELECT COUNT(*) FROM executions x "
+            "      WHERE x.task_id = e.task_id AND x.chat_id IS NULL "
+            "      AND x.id <= e.id) END AS exec_no "
+            "FROM executions e LEFT JOIN tasks t ON e.task_id = t.id "
+            "WHERE e.status='running' ORDER BY e.id"
         ).fetchall()
         pconn.close()
         return [dict(r) for r in rows]
@@ -1294,8 +1307,11 @@ def _project_confirmed_tasks(project):
         return []
     try:
         pconn = db.get_project_db(path)
+        # display_code + task_display_code both ride along: the frontend's
+        # BlockTask type carries the two aliases (taskChip reads display_code).
         rows = pconn.execute(
-            "SELECT id, title, status FROM tasks "
+            "SELECT id, title, status, display_code, "
+            "display_code AS task_display_code FROM tasks "
             "WHERE status='confirmed' ORDER BY id"
         ).fetchall()
         pconn.close()
@@ -2273,6 +2289,16 @@ def update_project(pid):
         db.set_project_field(pid, 'use_rag', 1 if data['use_rag'] else 0)
     if 'rag_corpus_id' in data:
         db.set_project_field(pid, 'rag_corpus_id', (data['rag_corpus_id'] or 'railway').strip())
+    # Human display codes: rename the project's prefix; db.set_project_short_code
+    # also re-prefixes the project's task display codes in project.db.
+    # ValueError → 400 (bad format), False → 409 (another project's code).
+    if 'short_code' in data:
+        try:
+            ok = db.set_project_short_code(pid, data.get('short_code'))
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+        if not ok:
+            return jsonify({'error': 'short_code already used by another project'}), 409
     # Sync aingel.json with updated DB state
     updated = db.get_project(pid)
     if updated and updated.get('path'):
@@ -6581,11 +6607,20 @@ def fork_memory():
     memory_status = f'forked:chat:{chat["id"]}:task:{new_task_id}'
     db.update_execution_memory_status(exec_id, memory_status)
 
+    # The fork went through create_task, so it has a display code; read it back
+    # (nullable in the payload for robustness — never fail a successful fork).
+    try:
+        new_task = db.get_task(new_task_id, row.get('project_path'))
+        new_task_display_code = (new_task or {}).get('display_code')
+    except Exception:
+        new_task_display_code = None
+
     return jsonify({
         'ok': True,
         'exec_id': exec_id,
         'source_task_id': row['task_id'],
         'new_task_id': new_task_id,
+        'new_task_display_code': new_task_display_code,
         'new_chat_id': chat['id'],
         'chat_path': chat_path,
         'phase_name': phase_name,
@@ -7640,6 +7675,27 @@ def get_attachable_tasks():
     if auth_enabled() and not has_project_access(g.current_user, project_id, 'viewer'):
         return jsonify({'error': 'not_found'}), 404
     return jsonify(db.get_attachable_tasks(project_id))
+
+
+@app.route('/api/tasks/resolve')
+@require_auth
+def resolve_task_code():
+    """Map a human display code ('RP-014') to its integer task/project ids.
+
+    200 {task_id, project_id} on a hit, 404 when the code does not resolve OR
+    the caller cannot access the project (anti-enumeration, same gating as
+    /api/tasks/attachable). Internal integer ids remain the API's keys — this
+    is a read-only lookup for UIs that received a display code.
+    """
+    code = (request.args.get('code') or '').strip()
+    if not code:
+        return jsonify({'error': 'code required'}), 400
+    hit = db.resolve_task_code(code)
+    if not hit:
+        return jsonify({'error': 'not_found'}), 404
+    if auth_enabled() and not has_project_access(g.current_user, hit['project_id'], 'viewer'):
+        return jsonify({'error': 'not_found'}), 404
+    return jsonify({'task_id': hit['task_id'], 'project_id': hit['project_id']})
 
 
 # ── Work sessions ────────────────────────────────────────────────────────────

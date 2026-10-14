@@ -3,6 +3,7 @@ import { useStore } from '../store';
 import { api } from '../api';
 import type { Chat } from '../types';
 import { cn } from '../utils/cn';
+import { taskChipById } from '../utils/taskCode';
 import { RightPanelResizer } from './RightPanelResizer';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
@@ -102,7 +103,7 @@ export const ChatsSidebar = () => {
         list.push(c);
         phase.set(ph, list);
       } else {
-        const tt = c.task_title || `Task #${c.task_id}`;
+        const tt = c.task_title || `Task ${c.task_id != null ? taskChipById(c.task_id, tasks) : ''}`;
         const list = task.get(tt) || [];
         list.push(c);
         task.set(tt, list);
@@ -110,7 +111,7 @@ export const ChatsSidebar = () => {
     }
 
     return { project, phase, task };
-  }, [filteredChats]);
+  }, [filteredChats, tasks]);
 
   const handleSelectChat = async (chatId: number) => {
     try {

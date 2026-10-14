@@ -521,3 +521,23 @@ class TaskStatusSectionTests(unittest.TestCase):
         self._set_heartbeat('-15 minutes')
         s = agent_executor._task_status_section(self.path)
         self.assertIn('possibly stalled', s)
+
+    def test_failed_run_shows_code_error_and_gate(self):
+        # RP-082·E1: a strict-gate abort left the task `pending` with no error
+        # visible to the Guide, which then read "proceed" as a cleared gate.
+        conn = agent_db.get_project_db(self.path)
+        conn.execute("UPDATE executions SET status='failed', error_message=? WHERE id=?",
+                     ('Guide gate (proceed): all files inlined.', self.exec_id))
+        conn.execute("UPDATE tasks SET gate_state='open', gate_reason='all files inlined', "
+                     "gate_report_h2_json='{\"gate\": \"proceed\"}' WHERE id=?",
+                     (self.task_id,))
+        conn.commit()
+        conn.close()
+        code = agent_db.get_task(self.task_id)['display_code']
+        s = agent_executor._task_status_section(self.path)
+        self.assertIn(f'| {code} | #{self.task_id} |', s)
+        self.assertIn('E1 #', s)
+        self.assertIn('### Last run failed', s)
+        self.assertIn(f'**{code}·E1**', s)
+        self.assertIn('error: Guide gate (proceed): all files inlined.', s)
+        self.assertIn('gate_state=open, pre-run verdict=proceed', s)

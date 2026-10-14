@@ -840,7 +840,15 @@ def pre_run_check(task: Dict[str, Any],
     if capability_warnings:
         parsed.setdefault('capability_warnings', [])
         parsed['capability_warnings'] = list(set(parsed['capability_warnings'] + capability_warnings))
-    parsed.setdefault('gate', 'run')
+    # The model sometimes answers with H3's vocabulary ('proceed') or another
+    # synonym; strict mode aborts on anything but 'run', so a "proceed" verdict
+    # failed RP-082·E1. Map run-synonyms to 'run'; any other unknown → 'hold'.
+    _gate = str(parsed.get('gate') or 'run').strip().lower()
+    if _gate in ('proceed', 'go', 'ok', 'pass', 'open', 'continue', 'allow'):
+        _gate = 'run'
+    elif _gate not in ('run', 'hold', 'skip'):
+        _gate = 'hold'
+    parsed['gate'] = _gate
     parsed.setdefault('reason', '')
     parsed.setdefault('strategic_advice', '')
     parsed.setdefault('completeness', 'complete')

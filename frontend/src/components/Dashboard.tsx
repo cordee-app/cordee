@@ -69,6 +69,7 @@ interface ProjectStat {
   id: number;
   name: string;
   slug: string;
+  short_code?: string | null;
   eu_only?: boolean;
   scw_session_enabled?: boolean;
   scw_session_bucket?: string;
@@ -358,6 +359,11 @@ export const Dashboard = () => {
             <div className="dash-project-header flex justify-between items-start mb-2">
               <span className="dash-project-name text-base font-semibold leading-snug flex-1 dark:text-text-dark-DEFAULT">
                 {p.name}
+                {p.short_code && (
+                  <span className="ml-1.5 inline-flex items-center font-mono text-[10px] tracking-wide text-text-muted dark:text-text-dark-muted px-1 py-px rounded border border-border-muted dark:border-border-dark-muted align-middle">
+                    {p.short_code}
+                  </span>
+                )}
                 {p.scw_session_enabled && (
                   <span className="ml-1.5 inline-flex items-center gap-1 text-[10px] uppercase tracking-wide text-accent dark:text-accent-dark-DEFAULT px-1 py-px rounded border border-accent/25 dark:border-accent-dark-DEFAULT/40" style={{ background: 'rgba(99,102,241,.12)' }}>
                     <Lock size={11} />

@@ -328,6 +328,8 @@ export const api = {
       execution_type?: string;
     }) => post<{ id: number; ok: true }>('/api/tasks', data),
     get: (tid: number) => get<Task>(`/api/tasks/${tid}`),
+    resolveTaskCode: (code: string) =>
+      get<{ task_id: number; project_id: number }>(`/api/tasks/resolve?code=${encodeURIComponent(code)}`),
     update: (tid: number, data: Partial<Task & { handoff_context?: string }>) =>
       patch<{ ok: boolean; auto_promoted?: string }>(`/api/tasks/${tid}`, data),
     delete: (tid: number) => del<{ ok: true }>(`/api/tasks/${tid}`),
@@ -419,7 +421,7 @@ export const api = {
     skip: (data: { exec_id: number; reason?: string }) =>
       post<{ ok: boolean; task_id: number; memory_status: string; task_status: string }>('/api/memory/skip', data),
     fork: (data: { exec_id: number; feedback?: string; topic?: string }) =>
-      post<{ ok: boolean; new_task_id: number; new_chat_id: number; phase_name?: string }>('/api/memory/fork', data),
+      post<{ ok: boolean; new_task_id: number; new_chat_id: number; new_task_display_code?: string | null; phase_name?: string }>('/api/memory/fork', data),
   },
 
   // ── Phases ──────────────────────────────────────────────────────────

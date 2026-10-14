@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useStore } from '../store';
 import { api } from '../api';
 import { cn } from '../utils/cn';
+import { taskChip, isTaskCode } from '../utils/taskCode';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
 import type { Dependency, TaskDependencies } from '../types';
 
@@ -65,12 +66,25 @@ export const DependenciesModal = () => {
   };
 
   const handleAddDep = async () => {
-    const inputId = Number(addInput.trim());
-    if (!inputId || !Number.isInteger(inputId)) {
-      setAddError('Enter a valid task ID');
-      return;
-    }
+    const raw = addInput.trim();
     if (depsModalTaskId === null) return;
+    let inputId: number | null = null;
+    if (isTaskCode(raw)) {
+      try {
+        const resolved = await api.tasks.resolveTaskCode(raw);
+        inputId = resolved.task_id;
+      } catch {
+        setAddError('Task code not found');
+        return;
+      }
+    } else {
+      const parsed = Number(raw);
+      if (!parsed || !Number.isInteger(parsed)) {
+        setAddError('Enter a valid task ID');
+        return;
+      }
+      inputId = parsed;
+    }
     if (inputId === depsModalTaskId) {
       setAddError('A task cannot depend on itself');
       return;
@@ -116,10 +130,10 @@ export const DependenciesModal = () => {
       >
         <div className="flex items-center gap-2">
           <span className="font-mono text-sm+ text-text-faint">
-            #{depId}
+            {taskChip(depTask)}
           </span>
           <span className="text-sm">
-            {depTask?.title ?? `Task #${depId}`}
+            {depTask?.title ?? `Task ${taskChip(depTask)}`}
           </span>
           {depTask && (
             <span
@@ -158,7 +172,7 @@ export const DependenciesModal = () => {
           className="flex justify-between items-center mb-4"
         >
           <h3 className="m-0 text-base">
-            Dependencies for #{depsModalTaskId}: {task.title}
+            Dependencies for {taskChip(task)}: {task.title}
           </h3>
           <button
             data-tip="Close this dialog"
@@ -206,10 +220,10 @@ export const DependenciesModal = () => {
                       className="flex items-center py-1.5 px-2 bg-surface-subtle rounded mb-1"
                     >
                       <span className="font-mono text-sm+ text-text-faint">
-                        #{depTaskId}
+                        {taskChip(depTask)}
                       </span>
                       <span className="text-sm ml-2">
-                        {depTask?.title ?? `Task #${depTaskId}`}
+                        {depTask?.title ?? `Task ${taskChip(depTask)}`}
                       </span>
                       {depTask && (
                         <span
@@ -237,8 +251,8 @@ export const DependenciesModal = () => {
               <div className="flex gap-2 items-start">
                 <div className="flex-1">
                   <input
-                    type="number"
-                    data-tip="Enter the ID of the task to depend on"
+                    type="text"
+                    data-tip="Enter the ID or code of the task to depend on"
                     className={cn(
                       'w-full py-1.5 px-2.5 border rounded text-md-',
                       addError ? 'border-danger' : 'border-default',
@@ -251,7 +265,7 @@ export const DependenciesModal = () => {
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') handleAddDep();
                     }}
-                    placeholder="Task ID"
+                    placeholder="Task ID or code"
                   />
                   {addError && (
                     <div className="text-sm+ text-danger mt-1">
@@ -283,7 +297,7 @@ export const DependenciesModal = () => {
                           className="btn py-[3px] px-2 text-sm+ whitespace-nowrap border border-default rounded cursor-pointer"
                           onClick={() => handleQuickPick(t.id)}
                         >
-                          #{t.id} {t.title.slice(0, 30)}
+                          {taskChip(t)} {t.title.slice(0, 30)}
                           {t.title.length > 30 ? '\u2026' : ''}
                         </button>
                       ))}

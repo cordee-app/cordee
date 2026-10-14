@@ -3334,12 +3334,20 @@ def _task_status_section(project_path):
         rows = pconn.execute(
             '''
             SELECT t.id, t.title, t.status, t.model, t.work_session_slot,
+                   t.display_code, t.gate_state, t.gate_reason,
+                   t.gate_report_h2_json,
                    e.id            AS exec_id,
                    e.status        AS exec_status,
                    e.tokens_input,
                    e.tokens_output,
                    e.started_at,
-                   e.last_heartbeat_at
+                   e.finished_at,
+                   e.last_heartbeat_at,
+                   e.error_message,
+                   CASE WHEN e.id IS NULL OR e.chat_id IS NOT NULL THEN NULL
+                        ELSE (SELECT COUNT(*) FROM executions x
+                              WHERE x.task_id = t.id AND x.chat_id IS NULL
+                              AND x.id <= e.id) END AS exec_no
             FROM tasks t
             LEFT JOIN executions e ON e.id = (
                 SELECT e2.id FROM executions e2
@@ -3359,9 +3367,10 @@ def _task_status_section(project_path):
     lines = [
         '## Task status',
         '',
-        '| ID | Status | Model | Slot | Last exec | Title |',
-        '|----|--------|-------|------|-----------|-------|',
+        '| Code | ID | Status | Model | Slot | Last exec | Title |',
+        '|------|----|--------|-------|------|-----------|-------|',
     ]
+    failures = []
     # Surface problems (running/failed) first, then the rest by id.
     def _sort_key(r):
         st = (r['status'] or '').lower()
@@ -3375,7 +3384,13 @@ def _task_status_section(project_path):
             title = title[:57] + '...'
         slot = r['work_session_slot'] or ''
         if r['exec_id']:
-            last_exec = f"#{r['exec_id']} {r['exec_status']} {r['tokens_input']}↑{r['tokens_output']}↓"
+            exec_label = f"E{r['exec_no']} " if r['exec_no'] else ''
+            last_exec = f"{exec_label}#{r['exec_id']} {r['exec_status']} {r['tokens_input']}↑{r['tokens_output']}↓"
+            # A failed last run sends the task back to `pending`, so without the
+            # error and gate verdict the Guide can only guess why (RP-082·E1:
+            # it read a strict-gate abort quoting "proceed" as a cleared gate).
+            if (r['exec_status'] or '').lower() == 'failed':
+                failures.append(r)
             # Show elapsed minutes for running executions so the model can
             # distinguish "just started" from "stuck for 18 min".
             # 2026-08-21 fix (task 10001088): Vibe CLI commits at END, so
@@ -3405,12 +3420,41 @@ def _task_status_section(project_path):
                     pass
         else:
             last_exec = '—'
-        line = f"| #{r['id']} | {r['status']} | {r['model']} | {slot} | {last_exec} | {title} |"
+        line = f"| {r['display_code'] or '—'} | #{r['id']} | {r['status']} | {r['model']} | {slot} | {last_exec} | {title} |"
         body_chars += len(line)
         if body_chars > cap:
             lines.append('| _…further tasks omitted…_ |')
             break
         lines.append(line)
+
+    if failures:
+        lines.append('')
+        lines.append('### Last run failed')
+        lines.append('')
+        for r in failures:
+            code = r['display_code'] or f"#{r['id']}"
+            ex = f"{code}·E{r['exec_no']}" if r['exec_no'] else f"{code} exec #{r['exec_id']}"
+            err = ' '.join((r['error_message'] or '').split())
+            if len(err) > 300:
+                err = err[:297] + '...'
+            verdict = ''
+            try:
+                verdict = (json.loads(r['gate_report_h2_json'] or '{}') or {}).get('gate') or ''
+            except Exception:
+                pass
+            gate = f"gate_state={r['gate_state'] or '—'}"
+            if verdict:
+                gate += f", pre-run verdict={verdict}"
+            if r['gate_reason']:
+                gate += f" ({' '.join(r['gate_reason'].split())[:200]})"
+            lines.append(f"- **{ex}** ({r['started_at'] or '?'} → {r['finished_at'] or '?'} UTC, "
+                         f"{r['tokens_input']}↑{r['tokens_output']}↓): "
+                         f"error: {err or '—'}; {gate}")
+        lines.append('')
+        lines.append(
+            '> The error above is what the executor recorded. `0↑0↓` means the run '
+            '> stopped before any model call (gate or setup). Gate fields reflect the '
+            '> latest pre-run check, which may postdate the failed run.')
 
     lines.append('')
     lines.append(

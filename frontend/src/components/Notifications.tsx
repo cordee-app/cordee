@@ -1,6 +1,7 @@
 import { useEffect, useRef, useMemo } from 'react';
 import { useStore } from '../store';
 import { cn } from '../utils/cn';
+import { taskChip, execChip } from '../utils/taskCode';
 import { TriangleAlert, CircleCheck, LoaderCircle } from 'lucide-react';
 
 interface NotifItem {
@@ -37,7 +38,7 @@ export const Notifications = () => {
     for (const e of failedEx) {
       items.push({
         icon: '\u2715',
-        title: `Execution #${e.id} failed`,
+        title: `${execChip(e)} failed`,
         desc: (e.task_title || e.instructions || '').slice(0, 60),
         time: String(e.started_at || ''),
         type: 'failed',
@@ -53,7 +54,7 @@ export const Notifications = () => {
     for (const e of pendingApprovals) {
       items.push({
         icon: '\u2713',
-        title: `Execution #${e.id} ready to approve`,
+        title: `${execChip(e)} ready to approve`,
         desc: (e.task_title || '').slice(0, 60),
         time: String(e.finished_at || e.started_at || ''),
         type: 'approve',
@@ -68,7 +69,7 @@ export const Notifications = () => {
       const ext = t as unknown as Record<string, unknown>;
       items.push({
         icon: '\u23F3',
-        title: `Task #${t.id} running`,
+        title: `Task ${taskChip(t)} running`,
         desc: (t.title || '').slice(0, 60),
         time: String(ext.updated_at || ext.created_at || ''),
         type: 'running',

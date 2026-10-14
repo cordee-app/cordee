@@ -5,6 +5,7 @@ import { cn } from '../utils/cn';
 import { fmtTokens } from '../utils/tokens';
 import { fmtUsd } from '../utils/currency';
 import { stuckReason } from '../utils/stuck';
+import { taskChip } from '../utils/taskCode';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
 import type { CSSProperties } from 'react';
 import type { Task, GateQuestion } from '../types';
@@ -315,7 +316,7 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
           />
         )}
         <div className="flex items-center gap-1.5 flex-wrap">
-          <span className="font-semibold text-sm+" style={{ color: modelColor }}>#{task.id}</span>
+          <span className="font-semibold text-sm+" style={{ color: modelColor }}>{taskChip(task)}</span>
           <span className="text-sm+">{shortTitle}</span>
           {task.estimated_tokens > 0 && (
             <span className="text-xs text-faint">{estTokens}</span>
@@ -359,7 +360,7 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
               className="mr-0.5"
             />
           )}
-          <span className="task-id font-semibold text-muted text-sm">#{task.id}</span>
+          <span className="task-id font-semibold text-muted text-sm">{taskChip(task)}</span>
           {modelBadge}
           {task.status === 'skip' && (
             <span
@@ -536,7 +537,7 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
             className="mr-0.5"
           />
         )}
-        <span className="task-id font-semibold text-muted text-sm">#{task.id}</span>
+        <span className="task-id font-semibold text-muted text-sm">{taskChip(task)}</span>
         {modelBadge}
         {task.status === 'skip' && (
           <span

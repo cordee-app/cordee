@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from 'react';
 import { useStore } from '../store';
 import { api } from '../api';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
+import { taskChip } from '../utils/taskCode';
 
 type Scope = 'project' | 'phase' | 'task';
 
@@ -191,7 +192,7 @@ export const ChatModal = () => {
                 <option value="">-- Select task --</option>
                 {selectedPhaseTasks.map((t) => (
                   <option key={t.id} value={t.id}>
-                    #{t.id} {t.title}
+                    {taskChip(t)} {t.title}
                   </option>
                 ))}
               </select>

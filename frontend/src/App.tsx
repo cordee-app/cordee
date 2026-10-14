@@ -5,6 +5,7 @@ import { cn } from './utils/cn';
 import { useProjectSSE } from './hooks/useProjectSSE';
 import { useIsMobile } from './hooks/useIsMobile';
 import { MOBILE_BREAKPOINT } from './utils/breakpoints';
+import { taskChip } from './utils/taskCode';
 import { MobileBottomNav } from './components/MobileBottomNav';
 import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
@@ -312,7 +313,7 @@ const App = () => {
       try {
         const newChat = await api.chats.create({
           project_id: t.project_id,
-          name: (t.title || '').slice(0, 50) || `Task #${t.id}`,
+          name: (t.title || '').slice(0, 50) || `Task ${taskChip(t)}`,
           phase_name: t.phase_name || undefined,
           task_id: t.id,
           ...(model ? { model } : {}),

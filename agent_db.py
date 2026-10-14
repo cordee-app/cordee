@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 import threading
 import logging
@@ -128,7 +129,9 @@ def _init_project_db_schema(conn):
             stale            INTEGER DEFAULT 0,
             created_by       INTEGER DEFAULT NULL,
             created_at       TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at       TEXT DEFAULT CURRENT_TIMESTAMP
+            updated_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+            display_no       INTEGER,
+            display_code     TEXT
         );
         CREATE TABLE IF NOT EXISTS executions (
             id               INTEGER PRIMARY KEY,
@@ -246,6 +249,10 @@ def _init_project_db_schema(conn):
         ('created_by', 'INTEGER DEFAULT NULL'),
         # Processing type per task: NULL (normal), 'research', 'deployment'.
         ('execution_type', 'TEXT'),
+        # Human display codes: per-project sequence + full code ("RP-014").
+        # Internal integer ids stay authoritative everywhere.
+        ('display_no', 'INTEGER'),
+        ('display_code', 'TEXT'),
     ]:
         _add_column_if_missing(conn, 'tasks', col, defn)
     for col, defn in [
@@ -283,6 +290,21 @@ def _init_project_db_schema(conn):
          ''')
     except Exception as e:
         _log.warning('project.db: CREATE INDEX failed: %s', e)
+    # display_no must be UNIQUE per project: two concurrent creates can both
+    # read MAX(display_no)+1 before either INSERT lands. The unique index
+    # turns that race into an IntegrityError that create_task/upsert_task
+    # retry over. The old non-unique idx_tasks_display is DROPPED first — a
+    # same-name CREATE UNIQUE IF NOT EXISTS would be a silent no-op while the
+    # old index exists, leaving two overlapping indexes. Failure (e.g.
+    # pre-existing duplicate display_no data) logs a warning and moves on:
+    # it must never brick get_project_db.
+    try:
+        conn.execute('DROP INDEX IF EXISTS idx_tasks_display')
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_display_unique '
+                     'ON tasks(project_id, display_no)')
+    except Exception as e:
+        _log.warning('project.db: display_no unique index failed (pre-existing '
+                     'duplicates?): %s', e)
     # ── chats.created_by guarded migration (project.db files created before Phase 1) ──
     _add_column_if_missing(conn, 'chats', 'created_by', 'INTEGER DEFAULT NULL')
     # ── file_tags guarded migration (per-project DBs created before this phase) ──
@@ -633,9 +655,9 @@ def _all_project_paths():
 
 
 def _projects_map():
-    """Return {project_id: {id, name, slug, path}} from central DB."""
+    """Return {project_id: {id, name, slug, short_code, path}} from central DB."""
     conn = get_db()
-    rows = conn.execute('SELECT id, name, slug, path FROM projects').fetchall()
+    rows = conn.execute('SELECT id, name, slug, short_code, path FROM projects').fetchall()
     conn.close()
     return {r['id']: dict(r) for r in rows}
 
@@ -763,7 +785,8 @@ def init_db():
             scw_kms_key_id       TEXT DEFAULT NULL,
             scw_session_region   TEXT DEFAULT "fr-par",
             scw_session_created_at TEXT DEFAULT NULL,
-            owner_id             INTEGER DEFAULT NULL
+            owner_id             INTEGER DEFAULT NULL,
+            short_code           TEXT DEFAULT NULL
         );
         -- Phase 2 (2026-07-17): tasks/executions/chats/sessions/project_skills/
         -- project_permissions were dropped from aingel.db entirely. They live only in
@@ -1001,6 +1024,14 @@ def init_db():
     # treated as admin-owned; AINGEL_AUTH=off behavior unchanged.
     if 'owner_id' not in proj_cols:
         conn.execute('ALTER TABLE projects ADD COLUMN owner_id INTEGER DEFAULT NULL')
+    # Human display codes: per-project prefix ("RP" in "RP-014"). Assigned at
+    # project creation (see upsert_project) and editable via the project PATCH
+    # route. NULL = not yet assigned (SQLite UNIQUE indexes treat NULLs as
+    # distinct, so many projects can predate the feature).
+    if 'short_code' not in proj_cols:
+        conn.execute('ALTER TABLE projects ADD COLUMN short_code TEXT')
+    conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_short_code '
+                 'ON projects(short_code)')
 
     # ── Shared GPU window (cross-project run window) ────────────────────────────
     # scw_deployments.project_id becomes nullable (a shared window is not owned by
@@ -1409,28 +1440,238 @@ def reset_orphaned_executions(reason='tick'):
 
 # ── Projects (central DB) ─────────────────────────────────────────────────────
 
+# ── Human display codes ("RP-014") ────────────────────────────────────────────
+# Projects get a short_code (initials of the name, editable, unique per
+# instance); tasks get a per-project 1-based display_no so the UI can show
+# "RP-014" instead of the global integer id. Purely additive display fields —
+# internal integer ids (keys, FKs, URLs, filenames, branches) are unchanged.
+
+_SHORT_CODE_STOPWORDS = frozenset((
+    'of', 'the', 'on', 'a', 'an', 'and', 'for', 'in', 'to', 'with', 'at',
+    'by', 'from', 'de', 'la', 'le', 'les', 'des', 'du',
+))
+# A-Z first, then A-Z0-9; 2-6 chars total (initials max 4 + collision digits).
+_SHORT_CODE_RE = re.compile(r'^[A-Z][A-Z0-9]{1,5}$')
+
+
+def _short_code_base(name):
+    """Initials of a project name's significant words: 'RAG Pipeline' → 'RP'.
+
+    Splits on non-alphanumerics, skips stopwords, uppercase, max 4 chars, min
+    2 (padded from the first significant word's own letters when the name has
+    a single initial). The first char is always a letter so a generated code
+    satisfies the same ^[A-Z][A-Z0-9]{1,5}$ rule enforced on user edits and by
+    resolve_task_code (digit-leading words like '3D Printing' are skipped as
+    initials until a letter leads the code).
+    """
+    initials = []
+    first_word = None
+    for word in re.split(r'[^0-9A-Za-z]+', name or ''):
+        if not word or word.lower() in _SHORT_CODE_STOPWORDS:
+            continue
+        initial = word[0].upper()
+        if not initials and not initial.isalpha():
+            continue
+        if first_word is None:
+            first_word = word
+        initials.append(initial)
+        if len(initials) >= 4:
+            break
+    code = ''.join(initials)
+    if len(code) < 2:
+        if first_word:
+            # Single significant word ('Superagent', 'OCR'): pad with the
+            # word's own letters beyond its initial.
+            for ch in first_word.upper()[1:]:
+                if len(code) >= 2:
+                    break
+                if ch.isalnum():
+                    code += ch
+        else:
+            code = 'PR'  # no usable word (empty / separator-only / stopwords)
+        if len(code) < 2:
+            code = (code + 'X')[:2]  # single-alnum-char name
+    return code[:4]
+
+
+def _generate_short_code(name, conn, extra_taken=()):
+    """A free short_code for a project: base initials, then 'RP2', 'RP3', ...
+    on collision with an existing project. `conn` is a central-DB connection;
+    `extra_taken` adds codes this caller plans to claim (dry-run fidelity in
+    the backfill script)."""
+    base = _short_code_base(name)
+    code, n = base, 2
+    while code in extra_taken or conn.execute(
+            'SELECT 1 FROM projects WHERE short_code=?', (code,)).fetchone():
+        code = f'{base}{n}'
+        n += 1
+    return code
+
+
+def _ensure_short_code(project_id):
+    """The project's short_code, generating + persisting one if missing.
+    Returns None when the project does not exist."""
+    conn = get_db()
+    try:
+        row = conn.execute('SELECT name, short_code FROM projects WHERE id=?',
+                           (project_id,)).fetchone()
+        if not row:
+            return None
+        if row['short_code']:
+            return row['short_code']
+        code = _generate_short_code(row['name'], conn)
+        conn.execute('UPDATE projects SET short_code=? WHERE id=?',
+                      (code, project_id))
+        conn.commit()
+        return code
+    finally:
+        conn.close()
+
+
+def _next_display_no(pconn, project_id, short_code):
+    """Allocate the next per-project display number and its full code.
+    `pconn` is the project's own DB connection (MAX(display_no) is per project)."""
+    display_no = pconn.execute(
+        'SELECT COALESCE(MAX(display_no),0)+1 FROM tasks WHERE project_id=?',
+        (project_id,)).fetchone()[0]
+    display_code = f'{short_code}-{display_no:03d}' if short_code else None
+    return display_no, display_code
+
+
+def _reprefix_task_display_codes(project_id, project_path, code):
+    """Swap the SHORT- prefix on the project's task display codes in its
+    project.db ('RP-001' + 'RP2' → 'RP2-001'). Only the part before the first
+    '-' is replaced; the per-project number is untouched. Shared by the
+    short_code rename (set_project_short_code) and the archive-restore path
+    (a colliding archived code is re-assigned, so the restored tasks must
+    follow). No-op (returns False) when the project has no project.db yet;
+    DB errors propagate to the caller."""
+    if not project_path or not os.path.exists(os.path.join(project_path, 'project.db')):
+        return False
+    pconn = get_project_db(project_path)
+    try:
+        pconn.execute(
+            "UPDATE tasks SET display_code = ? || substr(display_code, instr(display_code, '-')) "
+            'WHERE project_id=? AND display_code IS NOT NULL',
+            (code, project_id))
+        pconn.commit()
+    finally:
+        pconn.close()
+    return True
+
+
+def set_project_short_code(project_id, code):
+    """Set a project's short_code, re-prefixing its tasks' display codes.
+
+    Raises ValueError on an invalid format (route → 400). Returns False when
+    the code is already used by ANOTHER project (route → 409), True otherwise
+    (including the no-op case where the code is unchanged). Deliberately NOT
+    in _PROJECT_FIELD_WHITELIST: the rename must also re-prefix task rows in
+    project.db, which set_project_field cannot do.
+    """
+    code = (code or '').strip().upper()
+    if not _SHORT_CODE_RE.match(code):
+        raise ValueError('short_code must match ^[A-Z][A-Z0-9]{1,5}$')
+    conn = get_db()
+    try:
+        row = conn.execute('SELECT short_code, path FROM projects WHERE id=?',
+                           (project_id,)).fetchone()
+        if not row:
+            return False
+        if row['short_code'] == code:
+            return True
+        if conn.execute('SELECT 1 FROM projects WHERE short_code=? AND id != ?',
+                        (code, project_id)).fetchone():
+            return False
+        conn.execute('UPDATE projects SET short_code=? WHERE id=?',
+                     (code, project_id))
+        conn.commit()
+    finally:
+        conn.close()
+    # Swap only the prefix: the '-014' suffix carries the (unchanged) number.
+    try:
+        _reprefix_task_display_codes(project_id, row['path'], code)
+    except Exception as e:
+        _log.warning('short_code rename: task re-prefix failed for project %s: %s',
+                     project_id, e)
+    return True
+
+
+def resolve_task_code(code):
+    """Resolve a human display code ('RP-014', any case) to its integer ids.
+
+    Parses '<SHORT>-<NO>', finds the project by short_code (central DB), then
+    the task by per-project display_no. Returns
+    {'task_id', 'project_id', 'project_path'} or None when unresolvable.
+    """
+    code = (code or '').strip().upper()
+    short, sep, num = code.rpartition('-')
+    if not sep or not _SHORT_CODE_RE.match(short) or not re.fullmatch(r'[0-9]+', num):
+        return None
+    conn = get_db()
+    try:
+        proj = conn.execute('SELECT id, path FROM projects WHERE short_code=?',
+                            (short,)).fetchone()
+    finally:
+        conn.close()
+    if not proj:
+        return None
+    try:
+        pconn = get_project_db(proj['path'])
+    except Exception:
+        return None
+    try:
+        row = pconn.execute(
+            'SELECT id FROM tasks WHERE project_id=? AND display_no=?',
+            (proj['id'], int(num))).fetchone()
+    finally:
+        pconn.close()
+    if not row:
+        return None
+    return {'task_id': row['id'], 'project_id': proj['id'],
+            'project_path': proj['path']}
+
+
 def upsert_project(name, slug, path, project_type='', eu_only=0, llm_mode='standard',
                    execution_type='standard', aingel_name=None,
                    scw_session_enabled=0, scw_project_id=None, scw_session_bucket=None,
                    scw_kms_key_id=None, scw_session_region='fr-par', scw_session_created_at=None):
     conn = get_db()
-    conn.execute(
-        'INSERT INTO projects (name, slug, path, project_type, eu_only, llm_mode, execution_type, aingel_name, '
-        'scw_session_enabled, scw_project_id, scw_session_bucket, scw_kms_key_id, scw_session_region, scw_session_created_at) '
-        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) '
-        'ON CONFLICT(slug) DO UPDATE SET name=excluded.name, path=excluded.path, '
-        'project_type=excluded.project_type, eu_only=excluded.eu_only, llm_mode=excluded.llm_mode, '
-        'execution_type=excluded.execution_type, aingel_name=excluded.aingel_name, '
-        'scw_session_enabled=excluded.scw_session_enabled, scw_project_id=excluded.scw_project_id, '
-        'scw_session_bucket=excluded.scw_session_bucket, scw_kms_key_id=excluded.scw_kms_key_id, '
-        'scw_session_region=excluded.scw_session_region, scw_session_created_at=excluded.scw_session_created_at',
-        (name, slug, path, project_type, eu_only, llm_mode, execution_type, aingel_name,
-         scw_session_enabled, scw_project_id, scw_session_bucket, scw_kms_key_id,
-         scw_session_region, scw_session_created_at)
-    )
-    conn.commit()
-    row = conn.execute('SELECT * FROM projects WHERE slug=?', (slug,)).fetchone()
-    conn.close()
+    try:
+        # short_code is assigned on CREATE only — an existing project keeps its
+        # code even when upserted again (ON CONFLICT DO UPDATE never touches it).
+        existing = conn.execute('SELECT 1 FROM projects WHERE slug=?', (slug,)).fetchone()
+        short_code = None if existing else _generate_short_code(name, conn)
+        # Two concurrent CREATEs can generate the same code; the UNIQUE
+        # idx_projects_short_code then raises IntegrityError. Only the create
+        # branch can hit it (slug conflicts are absorbed by ON CONFLICT), so
+        # regenerate and retry a bounded number of times before surfacing.
+        for _attempt in range(5):
+            try:
+                conn.execute(
+                    'INSERT INTO projects (name, slug, path, project_type, eu_only, llm_mode, execution_type, aingel_name, '
+                    'scw_session_enabled, scw_project_id, scw_session_bucket, scw_kms_key_id, scw_session_region, scw_session_created_at, short_code) '
+                    'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) '
+                    'ON CONFLICT(slug) DO UPDATE SET name=excluded.name, path=excluded.path, '
+                    'project_type=excluded.project_type, eu_only=excluded.eu_only, llm_mode=excluded.llm_mode, '
+                    'execution_type=excluded.execution_type, aingel_name=excluded.aingel_name, '
+                    'scw_session_enabled=excluded.scw_session_enabled, scw_project_id=excluded.scw_project_id, '
+                    'scw_session_bucket=excluded.scw_session_bucket, scw_kms_key_id=excluded.scw_kms_key_id, '
+                    'scw_session_region=excluded.scw_session_region, scw_session_created_at=excluded.scw_session_created_at',
+                    (name, slug, path, project_type, eu_only, llm_mode, execution_type, aingel_name,
+                     scw_session_enabled, scw_project_id, scw_session_bucket, scw_kms_key_id,
+                     scw_session_region, scw_session_created_at, short_code)
+                )
+                break
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                if existing or _attempt == 4:
+                    raise
+                short_code = _generate_short_code(name, conn)
+        conn.commit()
+        row = conn.execute('SELECT * FROM projects WHERE slug=?', (slug,)).fetchone()
+    finally:
+        conn.close()
     return dict(row)
 
 
@@ -2407,8 +2648,24 @@ def check_archive_id_collisions(manifest):
     return None
 
 
+def _reprefix_restored_task_codes(project_id, project_path, archived_code, final_code):
+    """Post-restore best-effort: when a colliding archived short_code was
+    re-assigned during restore (RP → RP2), the restored tasks' display codes
+    still carry the OLD prefix. Re-prefix them in the (already in-place)
+    project.db so codes match the project row. No-op when no re-assignment
+    happened. Never raises — callers run past the central commit where a
+    cosmetic failure must not abort the restore."""
+    if not final_code or final_code == (archived_code or ''):
+        return
+    try:
+        _reprefix_task_display_codes(project_id, project_path, final_code)
+    except Exception as e:
+        _log.warning('restore: task display-code re-prefix failed for project %s: %s',
+                     project_id, e)
+
+
 def restore_project_central_rows(manifest, target_path, owner_id=None,
-                                 allowed_user_ids=None):
+                                  allowed_user_ids=None):
     """Insert a manifest's central rows in ONE transaction, parents first.
 
     Uses explicit INSERT statements so the ORIGINAL ids are preserved (SQLite
@@ -2460,6 +2717,16 @@ def restore_project_central_rows(manifest, target_path, owner_id=None,
         proj_vals['path'] = target_path
         if owner_id is not None and 'owner_id' in proj_cols:
             proj_vals['owner_id'] = owner_id
+        # A short_code is a human display prefix, not identity: never fail a
+        # restore over it. If the archived code is taken by another project,
+        # assign a fresh suffixed one instead.
+        if proj_vals.get('short_code') and conn.execute(
+                'SELECT 1 FROM projects WHERE short_code=?',
+                (proj_vals['short_code'],)).fetchone():
+            _log.info('restore: short_code %r taken by another project — assigning a fresh one',
+                      proj_vals['short_code'])
+            proj_vals['short_code'] = _generate_short_code(
+                proj_vals.get('name') or '', conn)
         cols = [c for c in proj_cols if c in proj_vals]
         placeholders = ','.join('?' for _ in cols)
         conn.execute(
@@ -2601,10 +2868,18 @@ def restore_project_central_rows(manifest, target_path, owner_id=None,
         # we just inserted.
         try:
             row = conn.execute('SELECT * FROM projects WHERE id=?', (pid,)).fetchone()
-            return dict(row) if row else dict(proj_vals)
+            restored = dict(row) if row else dict(proj_vals)
         except Exception as e:
             _log.warning('restore: project row read-back failed after commit: %s', e)
-            return dict(proj_vals)
+            restored = dict(proj_vals)
+        # A colliding short_code was re-assigned above (RP → RP2): the restored
+        # tasks still carry the OLD prefix in their display codes. Re-prefix
+        # them in the project.db already sitting at target_path (the folder is
+        # moved into place before the central insert); no-op without collision.
+        _reprefix_restored_task_codes(pid, target_path,
+                                      project.get('short_code'),
+                                      restored.get('short_code'))
+        return restored
     except sqlite3.IntegrityError as e:
         # A unique/PK/FK violation here means an id was taken between the
         # up-front collision pre-check and this write (a race). Surface it as a
@@ -2832,13 +3107,25 @@ def upsert_task(project_id, external_id, title, description='',
     task_id = central.execute('SELECT last_insert_rowid()').fetchone()[0]
     central.close()
 
-    pconn.execute(
-        'INSERT INTO tasks (id, project_id, external_id, title, description, phase_name, source, model, priority, status) '
-        'VALUES (?,?,?,?,?,?,"md",?,?,?)',
-        (task_id, project_id, external_id, title, description, phase_name or '', model, priority, status)
-    )
-    pconn.commit()
-    pconn.close()
+    short_code = _ensure_short_code(project_id)
+    try:
+        # Same IntegrityError race guard as create_task (see there).
+        for _attempt in range(3):
+            display_no, display_code = _next_display_no(pconn, project_id, short_code)
+            try:
+                pconn.execute(
+                    'INSERT INTO tasks (id, project_id, external_id, title, description, phase_name, source, model, priority, status, display_no, display_code) '
+                    'VALUES (?,?,?,?,?,?,"md",?,?,?,?,?)',
+                    (task_id, project_id, external_id, title, description, phase_name or '', model, priority, status, display_no, display_code)
+                )
+                break
+            except sqlite3.IntegrityError:
+                pconn.rollback()
+                if _attempt == 2:
+                    raise
+        pconn.commit()
+    finally:
+        pconn.close()
     return task_id
 
 
@@ -2979,6 +3266,7 @@ def get_attachable_tasks(project_id, project_path=None):
     pconn = get_project_db(project_path)
     rows = pconn.execute('''
         SELECT t.id, t.title, t.status, t.phase_name, COALESCE(t.archived,0) archived,
+               t.display_code,
                (SELECT e.id FROM executions e WHERE e.task_id = t.id AND e.status='done'
                 ORDER BY e.started_at DESC, e.id DESC LIMIT 1) AS latest_done_exec_id,
                (SELECT e.output_summary FROM executions e WHERE e.task_id = t.id AND e.status='done'
@@ -3008,10 +3296,12 @@ def get_attachable_tasks(project_id, project_path=None):
         tid = int(row['id'])
         has_deps = bool(dep_up.get(tid) or dep_down.get(tid))
         status = row['status'] or 'done'
+        # Human display code when the row has one, integer id otherwise.
+        label = f"{row['display_code'] or ('#' + str(tid))} {row['title'] or ''}".strip()
         attachable.append({
             'kind': 'task', 'ref': tid, 'id': tid,
-            'name': f"#{tid} {row['title'] or ''}".strip(),
-            'label': f"#{tid} {row['title'] or ''}".strip(),
+            'name': label,
+            'label': label,
             'phase_name': row['phase_name'] or '',
             'has_dependencies': has_deps, 'status': status,
             'color': '#28a745' if status == 'done' else '#6c757d',
@@ -3186,14 +3476,28 @@ def create_task(project_id, title, description='', model='claude-sonnet-5-5',
     task_id = central.execute('SELECT last_insert_rowid()').fetchone()[0]
     central.close()
 
+    short_code = _ensure_short_code(project_id)
     pconn = get_project_db(project_path)
-    pconn.execute(
-        'INSERT INTO tasks (id, project_id, title, description, phase_name, model, priority, source, status, estimated_tokens, role_id, corpus_id, requires_rag, created_by, execution_type) '
-        'VALUES (?,?,?,?,?,?,?,"manual","pending",?,?,?,?,?,?)',
-        (task_id, project_id, title, description, phase_name or '', model, priority, estimated_tokens, role_id, corpus_id, int(requires_rag), created_by, execution_type)
-    )
-    pconn.commit()
-    pconn.close()
+    try:
+        # UNIQUE(project_id, display_no) turns a MAX+1 allocation race (two
+        # concurrent creates in one project) into an IntegrityError: rollback,
+        # re-allocate the next free number, retry a bounded number of times.
+        for _attempt in range(3):
+            display_no, display_code = _next_display_no(pconn, project_id, short_code)
+            try:
+                pconn.execute(
+                    'INSERT INTO tasks (id, project_id, title, description, phase_name, model, priority, source, status, estimated_tokens, role_id, corpus_id, requires_rag, created_by, execution_type, display_no, display_code) '
+                    'VALUES (?,?,?,?,?,?,?,"manual","pending",?,?,?,?,?,?,?,?)',
+                    (task_id, project_id, title, description, phase_name or '', model, priority, estimated_tokens, role_id, corpus_id, int(requires_rag), created_by, execution_type, display_no, display_code)
+                )
+                break
+            except sqlite3.IntegrityError:
+                pconn.rollback()
+                if _attempt == 2:
+                    raise
+        pconn.commit()
+    finally:
+        pconn.close()
     # Lane B: store explicit context refs if provided
     if context_refs is not None:
         try:
@@ -3791,7 +4095,11 @@ def get_executions(limit=50):
                        e.error_message, e.git_branch, e.git_commit, e.git_diffstat,
                        e.memory_status, e.gpu_cost_usd, e.batch_parent_id, e.session_id,
                        e.rag_label, e.rag_provenance_json, e.context_used_json,
-                       t.title task_title, t.external_id task_ext_id
+                       t.title task_title, t.external_id task_ext_id,
+                       t.display_code task_display_code,
+                       CASE WHEN e.task_id IS NULL THEN NULL
+                            ELSE ROW_NUMBER() OVER (PARTITION BY e.task_id ORDER BY e.id)
+                       END AS exec_no
                 FROM executions e
                 LEFT JOIN tasks t ON e.task_id = t.id
                 WHERE e.chat_id IS NULL
@@ -3823,7 +4131,16 @@ def get_execution(exec_id, project_path=None):
         proj_id = reg['project_id'] if reg else None
     pconn = get_project_db(project_path)
     row = pconn.execute(
-        'SELECT e.*, t.title task_title, t.external_id task_ext_id '
+        'SELECT e.*, t.title task_title, t.external_id task_ext_id, '
+        't.display_code task_display_code, '
+        # exec_no: same semantics as get_executions — 1-based position among
+        # the task's executions (chat_id IS NULL population) ordered by id.
+        # COUNT with id <= e.id == ROW_NUMBER() OVER (PARTITION BY task_id
+        # ORDER BY id); chat executions are never in that numbering → NULL.
+        'CASE WHEN e.task_id IS NULL OR e.chat_id IS NOT NULL THEN NULL '
+        'ELSE (SELECT COUNT(*) FROM executions x '
+        '      WHERE x.task_id = e.task_id AND x.chat_id IS NULL '
+        '      AND x.id <= e.id) END AS exec_no '
         'FROM executions e LEFT JOIN tasks t ON e.task_id = t.id WHERE e.id=?',
         (exec_id,)
     ).fetchone()
@@ -3908,6 +4225,7 @@ def get_dashboard_stats():
             proj_info = pm.get(pid, {})
             d = {
                 'id': pid, 'name': proj_info.get('name', ''), 'slug': proj_info.get('slug', ''),
+                'short_code': proj_info.get('short_code'),
                 'budget_monthly': proj_info.get('budget_monthly') or 0.0,
                 'current_month_spend': proj_info.get('current_month_spend') or 0.0,
             }

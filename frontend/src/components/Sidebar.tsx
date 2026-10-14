@@ -1,5 +1,6 @@
 import { useStore } from '../store';
 import { cn } from '../utils/cn';
+import { taskChip } from '../utils/taskCode';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
 import { MobileDrawer } from './MobileDrawer';
@@ -237,7 +238,7 @@ export const Sidebar = () => {
                           <div
                             key={t.id}
                             className={cn('sidebar-task-item flex items-center gap-1.5 px-1.5 py-1 text-sm cursor-pointer rounded-sm hover:bg-accent-soft dark:hover:bg-accent-dark-soft text-text-default dark:text-text-dark-default', `status-${norm(t.status)}`, selectedTaskId === t.id && 'bg-accent-soft dark:bg-accent-dark-soft')}
-                            title={`#${t.id}: ${t.title}`}
+                            title={`${taskChip(t)}: ${t.title}`}
                             onClick={() => {
                               setSelectedTaskId(selectedTaskId === t.id ? null : t.id);
                               setActiveMainTab('board');

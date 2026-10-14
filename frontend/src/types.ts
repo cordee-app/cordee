@@ -2,6 +2,7 @@ export interface Project {
   id: number;
   name: string;
   slug: string;
+  short_code?: string | null;
   path: string;
   project_type: string;
   eu_only?: boolean;
@@ -73,6 +74,7 @@ export type TaskStatus = 'pending' | 'confirmed' | 'running' | 'done' | 'failed'
 
 export interface Task {
   id: number;
+  display_code?: string | null;
   project_id: number;
   title: string;
   description: string;
@@ -105,6 +107,8 @@ export type ExecutionStatus = 'pending' | 'running' | 'done' | 'failed' | 'rejec
 export interface Execution {
   id: number;
   task_id: number;
+  task_display_code?: string | null;
+  exec_no?: number | null;
   chat_id?: number;
   status: ExecutionStatus;
   model: string;

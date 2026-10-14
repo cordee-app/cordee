@@ -11,6 +11,7 @@ import type { Execution, MemoryLevel } from '../types';
 import { CircleCheck, X, LoaderCircle, GitCommitHorizontal, GitBranch, GitMerge, Sparkles, RefreshCw, CircleSlash, ChevronRight, ChevronDown } from 'lucide-react';
 import { relUrl } from '../utils/file';
 import { stuckReason } from '../utils/stuck';
+import { execChip, taskChip } from '../utils/taskCode';
 
 const LOG_HEIGHT_KEY = 'log_panel_height';
 const COL_WIDTHS_KEY = 'superagent_exec_col_widths';
@@ -337,7 +338,7 @@ export const ExecutionLog = () => {
       const result = await api.memory.fork({ exec_id: execId, topic });
       setForkFormId(null);
       setForkFeedback('');
-      showToast(`Forked \u2014 new task #${result.new_task_id}, chat #${result.new_chat_id}`);
+      showToast(`Forked \u2014 new task ${taskChip({ id: result.new_task_id, display_code: result.new_task_display_code })}, chat #${result.new_chat_id}`);
       await refreshExecutions();
     } catch (err: unknown) {
       alert('Fork failed: ' + (err instanceof Error ? err.message : 'unknown error'));
@@ -351,7 +352,7 @@ export const ExecutionLog = () => {
 
   const handleView = async (execId: number) => {
     const exec = executions.find((x) => x.id === execId);
-    const title = `Output — ${exec?.task_title || 'Execution #' + execId}`;
+    const title = `Output — ${exec?.task_title || (exec ? execChip(exec) : 'Execution #' + execId)}`;
     setOutputModal({ open: true, title, content: '', loading: true });
     try {
       const d = await api.executions.output(execId);
@@ -367,7 +368,7 @@ export const ExecutionLog = () => {
   const handleError = (e: Execution) => {
     setErrorModal({
       open: true,
-      title: `Error — ${e.task_title || 'Execution #' + e.id}`,
+      title: `Error — ${e.task_title || execChip(e)}`,
       content: e.error_message || 'No error details available.',
     });
   };
@@ -381,7 +382,7 @@ export const ExecutionLog = () => {
       }
       const exec = executions.find((x) => x.id === execId);
       const title = exec
-        ? `Git Diff — ${exec.task_title || 'Execution #' + execId}`
+        ? `Git Diff — ${exec.task_title || execChip(exec)}`
         : `Git Diff — Execution #${execId}`;
       setDiffModal({ open: true, title, content: d.diff || '', baseBranch: d.base_branch, taskBranch: d.task_branch });
     } catch (err: unknown) {
@@ -461,7 +462,7 @@ export const ExecutionLog = () => {
                       <td className={cn(tdBase, 'text-center')}>
                         {e.task_id ? (
                           <button
-                            data-tip={`Open new chat for task #${e.task_id}`}
+                            data-tip={`Open new chat for task ${execChip(e)}`}
                             className="btn-xs"
                             style={{ color: '#7a5aa6', borderColor: 'rgba(122,90,166,.4)', background: 'rgba(122,90,166,.15)' }}
                             onClick={() => newChatForTask(e.task_id)}
@@ -484,7 +485,7 @@ export const ExecutionLog = () => {
                         )}
                       </td>
                       <td className={cn(tdBase, 'text-faint font-semibold')} style={{ fontVariantNumeric: 'tabular-nums' }}>
-                        {e.task_id ? `#${e.task_id}` : '\u2014'}
+                        {execChip(e)}
                       </td>
                       <td className={tdBase} title={e.instructions || e.task_title || ''}>
                         {instructions}
@@ -745,7 +746,7 @@ export const ExecutionLog = () => {
                           <span className="text-xs font-semibold rounded px-1.5 py-px" style={{ background: '#fff2eb', color: '#b2622d', border: '1px solid #b2622d' }} title={stuck}>⚠ may be stuck</span>
                         )}
                       </span>
-                      <span className="text-xs text-faint font-semibold" style={{ fontVariantNumeric: 'tabular-nums' }}>{e.task_id ? `#${e.task_id}` : '—'}</span>
+                      <span className="text-xs text-faint font-semibold" style={{ fontVariantNumeric: 'tabular-nums' }}>{execChip(e)}</span>
                       <span className="flex-1" />
                       <span className="text-xs text-status-done font-semibold" style={{ fontVariantNumeric: 'tabular-nums' }}>{fmtUsd(e.cost_usd)}</span>
                     </div>
@@ -758,7 +759,7 @@ export const ExecutionLog = () => {
                     </div>
                     <div className="flex gap-1.5 flex-wrap items-center">
                       {e.task_id ? (
-                        <button data-tip={`Open new chat for task #${e.task_id}`} className="btn-xs" style={{ color: '#7a5aa6', borderColor: 'rgba(122,90,166,.4)', background: 'rgba(122,90,166,.15)' }} onClick={() => newChatForTask(e.task_id)}>Chat</button>
+                         <button data-tip={`Open new chat for task ${execChip(e)}`} className="btn-xs" style={{ color: '#7a5aa6', borderColor: 'rgba(122,90,166,.4)', background: 'rgba(122,90,166,.15)' }} onClick={() => newChatForTask(e.task_id)}>Chat</button>
                       ) : e.chat_id ? (
                         <button data-tip="Open this execution's chat" className="btn-xs" style={{ color: '#7a5aa6', borderColor: 'rgba(122,90,166,.4)', background: 'rgba(122,90,166,.15)' }} onClick={() => window.dispatchEvent(new CustomEvent('aingel:open-chat', { detail: { chatId: e.chat_id } }))}>Chat</button>
                       ) : null}
@@ -1013,7 +1014,7 @@ const ExecFileCell = ({ exec }: { exec: Execution }) => {
           href={`/files/${activeProject}/${encodeURIComponent('Artifacts')}/${encodeURIComponent('outputs')}/exec-${exec.id}-output.md`}
           target="_blank" rel="noopener noreferrer"
           className="text-xs text-link hover:underline truncate"
-          title={`Output file (exec #${exec.id}, task #${exec.task_id})`}
+          title={`Output file (${execChip(exec)})`}
           style={{ maxWidth: 110 }}
         >
           <GitBranch size={11} className="inline-block align-[-2px] mr-0.5" /> output-{exec.task_id}.md

@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { useStore } from '../store';
 import { api } from '../api';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
+import { taskChip } from '../utils/taskCode';
 import type { Task } from '../types';
 
 interface Props {
@@ -153,7 +154,7 @@ export const TaskOverflowMenu = ({ task, isArchived = false, held = false }: Pro
   const handleArchive = async (e: React.MouseEvent) => {
     stop(e);
     closeAll();
-    if (!window.confirm(`Archive task #${task.id} "${task.title}"?`)) return;
+    if (!window.confirm(`Archive task ${taskChip(task)} "${task.title}"?`)) return;
     setBusy(true);
     try {
       await api.tasks.archive(task.id);
@@ -458,7 +459,7 @@ export const TaskOverflowMenu = ({ task, isArchived = false, held = false }: Pro
         <div style={overlayStyle} onClick={(e) => { if (e.target === e.currentTarget) setShowRedo(false); }}>
           <div style={modalStyle} onClick={(e) => e.stopPropagation()}>
             <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 8 }}>
-              Redo task #{task.id}?
+              Redo task {taskChip(task)}?
             </div>
             <div style={{ fontSize: 13, color: '#555', marginBottom: 14, lineHeight: 1.5 }}>
               This resets the task to <strong>pending</strong>. Actual cost, gate reports,
@@ -494,7 +495,7 @@ export const TaskOverflowMenu = ({ task, isArchived = false, held = false }: Pro
         <div style={overlayStyle} onClick={(e) => { if (e.target === e.currentTarget) closeDelete(); }}>
           <div style={modalStyle} onClick={(e) => e.stopPropagation()}>
             <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 8, color: '#c62828' }}>
-              Delete task #{task.id}?
+              Delete task {taskChip(task)}?
             </div>
             <div style={{ fontSize: 13, color: '#555', marginBottom: 14, lineHeight: 1.5 }}>
               This <strong>permanently removes</strong> the task.
@@ -534,7 +535,7 @@ export const TaskOverflowMenu = ({ task, isArchived = false, held = false }: Pro
         <div style={overlayStyle} onClick={(e) => { if (e.target === e.currentTarget) setShowDup(false); }}>
           <div style={modalStyle} onClick={(e) => e.stopPropagation()}>
             <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 10 }}>
-              Duplicate task #{task.id}
+              Duplicate task {taskChip(task)}
             </div>
             <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: '#555', marginBottom: 4 }}>
               New title

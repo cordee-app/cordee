@@ -2,10 +2,12 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useStore } from '../store';
 import { api } from '../api';
 import { cn } from '../utils/cn';
+import { taskChip } from '../utils/taskCode';
 import type { Task, DependencyEdge } from '../types';
 
 interface GraphNode {
   id: number;
+  code: string | null;
   title: string;
   status: string;
   project_id: number;
@@ -106,7 +108,8 @@ function buildGraphData(tasks: Task[], depRows: DependencyEdge[]): GraphData | n
     if (!task) continue;
     nodes.push({
       id: task.id,
-      title: task.title || `Task #${task.id}`,
+      code: task.display_code ?? null,
+      title: task.title || `Task ${taskChip(task)}`,
       status: task.status || 'pending',
       project_id: task.project_id,
       stale: false,
@@ -382,14 +385,14 @@ export const DependencyGraph = () => {
                     ...(node.primary ? {} : { opacity: 0.7, borderStyle: 'dashed' }),
                   }}
                   onClick={() => setModModalTaskId(node.id)}
-                  data-tip={`${node.title} · #${node.id} · ${STATUS_LABEL[node.status] || node.status}`}
+                  data-tip={`${node.title} · #${node.code ?? node.id} · ${STATUS_LABEL[node.status] || node.status}`}
                 >
                   <div className="gn-top flex justify-between items-center mb-1">
                     <span
                       className="gn-chip gn-task text-2xs px-[5px] py-px rounded-sm whitespace-nowrap font-semibold"
                       style={{ background: projectColor('').replace('hsl', ''), opacity: 0.15, color: '#645c50' }}
                     >
-                      Task #{node.id}
+                      Task #{node.code ?? node.id}
                     </span>
                     <span className={cn('status-badge', `sb-${badgeStatus}`, 'text-2xs px-[5px] py-px rounded-sm whitespace-nowrap font-semibold')}>
                       {statusGlyph(node.status)} {STATUS_LABEL[node.status] || node.status}

@@ -2,13 +2,31 @@ import { useState } from 'react';
 import { useStore } from '../store';
 import { api, ApiError } from '../api';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
+import { taskChip } from '../utils/taskCode';
 import type { Project } from '../types';
 
 type BlockKind = 'running' | 'confirmed';
 
+interface BlockTask {
+  id: number;
+  task_id?: number;
+  title?: string;
+  status?: string;
+  display_code?: string | null;
+  task_display_code?: string | null;
+  exec_no?: number | null;
+}
+
+/** Exec rows in the 409 block list: "#code·E<n>" when the payload carries the
+ *  new fields, else raw ids. Mirrors execChip with a raw-id fallback. */
+const execRef = (t: BlockTask): string =>
+  t.task_display_code
+    ? `#${t.task_display_code}${t.exec_no != null ? `\u00b7E${t.exec_no}` : ''}`
+    : `exec #${t.id}${t.task_id != null ? ` (task #${t.task_id})` : ''}`;
+
 interface BlockInfo {
   kind: BlockKind;
-  tasks: { id: number; title?: string; status?: string }[];
+  tasks: BlockTask[];
 }
 
 export const DeleteProjectModal = () => {
@@ -155,7 +173,9 @@ export const DeleteProjectModal = () => {
             <ul className="ml-4 list-disc space-y-0.5 max-h-40 overflow-y-auto">
               {block.tasks.map((t) => (
                 <li key={t.id} className="text-text-soft dark:text-text-dark-soft">
-                  #{t.id} — {t.title || '(untitled)'}
+                  {t.title
+                    ? `${taskChip(t)} — ${t.title}`
+                    : execRef(t)}
                 </li>
               ))}
             </ul>

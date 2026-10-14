@@ -30,6 +30,7 @@ import {
   Globe, ExternalLink, Clipboard, ClipboardCheck,
 } from 'lucide-react';
 import { cn } from '../utils/cn';
+import { taskChipById } from '../utils/taskCode';
 
 // ── Writable-root helpers (Batch 2: F3) — mirrors agent_files._WRITABLE_VARIANTS ──
 const WRITABLE_VARIANTS = ['My Docs', 'Working Docs', 'Working Documents', 'working-docs', 'docs'] as const;
@@ -1467,6 +1468,7 @@ const TaskGroupedView = ({ groups, projectId, onSelectTask, collapsed, setCollap
 }) => {
   const setActiveProject = useStore((s) => s.setActiveProject);
   const setActiveMainTab = useStore((s) => s.setActiveMainTab);
+  const tasks = useStore((s) => s.tasks);
   const handleTask = (id: number) => {
     if (onSelectTask) onSelectTask(id);
     setActiveProject(projectId);
@@ -1492,11 +1494,11 @@ const TaskGroupedView = ({ groups, projectId, onSelectTask, collapsed, setCollap
               </button>
               {g.task_id !== null ? (
                 <button
-                  data-tip={`Open task #${g.task_id} on the board`}
+                  data-tip={`Open task ${taskChipById(g.task_id, tasks)} on the board`}
                   onClick={() => handleTask(g.task_id!)}
                   className="flex-1 text-left font-medium text-sm cursor-pointer bg-transparent border-none p-0 text-link hover:underline"
                 >
-                  #{g.task_id} · {g.task_title || 'Untitled task'}
+                  {taskChipById(g.task_id, tasks)} · {g.task_title || 'Untitled task'}
                 </button>
               ) : (
                 <span className="flex-1 font-medium text-sm">{g.task_title}</span>

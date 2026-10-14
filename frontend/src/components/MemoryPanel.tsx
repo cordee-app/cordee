@@ -408,7 +408,7 @@ const ArtifactsTab = ({ data, fileUrl, executions }: { data: MemoryView; fileUrl
       if (execMatch) {
         const execId = parseInt(execMatch[1], 10);
         const exec = executions.find((e: any) => e.id === execId);
-        if (exec && exec.task_id) return `output-${exec.task_id}.md`;
+        if (exec && exec.task_id) return `output-${exec.task_display_code || exec.task_id}.md`;
       }
     }
     return f.name;
