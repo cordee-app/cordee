@@ -289,6 +289,18 @@ MODELS = {
         'cost_input': 0.432, 'cost_output': 0.864, 'context_window': 256000,
         'best_for': 'code, agentic, reasoning',
     },
+    'scw-deepseek-v4.1-flash': {
+        # deepseek-v4.1-flash: multimodal successor of deepseek-v4-flash-0731.
+        # Scaleway lists it as "Chat, code, and Vision" (text-only for the
+        # old -0731) at EUR 0.60 / 1.80 per 1M tokens; ×EUR_TO_USD. Verified
+        # empirically 2026-10-15: image content-parts are accepted and
+        # described correctly, while -0731 rejects them with 400
+        # "not a multimodal model". Tools + reasoning supported (Scaleway
+        # pricing metadata), max output 32768, context 256k.
+        'label': 'SCW DeepSeek-V4.1 Flash', 'provider': 'scaleway',
+        'cost_input': 0.648, 'cost_output': 1.944, 'context_window': 256000,
+        'best_for': 'code, agentic, vision, reasoning',
+    },
     'scw-qwen3.8-27b': {
         # qwen3.8-27b: vision-language dense model (builds on 3.6-27B, improved
         # coding + office productivity, text and visual). Scaleway price
@@ -603,6 +615,7 @@ PRICING = {
     'codex-chatgpt':             {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
     # Scaleway Generative API — EUR×EUR_TO_USD → USD/M tokens
     'scw-deepseek-v4-flash':     {'input': 0.432, 'output': 0.864, 'cache_write': 0, 'cache_read': 0},
+    'scw-deepseek-v4.1-flash':   {'input': 0.648, 'output': 1.944, 'cache_write': 0, 'cache_read': 0},
     'scw-qwen3.8-27b':           {'input': 0.648, 'output': 3.564, 'cache_write': 0, 'cache_read': 0},
     'scw-gpt-oss-120b':          {'input': 0.162, 'output': 0.648, 'cache_write': 0, 'cache_read': 0},
     'scw-llama-3.3-70b':         {'input': 0.972, 'output': 0.972, 'cache_write': 0, 'cache_read': 0},

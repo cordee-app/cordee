@@ -267,6 +267,13 @@ def _init_project_db_schema(conn):
         ('context_used_json', 'TEXT'),
         # Multi-tenancy (Phase 1): creating user; NULL = pre-multi-tenancy.
         ('created_by', 'INTEGER DEFAULT NULL'),
+        # Pause at the limit (TODO item 16): why the run paused ('turns' |
+        # 'time'; kept after it ends, so a stopped-at-limit run shows it) and
+        # how many parts (blocks of turns) it has run.
+        ('pause_reason', 'TEXT'),
+        ('segments', 'INTEGER DEFAULT 1'),
+        # The report shown while paused: facts from code + the Guide's read.
+        ('pause_report_json', 'TEXT'),
     ]:
         _add_column_if_missing(conn, 'executions', col, defn)
     # ── Indexes (after migrations so newly-added columns are indexed safely) ───
@@ -642,6 +649,75 @@ def _get_chat_reg(chat_id):
     return dict(row) if row else None
 
 
+# ── Pending chat commits (aingel.db) ─────────────────────────────────────────
+
+def add_pending_chat_commit(project_path, chat_id, chat_name):
+    """Queue a chat commit that was skipped because a task held the lock."""
+    if not project_path or chat_id is None:
+        return False
+    conn = get_db()
+    try:
+        conn.execute(
+            'INSERT OR IGNORE INTO pending_chat_commits (project_path, chat_id, chat_name) '
+            'VALUES (?, ?, ?)',
+            (project_path, int(chat_id), chat_name or ''))
+        conn.commit()
+        return True
+    except sqlite3.OperationalError:
+        # Table not created yet (init_db has not run in this process).
+        return False
+    finally:
+        conn.close()
+
+
+def list_pending_chat_commits(project_path):
+    """Pending rows for a project, oldest first. Empty if the table is missing."""
+    if not project_path:
+        return []
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            'SELECT * FROM pending_chat_commits WHERE project_path=? ORDER BY id ASC',
+            (project_path,)).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+
+def drop_pending_chat_commit(row_id):
+    """Remove a pending row (committed, or given up after repeated failures)."""
+    if row_id is None:
+        return False
+    conn = get_db()
+    try:
+        conn.execute('DELETE FROM pending_chat_commits WHERE id=?', (row_id,))
+        conn.commit()
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+
+
+def bump_pending_chat_commit(row_id, error):
+    """Record a failed flush attempt (attempts+1, last_error)."""
+    if row_id is None:
+        return False
+    conn = get_db()
+    try:
+        conn.execute(
+            'UPDATE pending_chat_commits SET attempts=attempts+1, last_error=? WHERE id=?',
+            ((error or '')[:1000], row_id))
+        conn.commit()
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+
+
 def _all_project_paths():
     """Return [(project_id, project_path)] for all projects with a project.db."""
     conn = get_db()
@@ -844,6 +920,18 @@ def init_db():
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             project_id   INTEGER,
             project_path TEXT
+        );
+        -- Chat git commits skipped because a task held the project lock. Flushed
+        -- by the executor once a run holds the lock on the default branch.
+        CREATE TABLE IF NOT EXISTS pending_chat_commits (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_path TEXT NOT NULL,
+            chat_id      INTEGER NOT NULL,
+            chat_name    TEXT,
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            attempts     INTEGER NOT NULL DEFAULT 0,
+            last_error   TEXT,
+            UNIQUE(project_path, chat_id)
         );
         CREATE TABLE IF NOT EXISTS scw_deployments (
             id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1382,6 +1470,48 @@ def _older_than_minutes(ts, minutes):
     return (datetime.now(timezone.utc) - dt).total_seconds() > minutes * 60
 
 
+_AGENT_CLI_NAMES = ('vibe', 'claude', 'codex', 'opencode')
+
+
+def _stop_orphan_cli(pid, proj_path, exec_id):
+    """Stop the agent CLI of an execution the sweep is about to mark failed.
+
+    A stale heartbeat means the process that started the run (and its 30 s
+    heartbeat thread) is gone — but the CLI child, started in its own session,
+    keeps running unsupervised. On 2026-10-15 Guide turns started from a
+    one-off runner process were marked "Orphaned" while their Vibe child went
+    on committing to the project (14090e4/559ab69 at 15:40, row failed 15:50).
+
+    Only a live process whose command is a known agent CLI and whose working
+    directory is inside this project is stopped (SIGTERM to its process group).
+    Anything else — a reused pid, an unrelated process — is left alone.
+    """
+    if not pid:
+        return False
+    import signal as _signal
+    try:
+        pid = int(pid)
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            argv = [a.decode('utf-8', 'replace') for a in f.read().split(b'\0') if a]
+        cwd = os.path.realpath(os.readlink(f'/proc/{pid}/cwd'))
+    except (OSError, ValueError):
+        return False
+    names = {os.path.basename(a) for a in argv[:2]}
+    if not names & set(_AGENT_CLI_NAMES):
+        return False
+    root = os.path.realpath(proj_path)
+    if cwd != root and not cwd.startswith(root + os.sep):
+        return False
+    try:
+        os.killpg(os.getpgid(pid), _signal.SIGTERM)
+    except OSError:
+        return False
+    logging.getLogger(__name__).warning(
+        '[orphan sweep] stopped CLI pid %s (%s) of orphaned exec %s in %s',
+        pid, ' '.join(argv[:2]), exec_id, proj_path)
+    return True
+
+
 def reset_orphaned_executions(reason='tick'):
     """Mark stale running executions as failed across all project DBs.
 
@@ -1401,10 +1531,11 @@ def reset_orphaned_executions(reason='tick'):
         try:
             pconn = get_project_db(proj_path)
             orphans = pconn.execute(
-                "SELECT id, task_id FROM executions WHERE status='running' "
+                "SELECT id, task_id, child_pid FROM executions WHERE status='running' "
                 "AND COALESCE(last_heartbeat_at, started_at) < datetime('now', '-10 minutes')"
             ).fetchall()
             for row in orphans:
+                _stop_orphan_cli(row['child_pid'], proj_path, row['id'])
                 pconn.execute(
                     "UPDATE executions SET status='failed', "
                     "error_message=?, finished_at=? WHERE id=?",
@@ -3395,23 +3526,25 @@ def update_task(task_id, project_path=None, **kwargs):
     agent_guide_sync.after_task_change(project_path, project_id=proj_id, task_id=task_id)
 
 
-def claim_task(task_id, project_path=None):
+def claim_task(task_id, project_path=None, from_statuses=('confirmed', 'pending')):
     """Atomically claim a task for execution.
 
-    Moves the row from pending/confirmed to running in a single guarded UPDATE
-    and reports whether *this* caller won. Two concurrent runners therefore
-    cannot both start the same task.
+    Moves the row from pending/confirmed (or ``from_statuses``; a resumed run
+    claims from 'paused') to running in a single guarded UPDATE and reports
+    whether *this* caller won. Two concurrent runners therefore cannot both
+    start the same task.
     """
     if not project_path:
         project_path = _get_task_path(task_id)
     if not project_path:
         return False
+    from_statuses = tuple(from_statuses)
     pconn = get_project_db(project_path)
     try:
         cur = pconn.execute(
             "UPDATE tasks SET status='running', updated_at=? "
-            "WHERE id=? AND status IN ('confirmed','pending')",
-            (datetime.now(timezone.utc).isoformat(), task_id))
+            f"WHERE id=? AND status IN ({','.join('?' * len(from_statuses))})",
+            (datetime.now(timezone.utc).isoformat(), task_id, *from_statuses))
         pconn.commit()
         claimed = cur.rowcount == 1
     finally:
@@ -3760,6 +3893,17 @@ def flag_stale_dependents(task_id, include_done=False):
             pconn.commit()
             pconn.close()
             count += changed
+            if changed:
+                # Push the flag to any open board now: without this the
+                # dependent's card only learns about the stale flag on its
+                # next 30s poll, so the user can stare at a "fresh" card
+                # while its upstream work is being redone. Dependents can
+                # live in another project (deps are cross-project), so the
+                # project id is resolved from the task — the same mechanism
+                # update_task uses for its own task_changed emission.
+                proj_id = _resolve_project_id(task_id=tid, project_path=pp)
+                if proj_id is not None:
+                    _emit_safe(proj_id, {'type': 'task_changed', 'task_id': tid})
         except Exception:
             pass
     return count
@@ -3870,6 +4014,15 @@ def create_execution(task_id, model, chat_id=None, project_path=None, created_by
 def finish_execution(exec_id, status, tokens_input=0, tokens_output=0,
                      cost_usd=0.0, output_summary='', error_message='',
                      project_path=None):
+    """Close a running execution row.
+
+    Usage columns use MAX(COALESCE(...), ?) so a zero-usage finish can never
+    wipe nonzero live-tracked usage: failure handlers used to call this with
+    default zeros, which erased the heartbeat-tracked tokens of a failed
+    Scaleway run (1.23M tokens actually billed, recorded as 0/0/$0.00).
+    Higher final values still win; the status='running' guard (a late
+    finish after /cancel no-ops) is unchanged.
+    """
     if not project_path:
         reg = _get_exec_reg(exec_id)
         project_path = reg['project_path'] if reg else None
@@ -3877,7 +4030,10 @@ def finish_execution(exec_id, status, tokens_input=0, tokens_output=0,
         return
     pconn = get_project_db(project_path)
     pconn.execute(
-        'UPDATE executions SET status=?, tokens_input=?, tokens_output=?, cost_usd=?, '
+        'UPDATE executions SET status=?, '
+        'tokens_input=MAX(COALESCE(tokens_input,0), ?), '
+        'tokens_output=MAX(COALESCE(tokens_output,0), ?), '
+        'cost_usd=MAX(COALESCE(cost_usd,0), ?), '
         'output_summary=?, error_message=?, child_pid=NULL, '
         "finished_at=CURRENT_TIMESTAMP WHERE id=? AND status='running'",
         (status, tokens_input, tokens_output, cost_usd, output_summary, error_message, exec_id)
@@ -3890,6 +4046,74 @@ def finish_execution(exec_id, status, tokens_input=0, tokens_output=0,
         _emit_safe(proj_id, {'type': 'execution_changed', 'exec_id': exec_id})
         # Also emit cost_changed since finish_execution writes cost_usd
         _emit_safe(proj_id, {'type': 'cost_changed'})
+
+
+def pause_execution(exec_id, reason, tokens_input, tokens_output, cost_usd,
+                    output_summary='', project_path=None):
+    """Running → paused at a turn/time limit (TODO item 16). Usage is the
+    run's cumulative total so far. No finished_at: the run isn't over."""
+    if not project_path:
+        reg = _get_exec_reg(exec_id)
+        project_path = reg['project_path'] if reg else None
+    if not project_path:
+        return False
+    pconn = get_project_db(project_path)
+    cur = pconn.execute(
+        "UPDATE executions SET status='paused', pause_reason=?, "
+        'tokens_input=MAX(COALESCE(tokens_input,0), ?), '
+        'tokens_output=MAX(COALESCE(tokens_output,0), ?), '
+        'cost_usd=MAX(COALESCE(cost_usd,0), ?), '
+        "output_summary=?, child_pid=NULL WHERE id=? AND status='running'",
+        (reason, tokens_input, tokens_output, cost_usd, output_summary, exec_id))
+    pconn.commit()
+    changed = cur.rowcount
+    pconn.close()
+    proj_id = _resolve_project_id(exec_id=exec_id, project_path=project_path)
+    if proj_id is not None:
+        _emit_safe(proj_id, {'type': 'execution_changed', 'exec_id': exec_id})
+        _emit_safe(proj_id, {'type': 'cost_changed'})
+    return bool(changed)
+
+
+def update_execution_pause_report(exec_id, report, project_path=None):
+    """Store the pause report (dict) on the execution row."""
+    if not project_path:
+        reg = _get_exec_reg(exec_id)
+        project_path = reg['project_path'] if reg else None
+    if not project_path:
+        return
+    pconn = get_project_db(project_path)
+    pconn.execute('UPDATE executions SET pause_report_json=? WHERE id=?',
+                  (json.dumps(report, ensure_ascii=False), exec_id))
+    pconn.commit()
+    pconn.close()
+    proj_id = _resolve_project_id(exec_id=exec_id, project_path=project_path)
+    if proj_id is not None:
+        _emit_safe(proj_id, {'type': 'execution_changed', 'exec_id': exec_id})
+
+
+def reopen_paused_execution(exec_id, new_segment=True, project_path=None):
+    """Paused → running, for Continue (``new_segment`` counts another part)
+    or for Stop (finishing through the normal paths, which need 'running').
+    Returns False when the row isn't paused (double click, already stopped)."""
+    if not project_path:
+        reg = _get_exec_reg(exec_id)
+        project_path = reg['project_path'] if reg else None
+    if not project_path:
+        return False
+    pconn = get_project_db(project_path)
+    cur = pconn.execute(
+        "UPDATE executions SET status='running', last_heartbeat_at=datetime('now'), "
+        'segments=COALESCE(segments,1) + ? '
+        "WHERE id=? AND status='paused'",
+        (1 if new_segment else 0, exec_id))
+    pconn.commit()
+    changed = cur.rowcount
+    pconn.close()
+    proj_id = _resolve_project_id(exec_id=exec_id, project_path=project_path)
+    if proj_id is not None:
+        _emit_safe(proj_id, {'type': 'execution_changed', 'exec_id': exec_id})
+    return bool(changed)
 
 
 def update_execution_tokens(exec_id, tokens_input, tokens_output, project_path=None):
@@ -4093,8 +4317,10 @@ def get_executions(limit=50):
                        e.tokens_input, e.tokens_output, e.started_at, e.finished_at,
                        e.last_heartbeat_at, e.child_pid, e.chat_id, e.aingel_brief,
                        e.error_message, e.git_branch, e.git_commit, e.git_diffstat,
+                       e.git_merge_commit,
                        e.memory_status, e.gpu_cost_usd, e.batch_parent_id, e.session_id,
                        e.rag_label, e.rag_provenance_json, e.context_used_json,
+                       e.pause_reason, e.segments, e.pause_report_json,
                        t.title task_title, t.external_id task_ext_id,
                        t.display_code task_display_code,
                        CASE WHEN e.task_id IS NULL THEN NULL

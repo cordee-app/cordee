@@ -4,6 +4,8 @@ import { api } from '../api';
 import { cn } from '../utils/cn';
 import { taskChip, isTaskCode } from '../utils/taskCode';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
+import { addDependencyWithGate } from '../utils/deps';
+import { useUnmetDepsConfirm, UnmetDepsConfirmDialog } from './UnmetDepsConfirm';
 import type { Dependency, TaskDependencies } from '../types';
 
 export const DependenciesModal = () => {
@@ -11,6 +13,10 @@ export const DependenciesModal = () => {
   const setDepsModalTaskId = useStore((s) => s.setDepsModalTaskId);
   const tasks = useStore((s) => s.tasks);
   const setTasks = useStore((s) => s.setTasks);
+  const refreshDepEdges = useStore((s) => s.refreshDepEdges);
+
+  // Dependency-gate confirm (not-done deps block the task from running).
+  const unmetConfirm = useUnmetDepsConfirm();
 
   const [deps, setDeps] = useState<TaskDependencies | null>(null);
   const [addInput, setAddInput] = useState('');
@@ -60,9 +66,51 @@ export const DependenciesModal = () => {
       await loadDeps();
       const refreshed = await api.tasks.list();
       setTasks(refreshed);
+      refreshDepEdges();
     } catch (e: unknown) {
       alert('Error: ' + (e as Error).message);
     }
+  };
+
+  // Shared gate for both add paths: pre-confirm when the dep's status is
+  // known from the store (quick-picks always are; code-resolved deps may be
+  // cross-project and missing), then let addDependencyWithGate handle the
+  // 409 dependency_not_done backstop (confirm → retry with acknowledged).
+  const addDepWithGate = async (inputId: number) => {
+    if (depsModalTaskId === null) return;
+    const depTask = tasks.find((t) => t.id === inputId);
+    const notDone = Boolean(depTask && depTask.status !== 'done');
+    if (notDone && depTask) {
+      const ok = await unmetConfirm.confirm(
+        [{
+          id: depTask.id,
+          display_code: depTask.display_code ?? undefined,
+          title: depTask.title,
+          status: depTask.status,
+        }],
+        'add',
+      );
+      if (!ok) return;
+    }
+    const res = await addDependencyWithGate(
+      depsModalTaskId,
+      inputId,
+      notDone,
+      (unmet) => unmetConfirm.confirm(unmet, 'add'),
+    );
+    if (!res.ok) {
+      // The not-done case was confirmed (or declined) inside the gate —
+      // surface only real errors; declines stay silent.
+      if (res.error !== undefined) {
+        setAddError(res.error instanceof Error ? res.error.message : 'Failed to add dependency');
+      }
+      return;
+    }
+    setAddInput('');
+    await loadDeps();
+    const refreshed = await api.tasks.list();
+    setTasks(refreshed);
+    refreshDepEdges();
   };
 
   const handleAddDep = async () => {
@@ -90,31 +138,17 @@ export const DependenciesModal = () => {
       return;
     }
     setAddError('');
-    try {
-      await api.tasks.dependencies.add(depsModalTaskId, { depends_on_id: inputId });
-      setAddInput('');
-      await loadDeps();
-      const refreshed = await api.tasks.list();
-      setTasks(refreshed);
-    } catch (e: unknown) {
-      setAddError((e as Error).message || 'Failed to add dependency');
-    }
+    await addDepWithGate(inputId);
   };
 
   const handleQuickPick = async (id: number) => {
     if (depsModalTaskId === null) return;
     setAddError('');
-    try {
-      await api.tasks.dependencies.add(depsModalTaskId, { depends_on_id: id });
-      await loadDeps();
-      const refreshed = await api.tasks.list();
-      setTasks(refreshed);
-    } catch (e: unknown) {
-      setAddError((e as Error).message || 'Failed to add dependency');
-    }
+    await addDepWithGate(id);
   };
 
   const closeModal = () => {
+    unmetConfirm.settle(false); // never leave an awaited gate confirm hanging
     setDepsModalTaskId(null);
   };
 
@@ -299,6 +333,15 @@ export const DependenciesModal = () => {
                         >
                           {taskChip(t)} {t.title.slice(0, 30)}
                           {t.title.length > 30 ? '\u2026' : ''}
+                          {t.status !== 'done' && (
+                            <span
+                              className="ml-1 font-semibold"
+                              style={{ color: '#b2622d' }}
+                              title="Not done — the task will be blocked from running until this dependency finishes"
+                            >
+                              · {t.status}
+                            </span>
+                          )}
                         </button>
                       ))}
                     {siblingTasks.filter(
@@ -322,6 +365,14 @@ export const DependenciesModal = () => {
           </button>
         </div>
       </div>
+
+      {/* Dependency-gate confirm — overlays the modal (z-toast) so it can't
+          be dismissed behind its back. */}
+      <UnmetDepsConfirmDialog
+        state={unmetConfirm.state}
+        onConfirm={() => unmetConfirm.settle(true)}
+        onCancel={() => unmetConfirm.settle(false)}
+      />
     </div>
   );
 };

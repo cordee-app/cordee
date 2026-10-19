@@ -70,7 +70,7 @@ export interface Model {
   free_allowed?: boolean;
 }
 
-export type TaskStatus = 'pending' | 'confirmed' | 'running' | 'done' | 'failed' | 'skip' | 'cancelled';
+export type TaskStatus = 'pending' | 'confirmed' | 'running' | 'paused' | 'done' | 'failed' | 'skip' | 'cancelled';
 
 export interface Task {
   id: number;
@@ -102,7 +102,7 @@ export interface Task {
   execution_type?: string | null;
 }
 
-export type ExecutionStatus = 'pending' | 'running' | 'done' | 'failed' | 'rejected' | 'skipped';
+export type ExecutionStatus = 'pending' | 'running' | 'paused' | 'done' | 'failed' | 'rejected' | 'skipped';
 
 export interface Execution {
   id: number;
@@ -119,6 +119,12 @@ export interface Execution {
   started_at?: string;
   finished_at?: string;
   last_heartbeat_at?: string;
+  /** Pause at the limit (TODO item 16): 'turns' | 'time'; kept after the run ends. */
+  pause_reason?: string | null;
+  /** Parts (blocks of turns) the run has used. */
+  segments?: number | null;
+  /** JSON: {facts, guide, created_at} — the report shown while paused. */
+  pause_report_json?: string | null;
   instructions?: string;
   git_commit?: string;
   git_branch?: string;
@@ -160,7 +166,7 @@ export interface Chat {
 }
 
 export interface ChatTranscriptEntry {
-  role: 'user' | 'assistant' | 'system';
+  role: 'user' | 'assistant' | 'system' | 'notice';
   content: string;
   timestamp: string;
 }
@@ -264,6 +270,43 @@ export interface DependencyEdge {
 export interface TaskDependencies {
   depends_on: Dependency[];
   depended_on_by: Dependency[];
+}
+
+/** One unmet (not done) dependency, as carried by every dependency-gate
+ *  surface: the 409 dep-add body, the run refusal, the SSE `dep_blocked`
+ *  event and the PATCH slot-assign warning. `id` is the depended-on task's
+ *  id (registry ids are numeric today; string is tolerated for safety). */
+export interface UnmetDep {
+  id: number | string;
+  display_code?: string;
+  title: string;
+  status: string;
+}
+
+/** POST /api/execute refusal when the task's dependencies aren't all done
+ *  (deps-done gate): no execution row is created, the task stays as-is. */
+export interface DepBlockedResult {
+  status: 'dep_blocked';
+  task_id: number;
+  /** Human-readable one-liner, e.g. "Blocked by unmet dependencies: RP-077 (pending)". */
+  error?: string;
+  unmet?: UnmetDep[];
+}
+
+/** One dep-skipped task in run-all / column-run responses. */
+export interface SkippedByDeps {
+  task_id: number;
+  title: string;
+  unmet: UnmetDep[];
+}
+
+/** PATCH /api/tasks/<id> response warning: the update still applied (e.g.
+ *  the slot was assigned) but the dependency gate will refuse to run the
+ *  task until its deps are done. Toasted by the UI; the card badge carries
+ *  the detail. */
+export interface TaskUpdateWarning {
+  type: 'dep_blocked';
+  unmet: UnmetDep[];
 }
 
 export interface Role {

@@ -32,10 +32,74 @@ import logging
 _log = logging.getLogger('agent_overseer')
 
 # Hard cap on the output snippet we send to H3. The full output lives in
-# Artifacts/outputs/exec-<id>-output.md; we only send the first N chars to
-# keep the overseer's context under ~5k tokens.
-_OUTPUT_SNIPPET_CHARS = 4000
+# Artifacts/outputs/<task>/exec-<id>-output.md; H3 gets its head and its tail
+# (~6k chars, ~2k tokens). Tail-heavy: an agentic transcript ends with the
+# model's own verdict. RP-087 E5 said "deliverable not produced" at char 7661
+# of 15612 and H3, shown only the first 4000, approved it.
+_OUTPUT_HEAD_CHARS = 2000
+_OUTPUT_TAIL_CHARS = 4000
+_OUTPUT_SNIPPET_CHARS = _OUTPUT_HEAD_CHARS + _OUTPUT_TAIL_CHARS
+# The task description H3 judges the output against (it used to get the title only).
+# 1500 chars was too tight for description-heavy tasks: RP-088's H3 never saw
+# the Output section (the mandated deliverable paths) or the clarifications
+# block, so it 'correctly' judged against requirements it was never shown —
+# flagging the mandated shared/ paths as a containment breach and dedup as a
+# spec violation. Long enough to carry instructions + outputs + clarifications.
+_H3_DESC_CHARS = 4000
 _OVERVIEW_MAX_CHARS = 8000  # ~2k words
+
+
+def _budget_keys(model: str, caller: str) -> List[str]:
+    """kv keys remembering the smallest max_tokens that worked, most specific first."""
+    return [f'overseer_budget:{model}:{caller}', f'overseer_budget:{model}']
+
+
+def _remembered_budget(model: str, caller: str, budget: int, ceiling: int) -> Optional[int]:
+    """Read the remembered max_tokens for this model/caller, clamped to [budget, ceiling].
+
+    Returns None when nothing usable is stored, or when ``app_settings`` is
+    unavailable — the caller then starts the ladder exactly as before.
+    """
+    try:
+        from agent_db import get_app_settings
+        settings = get_app_settings() or {}
+    except Exception:
+        return None
+    for key in _budget_keys(model, caller):
+        try:
+            val = int(str(settings.get(key)).strip())
+        except Exception:
+            continue
+        return max(budget, min(val, ceiling))
+    return None
+
+
+def _remember_budget(model: str, caller: str, max_tokens: int) -> None:
+    """Persist the max_tokens that succeeded under both keys. Never raises."""
+    try:
+        from agent_db import set_app_setting
+        for key in _budget_keys(model, caller):
+            try:
+                set_app_setting(key, str(max_tokens))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _build_ladder(budget: int, ceiling: int, start: Optional[int] = None) -> List[int]:
+    """Retry ladder: ``start`` (or ``budget``) then doubling up to ``ceiling``.
+
+    At most 4 rungs. A remembered start skips the rungs that already failed:
+    starting at 8192 with a 12000 ceiling yields ``[8192, 12000]``.
+    """
+    first = budget if start is None else max(budget, min(int(start), ceiling))
+    ladder = [first]
+    for _k in range(3):
+        nxt = min(ladder[-1] * 2, ceiling)
+        if nxt > ladder[-1]:
+            ladder.append(nxt)
+    return ladder
 
 
 def _ask(model: str, prompt: str, want_tokens: int, project_path: str, caller: str,
@@ -59,7 +123,7 @@ def _ask(model: str, prompt: str, want_tokens: int, project_path: str, caller: s
     produced nothing instead of silently passing.
     """
     from agent_router import route
-    from model_caps import effective_max_tokens
+    from model_caps import effective_max_tokens, get_cap
 
     def _ok(t):
         if not t or not t.strip():
@@ -68,9 +132,27 @@ def _ask(model: str, prompt: str, want_tokens: int, project_path: str, caller: s
 
     budget = effective_max_tokens(model, want_tokens)
     last_err = None
-    # Second attempt doubles the budget: an empty or unparseable reply from a
-    # model that answered the same prompt a moment ago is nearly always truncation.
-    for attempt, mt in enumerate((budget, min(budget * 2, 8192)), start=1):
+    # Retry ladder doubles until the model cap or 8192, up to 4 attempts.
+    # Two attempts (want, want*2) were not enough for reviewers whose JSON
+    # runs verbose: mistral-large-4 truncated at 900 AND 1800 on the RP-089
+    # H3 (findings + brief exceed the terse-model budget), and the failure
+    # reads as 'oversight unavailable' — which then degrades every gate
+    # decision downstream of it.
+    # The ceiling is the model's own max_tokens (at least 8192, at most
+    # 16384): a reasoning model's thinking counts against it, and GLM-5.3
+    # (cap 12000) came back empty at both 4096 and 8192 on RP-094's H2, so the
+    # run went ahead with no pre-run check.
+    try:
+        ceiling = int(get_cap(model).get('max_tokens') or 8192)
+    except Exception:
+        ceiling = 8192
+    ceiling = max(8192, min(ceiling, 16384))
+    # Start the ladder where this model/caller last succeeded, so a reviewer
+    # that needs 8192 does not burn the 2048 and 4096 rungs (each returning
+    # empty content or truncated JSON) on every single call.
+    ladder = _build_ladder(budget, ceiling,
+                           _remembered_budget(model, caller, budget, ceiling))
+    for attempt, mt in enumerate(ladder, start=1):
         try:
             # Force the plain API route — never an agentic one. This is a lightweight
             # check, not a task run: an agentic route has real file/bash access and can
@@ -94,14 +176,15 @@ def _ask(model: str, prompt: str, want_tokens: int, project_path: str, caller: s
         if _ok(text):
             if attempt > 1:
                 _log.info('[%s] recovered on retry at max_tokens=%d', caller, mt)
+            _remember_budget(model, caller, mt)
             return text, None
         last_err = ('empty response' if not (text or '').strip()
                     else 'reply was not parseable JSON')
-        _log.warning('[%s] %s at max_tokens=%d (attempt %d): %s',
-                     caller, last_err, mt, attempt, (text or '')[:200])
-        if mt >= 8192:
+        _log.info('[%s] %s at max_tokens=%d (attempt %d): %s',
+                  caller, last_err, mt, attempt, (text or '')[:200])
+        if mt >= ceiling:
             break
-    return None, f'{last_err} after 2 attempts (model={model})'
+    return None, f'{last_err} after {attempt} attempts (model={model})'
 
 
 def _safe_json(text: str) -> Optional[Dict[str, Any]]:
@@ -368,9 +451,14 @@ def _has_file_extension(ref: str) -> bool:
 # A file the task is told to CREATE is not a missing input. The verb must sit
 # right before the filename with no "of/from/using/read..." in between, so
 # "Create a summary of `x.pdf`" still treats x.pdf as an input.
+# 'output' is the verb of the most common instruction in this repo —
+# "Output a single markdown file named `X.md`" — and its absence made
+# every such deliverable look like a missing input (RP-087: H2 held the
+# map-task for a file the task itself was told to create). The gap check
+# still protects the noun use: "the output of `X.md`" keeps X an input.
 _OUTPUT_VERB_RE = re.compile(
     r'\b(?:save|saved|saving|write|writing|create|created|creating|produce|'
-    r'generate|generated|export|store)\b(?P<gap>[^\n`"\']{0,60})$', re.I)
+    r'generate|generated|export|store|output|outputs|outputting)\b(?P<gap>[^\n`"\']{0,60})$', re.I)
 # Imperative naming at the start of a sentence: "Name the output file … 'X.md'".
 # No input-word check: "using the decision number" there describes the name.
 # Only consulted for files that do not exist yet, so a renamed source is safe.
@@ -382,6 +470,15 @@ _PLACEHOLDER_RE = re.compile(
 # The description asks for the shared library: "RAG" as a word, or
 # "rag library/system/corpus" in any case.
 _RAG_REQUEST_RE = re.compile(r'\bRAG\b|\b(?i:rag)\s+(?i:library|system|corpus)\b')
+# "… a single Markdown file named `X.md`": the noun + "named/called" names
+# the file to produce even without a create/write verb next to it (RP-094:
+# "list them in a single Markdown file named `P30a_stops.md`" was missed, so
+# the pause report showed no deliverable and H3 couldn't hold on it). Only the
+# clause after the last quoted reference counts, and an input verb in it
+# ("Read the file named `x.pdf`") keeps it an input.
+_NAMED_FILE_RE = re.compile(
+    r'\b(?:file|document|report|table|sheet|spreadsheet|deck|page|note|list)\s+'
+    r'(?:named|called|titled)\s*$', re.I)
 _INPUT_WORD_RE = re.compile(
     r'\b(?:of|from|using|based on|read|open|extract|analy[sz]e|review|'
     r'summari[sz]e|compare|parse|load|consult)\b', re.I)
@@ -407,8 +504,10 @@ def _output_target_refs(description: str, refs: List[str]) -> set:
             # Drop the quote/backtick that opens the reference itself.
             before = desc[line_start:i].rstrip('`"\'')[-90:]
             m = _OUTPUT_VERB_RE.search(before)
+            clause = re.split(r'[`"\']', before)[-1]
+            named = _NAMED_FILE_RE.search(clause) and not _INPUT_WORD_RE.search(clause)
             if (m and not _INPUT_WORD_RE.search(m.group('gap'))) or _NAME_VERB_RE.search(before) \
-                    or _list_parent_is_output(desc, line_start, before):
+                    or named or _list_parent_is_output(desc, line_start, before):
                 targets.add(ref)
                 break
     return targets
@@ -419,6 +518,9 @@ _LIST_MARKER_RE = re.compile(r'^\s*(?:[-*•+]|\d+[.)])\s+')
 # "Output(s):" heading — after list markers and markdown emphasis.
 _OUTPUT_PARENT_RE = re.compile(
     r'^(?:save|write|create|produce|generate|export|store)\b|^outputs?\b', re.I)
+# A line that already names a file: "Save the report as `final.md`". A wrapped
+# reference on the next line is not that line's output (RP-099).
+_QUOTED_FILE_RE = re.compile(r'[`"\'][^`"\']+\.[A-Za-z0-9]{1,6}[`"\']')
 
 
 def _list_parent_is_output(desc: str, line_start: int, before: str) -> bool:
@@ -427,16 +529,26 @@ def _list_parent_is_output(desc: str, line_start: int, before: str) -> bool:
         - Produce two separate text files:
           - `UTK_reply_option1.txt` (…)
 
+    RP-099: the filename may be wrapped onto the next line, leaving `before`
+    empty; that is accepted only as an indented continuation line, e.g.
+        - Save the modified PowerPoint as:
+          `Deck_with_Polish_Plan.pptx`
+
     The parent is the nearest earlier line with less indentation (#10001186).
     """
-    if not _LIST_MARKER_RE.match(before) or _LIST_MARKER_RE.sub('', before).strip(' `*_"\''):
-        return False  # not a bare list item holding just the reference
     indent = len(before) - len(before.lstrip())
+    if _LIST_MARKER_RE.match(before):
+        if _LIST_MARKER_RE.sub('', before).strip(' `*_"\''):
+            return False  # not a bare list item holding just the reference
+    elif before.strip() or indent == 0:
+        return False  # not a marker-less, indented wrapped continuation (RP-099)
     lines = desc[:line_start].rstrip('\n').split('\n')
     for line in reversed(lines[-12:]):
         if not line.strip():
             continue
         if len(line) - len(line.lstrip()) < indent:
+            if _QUOTED_FILE_RE.search(line):
+                continue  # parent names its own file: not this ref's parent
             head = _LIST_MARKER_RE.sub('', line).strip().lstrip('*_ ')
             return bool(_OUTPUT_PARENT_RE.match(head))
     return False
@@ -567,7 +679,8 @@ def pre_run_check(task: Dict[str, Any],
                   dep_titles: List[str],
                   budget_snapshot: Optional[Dict[str, Any]] = None,
                   dep_outcomes: Optional[List[Dict[str, Any]]] = None,
-                  rag_provenance: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                  rag_provenance: Optional[Dict[str, Any]] = None,
+                  dep_unmet: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """One medium-AI call that returns both strategic brief + completeness check.
 
     Returns a dict with keys:
@@ -577,11 +690,45 @@ def pre_run_check(task: Dict[str, Any],
         capability_warnings — list of strings
         dep_blockers        — list of {task_id, title, gate_for_next, severity, brief_2s}
                               for dependencies whose H3 gate_for_next is hold/skip
+        self_serve          — list of {name, exists, reason}
+        output_targets      — referenced files this task is told to create
         strategic_advice    — 1-3 bullet string
         gate                — 'run' | 'hold' | 'skip'
         reason              — one sentence
     On failure, returns a permissive default (gate='run', no warnings).
+
+    ``dep_unmet`` (dependency gate, 2026-10-17) short-circuits everything:
+    a non-empty list of unmet dependencies returns an immediate deterministic
+    ``gate='hold'`` (with the list under ``dep_status``) WITHOUT the _ask LLM
+    call — no model must be given the chance to wave a blocked task through.
     """
+    # H2 step 0 — deterministic dependency gate (TODO item 15 Phase 3.3,
+    # pulled forward after RP-096). The caller recomputes the check here
+    # (the entry gate's value can be stale after the up-to-1800s project
+    # lock wait). Same key set as the normal return so callers reading
+    # h2['missing_files'] / h2['self_serve'] / h2['output_targets'] / …
+    # (run_task, test_agent_outputs) never see a missing key.
+    if dep_unmet:
+        def _dep_label(d):
+            return (d.get('display_code') or d.get('title')
+                    or ('#' + str(d.get('id') or '?')))
+        first = dep_unmet[0]
+        return {
+            'completeness': 'incomplete',
+            'missing_files': [],
+            'binary_unparsable': [],
+            'capability_warnings': [
+                f'Dependency {_dep_label(d)} is not done' for d in dep_unmet],
+            'dep_status': dep_unmet,
+            'dep_blockers': [],
+            'self_serve': [],
+            'output_targets': [],
+            'strategic_advice': '',
+            'gate': 'hold',
+            'reason': (f'Dependency {_dep_label(first)} '
+                       f'({first.get("status") or "?"}) is not done'),
+        }
+
     aingel_model = (project or {}).get('aingel_model') or ''
     project_path = (project or {}).get('path') or ''
     if not aingel_model:
@@ -591,6 +738,9 @@ def pre_run_check(task: Dict[str, Any],
                                            context_ref_names(task))
     # Distinguish caught (inlined/batched) from missing
     caught_set = set(caught_files or [])
+    # Lane B catches by project-relative path; a description names the file
+    # by basename (RP-085: a caught PNG was reported as out of scope).
+    caught_set |= {os.path.basename(c) for c in caught_set}
     file_access = (model_caps or {}).get('file_access', 'none')
     agentic = file_access in ('native', 'bash', 'tools')
     missing = []
@@ -659,8 +809,13 @@ def pre_run_check(task: Dict[str, Any],
     binary_unparsable = []
     capability_warnings = []
     vision = (model_caps or {}).get('vision', False)
+    # An OCR route (file_access 'api-ocr') has no chat vision but reads the
+    # referenced PDFs/images itself — agent_router._call_mistral_ocr.
+    ocr_reads = (('.pdf', '.png', '.jpg', '.jpeg') if file_access == 'api-ocr' else ())
     for bn in (noted_binary or []):
         ext = os.path.splitext(bn)[1].lower()
+        if ext in ocr_reads:
+            continue
         if ext in ('.pdf', '.png', '.jpg', '.jpeg', '.gif') and not vision:
             binary_unparsable.append({
                 'name': bn,
@@ -714,9 +869,15 @@ def pre_run_check(task: Dict[str, Any],
     missing_block = json.dumps(missing[:6], ensure_ascii=False) if missing else '[]'
     self_serve_block = json.dumps(self_serve[:8], ensure_ascii=False) if self_serve else '[]'
     binary_block = json.dumps(binary_unparsable[:6], ensure_ascii=False) if binary_unparsable else '[]'
-    caps_block = json.dumps({'file_access': file_access, 'vision': vision,
-                             'tools': (model_caps or {}).get('tools', False),
-                             'context_window': (model_caps or {}).get('context_window', 0)})
+    caps = {'file_access': file_access, 'vision': vision or ('via OCR' if ocr_reads else False),
+            'tools': (model_caps or {}).get('tools', False),
+            'context_window': (model_caps or {}).get('context_window', 0)}
+    if ocr_reads:
+        caps['ocr'] = ('OCR-only model: reads the referenced PDF/PNG/JPEG files '
+                       'itself and returns their text as markdown, saved as '
+                       'Working Documents/OCR_mistral/<file name>.md; it cannot '
+                       'follow instructions, filter, or write other files')
+    caps_block = json.dumps(caps)
 
     # Build dep outcomes block for the prompt (up to 6 deps, summary only)
     dep_outcomes_block = ''
@@ -749,7 +910,10 @@ def pre_run_check(task: Dict[str, Any],
         f"Phase: {task.get('phase_name','n/a')}\n"
         f"Model assigned: {task.get('model','n/a')} (column: {slot_label})\n"
         f"Stale dependencies: {'yes' if task.get('stale') else 'no'}\n"
-        f"Budget used: {budget_pct}%" if budget_pct is not None else "Budget used: n/a")
+        # Parenthesised: unbracketed, the conditional took the whole implicitly
+        # concatenated header, so with no budget the prompt began at
+        # "Budget used: n/a" — no role, schema, task or model (RP-085).
+        + (f"Budget used: {budget_pct}%" if budget_pct is not None else "Budget used: n/a"))
     prompt += f"\nDepends on: {dep_block}\n"
     prompt += dep_outcomes_block
     prompt += f"Model capabilities: {caps_block}\n"
@@ -817,7 +981,11 @@ def pre_run_check(task: Dict[str, Any],
     prompt += (
         "Rules for `gate`:\n"
         "- run: every referenced file is inlined, OR the route is agentic and the file is inside the project (self-serve); no blocking binary mismatches. A folder listed above as existing inside the project is reachable by an agentic model and is never a reason to hold.\n"
-        "- hold: partial — minor warnings the user should see but can override (e.g. agentic self-serve of a file that may not exist).\n"
+        + ("- run (OCR route): the model capabilities include `ocr`, so the referenced PDF/PNG/JPEG files are "
+           "read by the OCR route itself — they need not be inlined and are not binary mismatches. Hold or "
+           "skip only if the task asks for more than a transcription (filtering, analysis, other output files).\n"
+           if ocr_reads else '')
+        + "- hold: partial — minor warnings the user should see but can override (e.g. agentic self-serve of a file that may not exist).\n"
         "- skip: incomplete OR a binary file is unparsable by this model OR a referenced path is OUTSIDE the project folder (containment breach) OR a capability mismatch makes the task unreachable as written.\n"
         "`strategic_advice`: 1-3 short bullets on model fit + risks (one string, use ' • ' as separator).\n"
         "`reason`: ONE sentence summarising the gate decision.\n"
@@ -860,13 +1028,30 @@ def pre_run_check(task: Dict[str, Any],
     # stay in capability_warnings/dep_blockers; they never forced a hold here.
     if output_expected and parsed.get('gate') == 'hold':
         _reason_l = (parsed.get('reason') or '').lower()
-        _cites_output = any(os.path.basename(t).lower() in _reason_l for t in output_expected)
+        # Basename OR a generic "the deliverable file" wording — RP-087 E6
+        # held with "deliverable file is missing" without ever naming the
+        # file, which slipped past a basename-only match.
+        _cites_output = (any(os.path.basename(t).lower() in _reason_l
+                             for t in output_expected)
+                         or 'deliverable' in _reason_l)
         _other = bool(missing or binary_unparsable or any(not x.get('exists') for x in self_serve))
         if _cites_output and not _other:
             parsed['gate'] = 'run'
             parsed['reason'] = (
                 f"{', '.join(os.path.basename(t) for t in output_expected[:3])} is this task's "
                 "own output and will be created; no blocking issue found")
+    # Same for an OCR route: the gate model keeps reading "no chat vision" as
+    # "cannot read the PNG" despite the `ocr` capability (RP-085, 4 skips).
+    # Only a vision/parse objection is overruled — "asks for filtering or
+    # interpretation" still blocks.
+    if ocr_reads and parsed.get('gate') in ('hold', 'skip'):
+        _reason_l = (parsed.get('reason') or '').lower()
+        _other = bool(missing or binary_unparsable or any(not x.get('exists') for x in self_serve))
+        if ('vision' in _reason_l or 'parse' in _reason_l) and not _other:
+            parsed['gate'] = 'run'
+            parsed['binary_unparsable'] = []
+            parsed['reason'] = ('OCR route reads the referenced PDF/image files itself; '
+                                'no blocking issue found')
     if rag_unwired and parsed.get('gate') != 'skip':
         parsed['gate'] = 'hold'
         parsed['reason'] = (
@@ -1167,9 +1352,10 @@ def post_run_analysis(task: Dict[str, Any],
     if blocked_tool_count and not blocked_hits:
         blocked_hits = [f'{blocked_tool_count} tool call(s) blocked by permission system']
 
-    snippet = (output_text or '')[:_OUTPUT_SNIPPET_CHARS]
-    if len(output_text or '') > _OUTPUT_SNIPPET_CHARS:
-        snippet += '\n…[truncated]'
+    snippet = _output_snippet(output_text)
+    description = ((task or {}).get('description') or '').strip()
+    if len(description) > _H3_DESC_CHARS:
+        description = description[:_H3_DESC_CHARS] + '\n…[truncated]'
 
     finish = execution.get('finish_reason') or execution.get('status') or ''
     status = execution.get('status') or ''
@@ -1244,6 +1430,20 @@ def post_run_analysis(task: Dict[str, Any],
     elif requires_rag and not cites_legal:
         rag_findings.append('Task required the legal library but output cites no Dz.U./CELEX/ELI refs')
 
+    # Deterministic completion checks (code, not the Guide model): a deliverable
+    # the description names must exist, and a run cut off by its turn limit is
+    # not finished. Both apply even when the Guide's reply is unusable.
+    missing_deliverables = _missing_deliverables(task, project_path,
+                                                 (execution or {}).get('started_at'))
+    hit_limit = _hit_turn_limit(output_text)
+    completion_findings = [f'Deliverable not written: {name}' for name in missing_deliverables]
+    if hit_limit:
+        completion_findings.append('Run stopped at its turn limit before the model finished')
+    completion_block = ''
+    if completion_findings:
+        completion_block = ('Completion check (by code — treat as facts):\n'
+                            + ''.join(f'  - {f}\n' for f in completion_findings) + '\n')
+
     prompt = (
         f"You are the Guide (project overseer) for the project \"{project.get('name','')}\". "
         f"A task just finished. In ONE response, return JSON ONLY (no prose) with this schema:\n"
@@ -1254,36 +1454,46 @@ def post_run_analysis(task: Dict[str, Any],
         f"\"brief_2s\": str, "
         f"\"unread_files\": [str]}}\n\n"
         f"Task #{task.get('id')}: {task.get('title','')}\n"
+        f"Task description (what was asked):\n```\n{description or '(none)'}\n```\n"
         f"Model used: {execution.get('model','n/a')}\n"
         f"Status: {status}  Finish: {finish}  Tokens: {tok_in}↑ {tok_out}↓\n"
+        f"{_parts_line(execution)}"
         f"Blocked-tool hits: {json.dumps(blocked_hits)}\n\n"
+        f"{completion_block}"
         f"{file_check_block}"
         f"{rag_block}"
-        f"Output (first {_OUTPUT_SNIPPET_CHARS} chars):\n```\n{snippet}\n```\n\n"
+        f"Output (head and tail, {len(output_text or '')} chars in total):\n```\n{snippet}\n```\n\n"
         "Rules:\n"
+        "- Judge the output against the task DESCRIPTION, not the title. Read the END of the "
+        "output: an agentic run ends with the model's own verdict (e.g. 'deliverable not produced').\n"
         "- severity=ok: output addresses the task; no issues; nothing suggests a referenced file was ignored.\n"
         "- severity=warning: minor gaps — e.g. some tool calls blocked but output still valid.\n"
-        "- severity=issue: output does not address the task; or tokens truncated; or a referenced file was fabricated instead of read; or output references paths outside the project folder (containment breach); or a task that required RAG shows no retrieved-citation evidence and no Dz.U./CELEX citations.\n"
+        "- severity=issue: output does not address the task; or a deliverable the description names was not written; or the run stopped before finishing; or tokens truncated; or a referenced file was fabricated instead of read; or output references paths outside the project folder (containment breach); or a task that required RAG shows no retrieved-citation evidence and no Dz.U./CELEX citations.\n"
         "- recommendation=discuss when severity != ok.\n"
         "- gate_for_next=hold when severity=warning or issue (next task may depend on this one being clean).\n"
         "- gate_for_next=skip when severity=issue and the next task is clearly unreachable.\n"
         "- unread_files: copy the UNVERIFIED list above if non-empty; else []. It is informational: "
         "on its own it NEVER raises severity above ok and must not go into findings. Raise severity "
         "only if the output ignores, contradicts or fabricates that file's content.\n"
-        "- brief_2s: 2-3 sentences: what was done + what's the next step. Plain text, no JSON.\n"
+        "- brief_2s: 2-3 sentences: what was done, then what the USER could do next, written as "
+        "options for the user (\"You can re-run …\", \"You may want to check …\"). Never an "
+        "instruction to an agent: no \"Next step: run …\", no imperatives. This text is shown to "
+        "the user in the Guide chat. Plain text, no JSON.\n"
         "Return ONLY the JSON object."
     )
 
     text, degraded = _ask(aingel_model, prompt, 900, project_path, 'autopilot:H3')
     if degraded:
         _log.warning('[overseer H3] exec %s: %s', execution.get('id'), degraded)
-        return _permissive_h3(degraded)
+        return _apply_completion_findings(_permissive_h3(degraded), completion_findings,
+                                          bool(missing_deliverables))
 
     parsed = _safe_json(text)
     if not parsed:
         _log.warning('[overseer H3] exec %s: could not parse JSON: %s',
                      execution.get('id'), (text or '')[:200])
-        return _permissive_h3('reply was not parseable JSON')
+        return _apply_completion_findings(_permissive_h3('reply was not parseable JSON'),
+                                          completion_findings, bool(missing_deliverables))
     parsed.setdefault('severity', 'ok')
     parsed.setdefault('findings', [])
     parsed.setdefault('recommendation', 'approve')
@@ -1307,6 +1517,263 @@ def post_run_analysis(task: Dict[str, Any],
                 parsed['recommendation'] = 'discuss'
                 if parsed['gate_for_next'] == 'proceed':
                     parsed['gate_for_next'] = 'hold'
+    # Deterministic backstop (mirror of H2's output-target rule): when the
+    # code-level file check proves every named deliverable exists on disk,
+    # the Guide model's 'deliverable not written' claims are false and are
+    # stripped — it infers non-delivery from the turn-limit marker without
+    # checking files (RP-089 exec 20001271: the part file was written
+    # incrementally during the run and merged; the false reject then posted
+    # into the project chat, where the autonomous chat agent 'helpfully'
+    # moved and rewrote the deliverable). A run cut at its turn limit with
+    # all deliverables present is a warning-level caveat, not a blocker:
+    # the incremental-write discipline makes the shipped file the success
+    # criterion, and [untraced] honest gaps are within spec.
+    try:
+        _refs = _extract_referenced_files(description, context_ref_names(task))
+        _targets = sorted(_output_target_refs(description, _refs))
+    except Exception:
+        _targets = []
+    all_delivered = bool(_targets) and not missing_deliverables
+    if all_delivered:
+        tset = {os.path.basename(t).lower() for t in _targets}
+        unwritten_re = re.compile(
+            r'not (?:be )?(?:written|produced|created|delivered|on disk|persisted|saved)'
+            r'|never (?:persisted|written|saved|captured)'
+            r'|no file|file (?:is |was )?missing|missing file|not saved')
+        def _false_unwritten(finding):
+            l = (finding or '').lower()
+            return any(b in l for b in tset) and bool(unwritten_re.search(l))
+        kept = [f for f in (parsed.get('findings') or []) if not _false_unwritten(f)]
+        if len(kept) != len(parsed.get('findings') or []):
+            parsed['findings'] = kept
+            parsed['all_deliverables_present'] = True
+            turn_limit_re = re.compile(r'turn limit|stopped at \d+ turns?|hit its turn')
+            only_turn_limit = all(turn_limit_re.search(f or '')
+                                  for f in (parsed.get('findings') or []))
+            if parsed.get('severity') == 'issue' and only_turn_limit:
+                # the issue rating was anchored on the (now stripped) false
+                # non-delivery claim; what remains is the turn-limit fact,
+                # which with the file delivered is warning-level
+                parsed['severity'] = 'warning'
+                if parsed.get('recommendation') == 'reject':
+                    parsed['recommendation'] = 'discuss'
+                if parsed.get('gate_for_next') in ('hold', 'skip'):
+                    parsed['gate_for_next'] = 'proceed'
+            if not parsed.get('findings'):
+                parsed['severity'] = 'ok'
+                parsed['recommendation'] = 'approve'
+                parsed['gate_for_next'] = 'proceed'
+    return _apply_completion_findings(parsed, completion_findings,
+                                      bool(missing_deliverables),
+                                      all_delivered=all_delivered)
+
+
+_FILES_CREATED_HEADING = '## Files created in this run'
+# The executor linkifies created files as [name](/files/<pid>/<rel path>) for
+# the UI. Those are inside-project paths rendered through a UI route.
+_FILES_LINK_RE = re.compile(r'\[([^\]]+)\]\(/files/\d+/[^)]*\)')
+_FILES_LIST_KEEP = 10
+
+
+def _parts_line(execution: Dict[str, Any]) -> str:
+    """A fact line for runs that paused at their limit (TODO item 16): the
+    reviewer said "paused once" for RP-094, which ran in three parts."""
+    parts = int((execution or {}).get('segments') or 1)
+    reason = (execution or {}).get('pause_reason') or ''
+    if parts <= 1 and not reason:
+        return ''
+    what = 'time' if reason == 'time' else 'turn'
+    if parts <= 1:
+        return f"Run parts: 1 — it paused at its {what} limit and the user stopped it there.\n"
+    return (f"Run parts: {parts} — it paused at its {what} limit and the user continued it "
+            f"{parts - 1} time(s); a run stopped at a later pause says so in its output.\n")
+
+
+def _output_snippet(output_text: str) -> str:
+    """Head + tail of the run output for H3 (whole text when it fits).
+
+    The executor's "## Files created in this run" list is cut to its first
+    entries before the tail is taken: on RP-087 E5 its 69 tile links filled the
+    whole tail and pushed the model's verdict out again. The /files/<pid>/
+    markdown URLs are also de-linkified first: H3's rubric treats references
+    to paths outside the project folder as a containment breach, and the
+    reviewer read the executor's own UI links as such a breach (RP-089
+    exec 20001271, finding 4 of 5 was a false positive on system
+    boilerplate).
+    """
+    text = output_text or ''
+    files_note = ''
+    idx = text.rfind(_FILES_CREATED_HEADING)
+    if idx >= 0:
+        body, files = text[:idx].rstrip(), text[idx:]
+        entries = [_FILES_LINK_RE.sub(r'\1', l)
+                   for l in files.splitlines()[1:] if l.strip()]
+        kept = entries[:_FILES_LIST_KEEP]
+        files_note = '\n\n' + _FILES_CREATED_HEADING + '\n' + '\n'.join(kept)
+        if len(entries) > len(kept):
+            files_note += f'\n…[{len(entries) - len(kept)} more files]'
+        text = body
+    if len(text) + len(files_note) <= _OUTPUT_SNIPPET_CHARS:
+        return text + files_note
+    tail_chars = max(_OUTPUT_TAIL_CHARS - len(files_note), _OUTPUT_TAIL_CHARS // 2)
+    skipped = len(text) - _OUTPUT_HEAD_CHARS - tail_chars
+    if skipped <= 0:
+        return text + files_note
+    return (text[:_OUTPUT_HEAD_CHARS]
+            + f'\n\n…[{skipped} chars omitted]…\n\n'
+            + text[-tail_chars:] + files_note)
+
+
+def _hit_turn_limit(output_text: str) -> bool:
+    """True when a route recorded that the run was cut off by its turn limit."""
+    try:
+        from agent_router import TOOL_TURN_LIMIT_MARKER, VIBE_TURN_LIMIT_MARKER
+    except Exception:  # pragma: no cover — router import failure must not break H3
+        return False
+    text = output_text or ''
+    return TOOL_TURN_LIMIT_MARKER in text or VIBE_TURN_LIMIT_MARKER in text
+
+
+def _parse_utc_ts(value) -> Optional[float]:
+    """Epoch seconds for a DB timestamp ('YYYY-MM-DD HH:MM:SS' UTC, or ISO)."""
+    if not value:
+        return None
+    from datetime import datetime, timezone
+    raw = str(value).strip().replace('T', ' ')
+    raw = raw.split('+')[0].rstrip('Z')
+    for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S'):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _missing_deliverables(task: Dict[str, Any], project_path: str,
+                          started_at=None) -> List[str]:
+    """Files the description tells the task to create that this run did not write.
+
+    A target counts as written when a file with that name exists — at its
+    project-relative path, at the project root, or anywhere under the task's
+    output folder (Artifacts/outputs/<id>-*/, nested folders included) — and,
+    when the run's start time is known, was modified after the run started, so
+    an earlier attempt's file does not pass for this run's.
+
+    Regression: RP-087 E5/E7 never wrote `pkp_intercity_routes_2026_2027.md`
+    and H3 approved both.
+    """
+    task = task or {}
+    if not project_path or not os.path.isdir(project_path):
+        return []
+    description = task.get('description') or ''
+    if not description:
+        return []
+    try:
+        refs = _extract_referenced_files(description, context_ref_names(task))
+        targets = sorted(_output_target_refs(description, refs))
+    except Exception as exc:  # detection must never break H3
+        _log.warning('[overseer H3] deliverable detection failed: %s', exc)
+        return []
+    if not targets:
+        return []
+    since = _parse_utc_ts(started_at)
+    if since is not None:
+        since -= 60  # clock/rounding slack
+
+    def _fresh(path: str) -> bool:
+        try:
+            return os.path.isfile(path) and (since is None or os.path.getmtime(path) >= since)
+        except OSError:
+            return False
+
+    tid = task.get('id')
+    out_dirs = []
+    base = os.path.join(project_path, 'Artifacts', 'outputs')
+    if tid is not None and os.path.isdir(base):
+        try:
+            out_dirs = [os.path.join(base, e) for e in os.listdir(base)
+                        if e.startswith(f'{tid}-') and os.path.isdir(os.path.join(base, e))]
+        except OSError:
+            out_dirs = []
+
+    def _fresh_under(dirs, name: str) -> bool:
+        for d in dirs:
+            for root, _dirs, files in os.walk(d):
+                if name in files and _fresh(os.path.join(root, name)):
+                    return True
+        return False
+
+    # One verdict per file NAME. A description often names the same file twice —
+    # bare ("write `part01.md`") and with its folder given elsewhere — and each
+    # reference used to become its own "not written" finding (RP-090, ×2).
+    by_name: Dict[str, List[str]] = {}
+    for ref in targets:
+        rel = ref.lstrip('/')
+        if os.path.isabs(ref) or '..' in rel.split('/'):
+            continue  # outside the project — H2 handles containment
+        by_name.setdefault(os.path.basename(rel), []).append(rel)
+
+    missing = []
+    other_outputs = None
+    for name, rels in sorted(by_name.items()):
+        if any(_fresh(os.path.join(project_path, r)) for r in rels) \
+                or _fresh(os.path.join(project_path, name)) or _fresh_under(out_dirs, name):
+            continue
+        # Last resort: a fresh file of that name in ANY task's output folder.
+        # Chained tasks write to a shared folder inside another task's outputs
+        # and give that folder in prose, not in the file reference (RP-089:
+        # `shared/` under 10001204-…). Missing that, the check told H3 a
+        # written file was "not written" — a false fact the Guide then acted on.
+        # Freshness (written during this run) keeps an older file from passing.
+        if other_outputs is None:
+            try:
+                other_outputs = [os.path.join(base, e) for e in os.listdir(base)
+                                 if os.path.isdir(os.path.join(base, e))
+                                 and os.path.join(base, e) not in out_dirs]
+            except OSError:
+                other_outputs = []
+        if since is not None and _fresh_under(other_outputs, name):
+            continue
+        missing.append(name)
+    return missing
+
+
+def _apply_completion_findings(parsed: Dict[str, Any], findings: List[str],
+                               deliverable_missing: bool,
+                               all_delivered: bool = False) -> Dict[str, Any]:
+    """Raise an H3 verdict for code-detected incompleteness (never lowers it).
+
+    A missing named deliverable is an ``issue``; a turn-limit cut-off on its own
+    is at least a ``warning``. Either way the next task is held for the user —
+    EXCEPT when ``all_delivered`` says every deliverable is on disk: then the
+    cut-off stays a recorded warning but no longer blocks the chain (see the
+    post_run_analysis backstop for why).
+    """
+    if not findings:
+        return parsed
+    existing = list(parsed.get('findings') or [])
+    already = {f.lower() for f in existing}
+
+    def _said_already(f: str) -> bool:
+        # "Deliverable not written: X" duplicates a model finding that names X
+        # and says it is missing / not written (merge by file name, not text).
+        if f.lower() in already:
+            return True
+        if f.startswith('Deliverable not written: '):
+            name = f.split(': ', 1)[1].lower()
+            return any(name in e.lower() and ('not written' in e.lower() or 'missing' in e.lower())
+                       for e in existing)
+        return False
+
+    parsed['findings'] = existing + [f for f in findings if not _said_already(f)]
+    rank = {'ok': 0, 'warning': 1, 'issue': 2}
+    floor = 'issue' if deliverable_missing else 'warning'
+    if rank.get(parsed.get('severity'), 0) < rank[floor]:
+        parsed['severity'] = floor
+    if parsed.get('recommendation') == 'approve':
+        parsed['recommendation'] = 'discuss'
+    if not all_delivered and parsed.get('gate_for_next') == 'proceed':
+        parsed['gate_for_next'] = 'hold'
     return parsed
 
 
@@ -1330,6 +1797,66 @@ def _permissive_h3(degraded_reason: str = '') -> Dict[str, Any]:
         'unread_files': [],
         'degraded': True,
         'degraded_reason': degraded_reason,
+    }
+
+
+# ── Pause report — the Guide's read of a run paused at its limit (item 16) ───
+
+_PAUSE_PROGRESS = ('progressing', 'looping', 'blocked')
+_PAUSE_RECOMMEND = ('continue', 'continue_with_note', 'stop')
+
+
+def pause_report_summary(task: Dict[str, Any], project: Dict[str, Any],
+                         facts: Dict[str, Any], transcript_text: str) -> Optional[Dict[str, Any]]:
+    """One tool-less call: is the paused run progressing, and should the user
+    continue it? Code gathers the facts; the Guide only reads them and the
+    head + tail of the transcript. Returns None when no Guide model is set or
+    its reply is unusable (the report then shows the facts only).
+    """
+    model = (project or {}).get('aingel_model') or ''
+    if not model:
+        return None
+    description = ((task or {}).get('description') or '').strip()
+    if len(description) > _H3_DESC_CHARS:
+        description = description[:_H3_DESC_CHARS] + '\n…[truncated]'
+    prompt = (
+        f"You are the Guide for the project \"{(project or {}).get('name', '')}\". "
+        "A task run has paused at its limit and the user must decide whether to continue it. "
+        "Return JSON ONLY:\n"
+        '{"progress": "progressing|looping|blocked", '
+        '"recommendation": "continue|continue_with_note|stop", '
+        '"suggested_note": str, "summary": str}\n\n'
+        f"Task #{(task or {}).get('id')}: {(task or {}).get('title', '')}\n"
+        f"Task description:\n```\n{description or '(none)'}\n```\n"
+        f"Facts (from code — treat as true):\n```\n{json.dumps(facts, ensure_ascii=False, indent=1)}\n```\n"
+        f"Transcript (head and tail):\n```\n{_output_snippet(transcript_text)}\n```\n\n"
+        "Rules:\n"
+        "- progressing: the last part made real progress toward the deliverable.\n"
+        "- looping: it repeats the same actions or re-reads the same files without new results.\n"
+        "- blocked: it cannot finish as asked (missing input, missing capability, wrong approach).\n"
+        "- continue_with_note when a short instruction would fix the approach (for example: "
+        "write the deliverable now and add rows as you go). suggested_note is that instruction, "
+        "in at most 2 sentences, written to the model; empty otherwise.\n"
+        "- stop when blocked, or when looping and no note would help.\n"
+        "- summary: 2-3 sentences for the user: what it did, what is left, your advice. "
+        "Never invent facts that are not in the facts or the transcript.\n"
+        "Return ONLY the JSON object."
+    )
+    text, degraded = _ask(model, prompt, 700, (project or {}).get('path') or '', 'pause:report')
+    if degraded:
+        _log.warning('[pause report] task %s: %s', (task or {}).get('id'), degraded)
+        return None
+    parsed = _safe_json(text)
+    if not parsed:
+        return None
+    progress = str(parsed.get('progress') or '').strip().lower()
+    rec = str(parsed.get('recommendation') or '').strip().lower()
+    return {
+        'progress': progress if progress in _PAUSE_PROGRESS else '',
+        'recommendation': rec if rec in _PAUSE_RECOMMEND else '',
+        'suggested_note': str(parsed.get('suggested_note') or '').strip()[:500],
+        'summary': str(parsed.get('summary') or '').strip()[:1200],
+        'model': model,
     }
 
 

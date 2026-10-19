@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { useStore } from '../store';
+import { PausedRunPanel } from './PausedRunPanel';
 import { api } from '../api';
 import { cn } from '../utils/cn';
 import { fmtTokens } from '../utils/tokens';
@@ -55,6 +56,8 @@ const statusStyle = (status: string, memoryStatus?: string): { color: string; bg
       return { color: '#a3402f', bg: '#f7e2dc', label: 'Failed' };
     case 'running':
       return { color: '#3f628f', bg: '#e3ebf5', label: 'Running' };
+    case 'paused':
+      return { color: '#8a5a12', bg: '#fbefd9', label: 'Paused' };
     case 'pending':
       return { color: '#b2622d', bg: '#fff2eb', label: 'Pending' };
     case 'skipped':
@@ -331,6 +334,54 @@ export const ExecutionLog = () => {
     }
   };
 
+  // Pause at the limit (TODO item 16): the run waits for the user's decision.
+  const handleContinue = async (execId: number) => {
+    const note = window.prompt(
+      'Continue this run for another block of turns.\n\nOptional note to the model (e.g. "write the table now"):', '');
+    if (note === null) return;
+    try {
+      await api.executions.continue(execId, note);
+      await refreshExecutions();
+    } catch (err: unknown) {
+      alert('Continue failed: ' + (err instanceof Error ? err.message : 'unknown error'));
+    }
+  };
+
+  const handleStop = async (execId: number, discard: boolean) => {
+    const msg = discard
+      ? 'Stop this run and DISCARD its changes? Its task branch is deleted and the task returns to pending.'
+      : 'Stop this run and keep what it produced? It finishes now and the Guide reviews it.';
+    if (!window.confirm(msg)) return;
+    try {
+      await api.executions.stop(execId, discard);
+      await refreshExecutions();
+    } catch (err: unknown) {
+      alert('Stop failed: ' + (err instanceof Error ? err.message : 'unknown error'));
+    }
+  };
+
+  const pausedLabel = (e: Execution) =>
+    `${e.pause_reason === 'time' ? 'time' : 'turn'} limit${(e.segments || 1) > 1 ? ` · part ${e.segments}` : ''}`;
+
+  const [reportExecId, setReportExecId] = useState<number | null>(null);
+
+  const pausedButtons = (e: Execution) => (
+    <>
+      <button data-tip="Show the pause report: what it did, what is left, the Guide's advice"
+              onClick={(ev) => { ev.stopPropagation(); setReportExecId(reportExecId === e.id ? null : e.id); }}
+              className="btn-xs">{reportExecId === e.id ? 'Hide report' : 'Report'}</button>
+      <button data-tip="Run another block of turns from where it stopped (optionally with a note)"
+              onClick={(ev) => { ev.stopPropagation(); handleContinue(e.id); }}
+              className="btn-xs text-status-done">Continue</button>
+      <button data-tip="Finish now with what it produced; the Guide reviews it"
+              onClick={(ev) => { ev.stopPropagation(); handleStop(e.id, false); }}
+              className="btn-xs">Stop &amp; review</button>
+      <button data-tip="Stop and discard its changes; the task returns to pending"
+              onClick={(ev) => { ev.stopPropagation(); handleStop(e.id, true); }}
+              className="btn-xs text-danger border-danger">Discard</button>
+    </>
+  );
+
   const handleFork = async (execId: number) => {
     const topic = forkFeedback.trim();
     if (!topic) return;
@@ -523,6 +574,11 @@ export const ExecutionLog = () => {
                           }}>
                             {st.label}
                           </span>
+                          {e.status === 'paused' && (
+                            <span className="text-xs text-faint" title="Paused at its limit — waiting for your decision">
+                              {pausedLabel(e)}
+                            </span>
+                          )}
                           {e.status === 'running' && (
                             <span className="text-xs font-mono text-faint" title={`Running for ${elapsedMins} min since ${fmtTimeFull(e.started_at)}`} style={{ fontVariantNumeric: 'tabular-nums' }}>
                               {elapsedMins}m
@@ -579,6 +635,12 @@ export const ExecutionLog = () => {
                       </td>
                       <td className={tdBase}>
                         <div className="flex gap-[3px] flex-wrap items-center">
+                          {e.status === 'paused' && canEditExec(e.project_id) && pausedButtons(e)}
+                          {e.status === 'paused' && reportExecId === e.id && (
+                            <div className="w-full mt-1" style={{ minWidth: 280 }}>
+                              <PausedRunPanel exec={e} canEdit={canEditExec(e.project_id)} />
+                            </div>
+                          )}
                           {e.status === 'running' && canEditExec(e.project_id) && (
                             <button
                               data-tip="Cancel execution and reset task to pending"
@@ -763,6 +825,10 @@ export const ExecutionLog = () => {
                       ) : e.chat_id ? (
                         <button data-tip="Open this execution's chat" className="btn-xs" style={{ color: '#7a5aa6', borderColor: 'rgba(122,90,166,.4)', background: 'rgba(122,90,166,.15)' }} onClick={() => window.dispatchEvent(new CustomEvent('aingel:open-chat', { detail: { chatId: e.chat_id } }))}>Chat</button>
                       ) : null}
+                      {e.status === 'paused' && canEditExec(e.project_id) && pausedButtons(e)}
+                      {e.status === 'paused' && reportExecId === e.id && (
+                        <div className="w-full mt-1"><PausedRunPanel exec={e} canEdit={canEditExec(e.project_id)} /></div>
+                      )}
                       {e.status === 'running' && canEditExec(e.project_id) && (
                         <button data-tip="Cancel execution and reset task to pending" onClick={(ev) => { ev.stopPropagation(); handleCancel(e.id); }} className="btn-xs text-danger border-danger">Cancel</button>
                       )}
@@ -941,8 +1007,9 @@ const expandDiffstatRename = (raw: string): string[] => {
   return out.length ? out : [s];
 };
 
-const parseDiffstatFiles = (diffstat: string | undefined): string[] => {
-  const out: string[] = [];
+const parseDiffstatFiles = (diffstat: string | undefined, taskId?: number): { name: string; abbreviated: boolean }[] => {
+  const out: { name: string; abbreviated: boolean }[] = [];
+  const seen = new Set<string>();
   if (!diffstat) return out;
   // Definition / bookkeeping files that are not task deliverables — even if
   // git tracks them (GUIDE.md is regenerated from DB), they should not appear
@@ -956,17 +1023,29 @@ const parseDiffstatFiles = (diffstat: string | undefined): string[] => {
     'tasks.md',
   ]);
   for (const line of diffstat.split('\n')) {
+    // git --stat abbreviates long paths to `.../basename` (path) or `...tail`
+    // (long filename, no slash); detect that on the RAW line (before the prefix
+    // is stripped) so the UI knows the real path is unknown and a /files/ link
+    // would be wrong.
+    const abbreviated = /^\s*\.{3}\/?/.test(line);
     const m = line.match(/^\s*(?:\.{3}\/?)?(.+?)\s+\|/);
     if (!m || !m[1]) continue;
-    let fname = m[1].trim().replace(/^\.{3}\//, '');
+    let fname = m[1].trim().replace(/^\.{3}\/?/, '');
     if (!fname) continue;
+    // Ownership filter: a task's commit can sweep in files left uncommitted by
+    // another task or a concurrent chat, so a diffstat entry under a *different*
+    // task's output folder (Artifacts/outputs/<taskId>-<slug>/) belongs to that
+    // other task, not this execution. Only applied to full paths — abbreviated
+    // (`.../`) entries cannot be attributed and are already rendered un-linked.
+    const owner = fname.match(/^Artifacts\/outputs\/(\d+)-/);
+    if (owner && taskId !== undefined && Number(owner[1]) !== taskId) continue;
     // Handle rename entries: split brace expansion and ` => `, link NEW file.
     const expanded = expandDiffstatRename(fname);
     // Use the NEW name (last element) as the file URL; old is kept out of the
     // File column to avoid 404s for moved files (helper still returns both for
     // backend attribution).
     fname = expanded.length ? expanded[expanded.length - 1] : fname;
-    fname = fname.replace(/^\.{3}\//, '').replace(/\.\.\.\//g, '').trim();
+    fname = fname.replace(/^\.{3}\/?/, '').replace(/\.\.\.\//g, '').trim();
     if (!fname) continue;
     // Skip if the raw brace pattern leaked through (safety)
     if (fname.includes('{') || fname.includes(' => ')) continue;
@@ -981,29 +1060,55 @@ const parseDiffstatFiles = (diffstat: string | undefined): string[] => {
     // Lane B output folder (Artifacts/outputs/<task>-<slug>/) must stay visible
     // (task 10001171: 'This is a test' was invisible in the File column).
     if (/^exec-\d+-output\.md$/i.test(base)) continue;
-    if (!out.includes(fname)) out.push(fname);
+    if (seen.has(fname)) continue;
+    seen.add(fname);
+    out.push({ name: fname, abbreviated });
   }
   return out;
 };
 
 const ExecFileCell = ({ exec }: { exec: Execution }) => {
   const { activeProject } = useStore();
-  const files = useMemo(() => parseDiffstatFiles(exec.git_diffstat), [exec.git_diffstat]);
+  const files = useMemo(() => parseDiffstatFiles(exec.git_diffstat, exec.task_id), [exec.git_diffstat, exec.task_id]);
   const hasOutput = exec.has_output_file;
   const totalCount = files.length + (hasOutput ? 1 : 0);
   const [expanded, setExpanded] = useState(false);
   if (totalCount === 0) return <span className="text-faint">{'\u2014'}</span>;
   const visible = expanded ? files : files.slice(0, 2);
   const hidden = files.length - visible.length;
+  // Files committed on a task branch that is not merged into main are not on
+  // disk, so a /files/ link 404s (RP-094: a GUIDE.md merge conflict left its
+  // deliverable on the branch). Show them as text with the reason instead.
+  const branch = (exec.git_branch || '').trim();
+  const unmerged = !!branch && !(exec.git_merge_commit || '').trim()
+    && exec.status !== 'running' && exec.status !== 'paused';
   return (
     <div className="flex flex-col gap-0.5">
       {visible.map((f) => {
-        const url = relUrl(f, activeProject);
-        const basename = f.split('/').pop() || f;
-        if (!url) return <span key={f} className="text-xs text-faint truncate" title={f}>{basename}</span>;
+        if (unmerged) {
+          return (
+            <span key={f.name} className="text-xs text-faint truncate" style={{ maxWidth: 110 }}
+                  title={`${f.name}\nOn task branch ${branch}, not merged into main yet — it is not on disk until it is merged.`}>
+              <GitBranch size={11} className="inline-block align-[-2px] mr-0.5" />{f.name.split('/').pop() || f.name}
+            </span>
+          );
+        }
+        // git abbreviated this entry to `.../basename` or `...tail`, so the
+        // full path is unknown — a /files/ link would 404. Show it as text.
+        if (f.abbreviated) {
+          return (
+            <span key={f.name} className="text-xs text-faint truncate" style={{ maxWidth: 110 }}
+                  title={`${f.name}\nPath truncated by git — the full path is unknown, so this entry cannot be linked directly. Open the run's output file to find the file.`}>
+              {f.name.split('/').pop() || f.name}
+            </span>
+          );
+        }
+        const url = relUrl(f.name, activeProject);
+        const basename = f.name.split('/').pop() || f.name;
+        if (!url) return <span key={f.name} className="text-xs text-faint truncate" title={f.name}>{basename}</span>;
         return (
-          <a key={f} href={url} target="_blank" rel="noopener noreferrer"
-             className="text-xs text-link hover:underline truncate" title={f}
+          <a key={f.name} href={url} target="_blank" rel="noopener noreferrer"
+             className="text-xs text-link hover:underline truncate" title={f.name}
              style={{ maxWidth: 110 }}>
             {basename}
           </a>

@@ -379,10 +379,73 @@ class OverseerOutputNameTests(unittest.TestCase):
         self.assertEqual(agent_overseer._output_target_refs(desc, refs),
                          {'DPP-WOPN.718.4.2021.PP.md'})
 
+    def test_output_verb_marks_a_named_deliverable(self):
+        # RP-087: "Output a single markdown file named `X.md`" — the repo's
+        # standard deliverable phrasing — was NOT detected ('output' was
+        # missing from the verb list), so the file looked like a missing
+        # input and H2 held the task for not-existing-yet.
+        desc = ("Analyze the attached image file `@map.png`.\n\n"
+                "Output a single markdown file named `routes_2026.md` containing:\n"
+                "- Header\n- Table\n")
+        refs = agent_overseer._extract_referenced_files(desc)
+        self.assertEqual(agent_overseer._output_target_refs(desc, refs),
+                         {'routes_2026.md'})
+
+    def test_output_verb_after_deliverable_heading(self):
+        # The bolded "**Deliverable:**" heading variant of the same
+        # instruction, as used on RP-087 E6.
+        desc = ("**Deliverable:** Output a single markdown file named "
+                "`pkp_intercity_routes_2026_2027.md` containing:\n"
+                "- A table\n")
+        refs = agent_overseer._extract_referenced_files(desc)
+        self.assertEqual(agent_overseer._output_target_refs(desc, refs),
+                         {'pkp_intercity_routes_2026_2027.md'})
+
+    def test_output_of_stays_an_input(self):
+        # The noun use must not flip: "output of `X`" names X as a source.
+        desc = "Review the output of `analysis.md` and summarise it."
+        refs = agent_overseer._extract_referenced_files(desc)
+        self.assertEqual(agent_overseer._output_target_refs(desc, refs), set())
+
     def test_named_input_is_still_an_input(self):
         desc = "Open the file named `DPP-WOPN.718.4.2021.PP.md` and summarise it."
         refs = agent_overseer._extract_referenced_files(desc)
         self.assertEqual(agent_overseer._output_target_refs(desc, refs), set())
+
+    def test_wrapped_filename_after_save_as_is_an_output(self):
+        # RP-099 (task 10001216): the deliverable name was wrapped onto the
+        # next line, so `before` held only whitespace and the ref was missed —
+        # `_missing_deliverables` stayed empty and the safety net was silent.
+        desc = ("Open `@Deck.pptx` (the existing document).\n"
+                "3. **Output**:\n"
+                "   - Save the modified PowerPoint as:\n"
+                "     `Deck_with_Polish_Plan.pptx`\n")
+        refs = agent_overseer._extract_referenced_files(desc)
+        self.assertEqual(agent_overseer._output_target_refs(desc, refs),
+                         {'Deck_with_Polish_Plan.pptx'})
+
+    def test_markerless_bold_announce_with_wrapped_name(self):
+        # RP-099: no list marker at all, only a bold "Save … as:" line.
+        desc = "**Save the reply as:**\n   `reply.md`\n"
+        refs = agent_overseer._extract_referenced_files(desc)
+        self.assertEqual(agent_overseer._output_target_refs(desc, refs), {'reply.md'})
+
+    def test_wrapped_name_under_read_instruction_is_an_input(self):
+        desc = "   - Read carefully and check:\n     `input.pptx`\n"
+        refs = agent_overseer._extract_referenced_files(desc)
+        self.assertEqual(agent_overseer._output_target_refs(desc, refs), set())
+
+    def test_wrapped_name_under_template_instruction_is_an_input(self):
+        desc = "Use as the template:\n  `template.docx`\n"
+        refs = agent_overseer._extract_referenced_files(desc)
+        self.assertEqual(agent_overseer._output_target_refs(desc, refs), set())
+
+    def test_parent_naming_its_own_file_does_not_claim_wrapped_ref(self):
+        # RP-099 amendment: the parent already names `final.md`, so the
+        # wrapped `notes.txt` must not become an output of that line.
+        desc = "Save the report as `final.md`\n  `notes.txt`\n"
+        refs = agent_overseer._extract_referenced_files(desc)
+        self.assertEqual(agent_overseer._output_target_refs(desc, refs), {'final.md'})
 
     def test_h2_does_not_hold_on_placeholder(self):
         with tempfile.TemporaryDirectory() as p:
@@ -398,6 +461,28 @@ class OverseerOutputNameTests(unittest.TestCase):
                     [], [], {'file_access': 'native'}, [])
             self.assertEqual(h2.get('self_serve') or [], [])
             self.assertEqual(h2.get('missing_files') or [], [])
+
+    def test_h2_hold_on_generic_deliverable_wording_is_overruled(self):
+        # RP-087 E6: the Guide held with "deliverable file is missing"
+        # — never naming the file — so the basename-only backstop missed
+        # it. A hold whose only cause is the task's own output must be
+        # overruled even when the Guide says just "deliverable".
+        with tempfile.TemporaryDirectory() as p:
+            desc = ("Output a single markdown file named `routes_2026.md` "
+                    "containing the table.")
+
+            def fake_ask(model, prompt, *a, **k):
+                return ('{"gate": "hold", "completeness": "partial", '
+                        '"reason": "deliverable file is missing and must be '
+                        'created by the task"}'), None
+
+            with mock.patch.object(agent_overseer, '_ask', side_effect=fake_ask):
+                h2 = agent_overseer.pre_run_check(
+                    {'id': 1, 'title': 't', 'description': desc},
+                    {'name': 'P', 'path': p, 'aingel_model': 'mistral-medium-latest'},
+                    [], [], {'file_access': 'native'}, [])
+            self.assertEqual(h2.get('gate'), 'run')
+            self.assertIn('own output', h2.get('reason', ''))
 
 
 class GitEverywhereTests(unittest.TestCase):

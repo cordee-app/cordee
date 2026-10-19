@@ -6,7 +6,9 @@ import { cn } from '../utils/cn';
 import { fmtUsd } from '../utils/currency';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
 import { taskChip, taskChipById, isTaskCode } from '../utils/taskCode';
-import type { Task, TaskDependencies, ModelRecommendation, TaskAttachment, HfCandidate, FileEntry } from '../types';
+import { addDependencyWithGate, confirmUnmetNative } from '../utils/deps';
+import { useUnmetDepsConfirm, UnmetDepsConfirmDialog } from './UnmetDepsConfirm';
+import type { Task, TaskDependencies, ModelRecommendation, TaskAttachment, HfCandidate, FileEntry, UnmetDep } from '../types';
 import { TaskAttachPicker } from './TaskAttachPicker';
 import { Paperclip } from 'lucide-react';
 
@@ -61,7 +63,11 @@ export const AddTaskModal = () => {
   const setActiveProject = useStore((s) => s.setActiveProject);
   const setActivePhase = useStore((s) => s.setActivePhase);
   const setActiveStatus = useStore((s) => s.setActiveStatus);
+  const refreshDepEdges = useStore((s) => s.refreshDepEdges);
   const user = useStore((s) => s.user);
+
+  // Dependency-gate confirm (not-done deps block the task from running).
+  const unmetConfirm = useUnmetDepsConfirm();
 
   const isFreeUser = user?.plan === 'free' && user?.role !== 'admin';
 
@@ -238,6 +244,7 @@ export const AddTaskModal = () => {
     setMentionQuery('');
     setMentionIndex(0);
     setMentionAt(-1);
+    unmetConfirm.settle(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showAddModal, modModalTaskId]);
 
@@ -389,6 +396,7 @@ export const AddTaskModal = () => {
   };
 
   const closeModal = () => {
+    unmetConfirm.settle(false); // never leave an awaited gate confirm hanging
     setShowAddModal(false);
     setModModalTaskId(null);
     setSuggestResults(null);
@@ -462,6 +470,28 @@ export const AddTaskModal = () => {
       }
     }
 
+    // Dependency gate: compute the pending deps that aren't done BEFORE
+    // anything is created or the modal closes — adding one blocks the task
+    // from running, and the user must acknowledge that while the form is
+    // still open (the dep requests themselves fire after closeModal, where
+    // no in-modal dialog can be shown).
+    const pendingUnmet: UnmetDep[] = [];
+    for (const depId of addTaskPendingDeps) {
+      const depTask = tasks.find((x) => x.id === depId);
+      if (depTask && depTask.status !== 'done') {
+        pendingUnmet.push({
+          id: depTask.id,
+          display_code: depTask.display_code ?? undefined,
+          title: depTask.title,
+          status: depTask.status,
+        });
+      }
+    }
+    if (pendingUnmet.length > 0) {
+      const ok = await unmetConfirm.confirm(pendingUnmet, 'save');
+      if (!ok) return; // stay in the modal
+    }
+
     setAddTaskSubmitting(true);
     try {
       const r = await api.tasks.create({
@@ -482,6 +512,8 @@ export const AddTaskModal = () => {
       });
 
       const depsToSave = [...addTaskPendingDeps];
+      // Acknowledged (per the confirm above) → every dep add carries the flag.
+      const depsAcknowledged = pendingUnmet.length > 0;
 
       closeModal();
       await refreshData();
@@ -501,14 +533,15 @@ export const AddTaskModal = () => {
       }
 
       for (const depId of depsToSave) {
-        try {
-          await api.tasks.dependencies.add(r.id, { depends_on_id: depId });
-        } catch {
-          /* ignore */
-        }
+        // Per-dep isolation (pre-existing behaviour): one failure must not
+        // abort the rest. The 409 dependency_not_done backstop still
+        // confirms — via a native dialog, the modal is closed by now — and
+        // retries with acknowledged: true.
+        await addDependencyWithGate(r.id, depId, depsAcknowledged, confirmUnmetNative);
       }
       if (depsToSave.length) {
         await refreshData();
+        refreshDepEdges();
       }
 
       setTimeout(() => {
@@ -531,6 +564,7 @@ export const AddTaskModal = () => {
       await loadEditDeps();
       const refreshed = await api.tasks.list();
       setTasks(refreshed);
+      refreshDepEdges();
     } catch (e: unknown) {
       alert('Error: ' + (e as Error).message);
     }
@@ -543,15 +577,42 @@ export const AddTaskModal = () => {
       return;
     }
     setDepsError('');
-    try {
-      await api.tasks.dependencies.add(modModalTaskId, { depends_on_id: depId });
-      setDepsAddInput('');
-      await loadEditDeps();
-      const refreshed = await api.tasks.list();
-      setTasks(refreshed);
-    } catch (e: unknown) {
-      setDepsError((e as Error).message || 'Failed to add dependency');
+    // Pre-flight gate: the dep's status is usually known from the store.
+    // Deps resolved by code may be cross-project (not in the store) — those
+    // rely on the 409 backstop inside addDependencyWithGate.
+    const depTask = tasks.find((t) => t.id === depId);
+    const notDone = Boolean(depTask && depTask.status !== 'done');
+    if (notDone && depTask) {
+      const ok = await unmetConfirm.confirm(
+        [{
+          id: depTask.id,
+          display_code: depTask.display_code ?? undefined,
+          title: depTask.title,
+          status: depTask.status,
+        }],
+        'add',
+      );
+      if (!ok) return;
     }
+    const res = await addDependencyWithGate(
+      modModalTaskId,
+      depId,
+      notDone,
+      (unmet) => unmetConfirm.confirm(unmet, 'add'),
+    );
+    if (!res.ok) {
+      // The not-done case was already confirmed (or declined) inside the
+      // gate — surface only real errors; declines stay silent.
+      if (res.error !== undefined) {
+        setDepsError(res.error instanceof Error ? res.error.message : 'Failed to add dependency');
+      }
+      return;
+    }
+    setDepsAddInput('');
+    await loadEditDeps();
+    const refreshed = await api.tasks.list();
+    setTasks(refreshed);
+    refreshDepEdges();
   };
 
   const handleEditDepToggle = (id: number) => {
@@ -680,6 +741,7 @@ export const AddTaskModal = () => {
                     ? 'bg-status-done-bg text-status-done'
                     : 'bg-status-pending-bg text-status-pending',
                 )}
+                title={t.status === 'done' ? undefined : 'Not done — the task will be blocked from running until this dependency finishes'}
               >
                 {t.status}
               </span>
@@ -1621,6 +1683,15 @@ export const AddTaskModal = () => {
                         <span className="max-w-[140px] overflow-hidden text-ellipsis whitespace-nowrap" title={t?.title ?? `Task ${taskChipById(id, tasks)}`}>
                           {t?.title ?? `Task ${taskChipById(id, tasks)}`}
                         </span>
+                        {t && t.status !== 'done' && (
+                          <span
+                            className="text-2xs font-semibold"
+                            style={{ color: '#b2622d' }}
+                            title="Not done — the task will be blocked from running until this dependency finishes"
+                          >
+                            · {t.status}
+                          </span>
+                        )}
                         <button
                           data-tip="Remove this pending dependency"
                           className="bg-none border-none text-text-faint cursor-pointer p-0 text-sm+ leading-none"
@@ -1668,6 +1739,14 @@ export const AddTaskModal = () => {
         onChange={setAttachments}
         onClose={() => setShowAttachPicker(false)}
         phaseOrder={phaseOrder}
+      />
+
+      {/* Dependency-gate confirm — overlays the modal (z-toast) so the form
+          can't be dismissed or submitted behind its back. */}
+      <UnmetDepsConfirmDialog
+        state={unmetConfirm.state}
+        onConfirm={() => unmetConfirm.settle(true)}
+        onCancel={() => unmetConfirm.settle(false)}
       />
     </div>
   );

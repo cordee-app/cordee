@@ -105,6 +105,7 @@ const App = () => {
     settingsDirty, setShowSearch,
     setSidebarCollapsed, setActiveChat,
     addAingelChatId,
+    refreshDepEdges,
   } = useStore();
 
   const isMobile = useIsMobile();
@@ -238,6 +239,14 @@ const App = () => {
     const iv = setInterval(loadAll, 30000);
     return () => clearInterval(iv);
   }, [loadAll]);
+
+  // Dependency edges for the active project: feed the blocked-by badges and
+  // runnable counts. Loaded with the tasks on project switch here; dep
+  // mutations and SSE events (task_changed / dep_blocked) refetch through
+  // the store, so the 30s loadAll poll stays as-is.
+  useEffect(() => {
+    refreshDepEdges();
+  }, [refreshDepEdges, activeProject]);
 
   useEffect(() => {
     const apply = () => {

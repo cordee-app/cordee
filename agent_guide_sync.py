@@ -27,6 +27,7 @@ _STATUS_MARKERS = {
     'failed':     '- [ ] 🔴 ',
     'blocked':    '- [ ] \U0001f6a7 ',  # 🚧
     'running':    '- [ ] \U0001f504 ',  # 🔄
+    'paused':     '- [ ] \u23f8 ',      # ⏸ paused at its limit (TODO item 16)
     'confirmed':  '- [ ] ',
     'pending':    '- [ ] ',
 }

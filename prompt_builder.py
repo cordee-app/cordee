@@ -21,6 +21,7 @@ Two responsibilities:
 
 from typing import Dict
 import os
+import re
 import time
 import logging
 import agent_files
@@ -36,6 +37,62 @@ _BINARY_EXTS = {
     '.pdf', '.db', '.sqlite', '.xlsx', '.xls', '.doc', '.docx', '.pptx',
     '.odt', '.ods', '.odp', '.png', '.jpg', '.jpeg', '.gif', '.zip',
 }
+
+# Verbs that mean "change this document", as opposed to "read/extract it".
+# Used with _binary_document_edit_task() to keep binary edits out of batch mode.
+_BINARY_MODIFY_RE = re.compile(
+    r'\b(?:modif(?:y|ies|ied|ying)|edit(?:s|ed|ing)?|updat(?:e|es|ed|ing)|'
+    r'revis(?:e|es|ed|ing)|amend(?:s|ed|ing)?|insert(?:s|ed|ing)?|'
+    r'integr(?:ate|ates|ated|ating)|incorporat(?:e|es|ed|ing)|'
+    r'fill(?:s|ed|ing)?|populat(?:e|es|ed|ing)|replac(?:e|es|ed|ing)|'
+    r'add\s+(?:a|an|the)\s+(?:new\s+)?(?:column|row|slide|table|sheet))\b', re.I)
+
+
+def _binary_document_edit_task(desc, files) -> bool:
+    """True when the task must MODIFY a referenced binary document.
+
+    Batch mode is text-only (map/reduce, no tools), so a .pptx/.docx/.xlsx
+    edit can never happen there (RP-099). Read/extract/summarise tasks stay
+    batch-eligible: both a referenced binary and a modify verb are required.
+    """
+    desc = desc or ''
+    if not _BINARY_MODIFY_RE.search(desc):
+        return False
+    for name, _content in files or []:
+        if os.path.splitext(str(name))[1].lower() not in _BINARY_EXTS:
+            continue
+        base = os.path.basename(str(name))
+        if base and (base in desc or str(name) in desc):
+            return True
+    return False
+
+
+def binary_note(name, model_id=None):
+    """Prompt note for a binary file that could not be inlined as text.
+
+    Images are the exception: a vision-capable model can SEE them — the
+    OpenAI tool loop (agent_router._tool_result_content) delivers read_file
+    results for images as an image part. The old one-size-fits-all "use a
+    code-execution model to parse it" actively steered vision models into
+    building OCR pipelines instead of looking at the picture (regression:
+    RP-087 E3 — a vision model burned 2.4M tokens on a local OCR pipeline
+    and never produced the deliverable). Non-image binaries keep the old
+    advice: their read_file result is base64, not an image part.
+    """
+    ext = os.path.splitext(name)[1].lower()
+    if model_id and ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'):
+        from model_caps import get_cap
+        try:
+            vision = bool(get_cap(model_id).get('vision'))
+        except Exception:
+            vision = False
+        if vision:
+            return (f"\n\n[Binary file `{name}` cannot be inlined as text, but you can "
+                    f"VIEW it: call the read_file tool on it and its content is "
+                    f"delivered to you as an image. Do not build OCR pipelines or use "
+                    f"code execution for this file.]\n")
+    return (f"\n\n[Binary file `{name}` is present in Working Docs but cannot be "
+            f"inlined as text. Use a code-execution model to parse it.]\n")
 
 
 def _approx_token_count(text: str) -> int:
@@ -457,6 +514,7 @@ def build(task, project_path, project=None) -> Dict:
     context_review_needed = False
     used_context_refs = []
     inline_files, batch_files = [], []
+    disabled_batch_names = []
     fallback_index_text = ''
     fallback_footer = ''
 
@@ -611,10 +669,28 @@ def build(task, project_path, project=None) -> Dict:
         context_review_needed = False
         # additions will be built below from inline_files/batch_files
         additions = ''
+        # RP-099: batch mode is text-only (map/reduce, no tools), so a task
+        # that must MODIFY a referenced binary document cannot run there.
+        # Keep the oversized files in the prompt as path notes instead.
+        if batch_files and _binary_document_edit_task(
+                (task or {}).get('description'), inline_files + batch_files):
+            _log.info('batch mode disabled: task edits a referenced binary document')
+            for name, content in batch_files:
+                if os.path.splitext(str(name))[1].lower() in _BINARY_EXTS or content is None:
+                    additions += (
+                        f"\n\n[Large binary file `{name}` is available at its project "
+                        f"path — open and edit it with your file tools; it cannot be "
+                        f"inlined as text.]\n")
+                else:
+                    additions += (
+                        f"\n\n[Large file `{name}` is available at its project path and "
+                        f"is too large to inline — read it with your file tools "
+                        f"(read_file / bash) in chunks.]\n")
+            disabled_batch_names = [name for name, _ in batch_files]
+            batch_files = []
         for name, content in inline_files:
             if content is None:
-                additions += (f"\n\n[Binary file `{name}` is present in Working Docs but cannot be "
-                              f"inlined as text. Use a code-execution model to parse it.]\n")
+                additions += binary_note(name, (task or {}).get('model'))
             else:
                 additions += f"\n\n**File: {name}**\n```\n{content}\n```\n"
         for name, _content in batch_files:
@@ -702,15 +778,34 @@ def build(task, project_path, project=None) -> Dict:
         # catchall path mass-extracts every file: task #10001117 — 54 PDFs, 28-min hang).
         fallback_inline, fallback_batch = _resolve_referenced_files(
             task, project_path, inline_budget, single_file_max, catchall_disabled=True)
+        # RP-099 guard (fallback path): same rule as explicit refs — a task that
+        # must modify a referenced binary document cannot run in text-only batch.
+        if fallback_batch and _binary_document_edit_task(
+                (task or {}).get('description'), fallback_inline + fallback_batch):
+            _log.info('batch mode disabled: task edits a referenced binary document')
+            for name, content in fallback_batch:
+                if os.path.splitext(str(name))[1].lower() in _BINARY_EXTS or content is None:
+                    additions += (
+                        f"\n\n[Large binary file `{name}` is available at its project "
+                        f"path — open and edit it with your file tools; it cannot be "
+                        f"inlined as text.]\n")
+                else:
+                    additions += (
+                        f"\n\n[Large file `{name}` is available at its project path and "
+                        f"is too large to inline — read it with your file tools "
+                        f"(read_file / bash) in chunks.]\n")
+            disabled_batch_names = [name for name, _ in fallback_batch]
+            fallback_batch = []
         for name, content in fallback_inline:
             if content is None:
-                additions += (f"\n\n[Binary file `{name}` is present in Working Docs but cannot be "
-                              f"inlined as text. Use a code-execution model to parse it.]\n")
+                additions += binary_note(name, (task or {}).get('model'))
             else:
                 additions += f"\n\n**File: {name}**\n```\n{content}\n```\n"
         for name, _content in fallback_batch:
             additions += f"\n\n[Large file `{name}` is supplied in chunks below.]\n"
-        fallback_caught = [name for name, _ in fallback_inline] + [name for name, _ in fallback_batch]
+        fallback_caught = ([name for name, _ in fallback_inline]
+                           + [name for name, _ in fallback_batch]
+                           + disabled_batch_names)
         used_context_refs.extend(fallback_caught)
         inline_files.extend(fallback_inline)
         batch_files.extend(fallback_batch)

@@ -9,6 +9,7 @@ import { useIsMobile } from '../hooks/useIsMobile';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
 import { cn } from '../utils/cn';
 import { taskChipById } from '../utils/taskCode';
+import { unmetLabel } from '../utils/deps';
 import type { WorkSession, Task } from '../types';
 
 const STATUSES = ['pending', 'confirmed', 'done', 'failed'] as const;
@@ -17,6 +18,7 @@ const STATUS_COLORS: Record<string, string> = {
   pending: '#645c50',
   confirmed: '#7a6420',
   running: '#3f628f',
+  paused: '#8a5a12',
   done: '#56633f',
   failed: '#a3402f',
   skip: '#645c50',
@@ -223,6 +225,7 @@ export const TaskBoard = () => {
 
   const runError = useStore((s) => s.runError);
   const clearRunError = useStore((s) => s.clearRunError);
+  const blockedBy = useStore((s) => s.blockedBy);
   const [runningSlots, setRunningSlots] = useState<Set<number | null>>(new Set());
   const boardRef = useRef<HTMLDivElement>(null);
   const [runAllRunning, setRunAllRunning] = useState<'claude' | 'mistral' | 'scaleway' | null>(null);
@@ -330,7 +333,9 @@ export const TaskBoard = () => {
     : phaseFiltered;
 
   const pendingTasks = taskFiltered.filter((t) => displayStatus(t.status) === 'pending');
-  const confirmedTasks = taskFiltered.filter((t) => t.status === 'confirmed' || t.status === 'running');
+  // A run paused at its limit (TODO item 16) stays in this column until the
+  // user continues or stops it from the execution log.
+  const confirmedTasks = taskFiltered.filter((t) => t.status === 'confirmed' || t.status === 'running' || t.status === 'paused');
   const doneTasks = taskFiltered.filter((t) => displayStatus(t.status) === 'done');
   const failedTasks = taskFiltered.filter((t) => displayStatus(t.status) === 'failed');
 
@@ -408,9 +413,26 @@ export const TaskBoard = () => {
       if (!confirmedIds.length) return;
       const slotNum = slot;
       try {
-        await api.columns.run(slotNum, confirmedIds);
+        const res = await api.columns.run(slotNum, confirmedIds);
         await reload();
-        setRunningSlots((prev) => new Set(prev).add(slotNum));
+        if ((res?.queued ?? 0) > 0) {
+          setRunningSlots((prev) => new Set(prev).add(slotNum));
+        }
+        // Surface dependency skips so the click isn't a silent no-op (mirrors
+        // the run-all handling): the deps-done gate refuses blocked tasks,
+        // leaving them 'confirmed' — without this the column shows nothing
+        // happening with no explanation.
+        const skipped = res?.skipped_by_deps;
+        if (skipped && skipped.length > 0) {
+          const summary = skipped
+            .map((s) => `${taskChipById(s.task_id, tasks)} blocked by ${s.unmet.map((u) => `${unmetLabel(u)} (${u.status})`).join(', ')}`)
+            .join('; ');
+          if ((res?.queued ?? 0) === 0) {
+            showToast(`Nothing ran — blocked by dependencies: ${summary}. A task cannot run before the task it depends on is done.`, 'error');
+          } else {
+            showToast(`Queued ${res.queued}. ${skipped.length} task(s) skipped — blocked by: ${summary}`, 'info');
+          }
+        }
         // SSE events will update the UI when tasks complete - no polling needed
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : 'Failed to run column';
@@ -418,7 +440,7 @@ export const TaskBoard = () => {
         showToast(msg);
       }
     },
-    [filtered, reload, kanbanTokenBudget, showToast]
+    [filtered, reload, kanbanTokenBudget, showToast, tasks]
   );
 
   const handleRunAll = useCallback(
@@ -464,11 +486,14 @@ export const TaskBoard = () => {
   );
 
   // Count confirmed runnable tasks for a slot (slot-1 sub-session rule).
-  // Tasks held by an AIngel gate (H2a clarifying questions or H2/H3 review) are
-  // excluded — the runner skips them, so running now would be a no-op.
+  // Tasks held by an AIngel gate (H2a clarifying questions or H2/H3 review)
+  // are excluded, and so are dep-blocked tasks (their dependencies aren't
+  // done) — the runner skips both, so running now would be a no-op.
   const runnableCountFor = (slot: number | null, bucketTasks: Task[]): number => {
     if (slot === null) return 0;
-    const runnable = bucketTasks.filter((t) => t.status === 'confirmed' && t.gate_state !== 'hold');
+    const runnable = bucketTasks.filter(
+      (t) => t.status === 'confirmed' && t.gate_state !== 'hold' && !blockedBy.has(t.id),
+    );
     if (slot === 1) {
       const groups = groupBySubSession(runnable, kanbanTokenBudget);
       const firstGroup = groups[0];

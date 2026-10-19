@@ -67,6 +67,7 @@ import agent_git as agit
 import agent_filecat as fcat
 import agent_files
 import agent_archive
+import agent_contract
 import agent_scw_session
 import agent_scw_deploy
 import hf_catalog
@@ -3194,6 +3195,15 @@ def run_gpu_window(dep_id):
                     if tid in _st:
                         _st[tid]['status'] = 'done' if done else 'failed'
                         _st[tid]['error'] = err
+                        # A dependency refusal is a failed run whose error is
+                        # already human-readable ('Blocked by unmet
+                        # dependencies: RP-077 (pending)', frozen contract
+                        # item 1) — keep the non-done→failed mapping, just
+                        # copy the unmet list onto the row so the polling UI
+                        # can name the blocking dep instead of a generic
+                        # failure. Other rows simply carry no 'unmet'.
+                        if isinstance(res, dict) and res.get('unmet'):
+                            _st[tid]['unmet'] = res['unmet']
 
         threading.Thread(target=_run, daemon=True).start()
         return jsonify({'ok': True, 'queued': len(assigned), 'model_id': model_id,
@@ -4084,6 +4094,18 @@ def update_task(tid):
         if slot is not None and not (task.get('description') or '').strip():
             return jsonify({'error': 'Cannot assign a slot to a task with no description. Add a description first.'}), 400
 
+        # Dependency gate (frozen contract item 4): assigning a dep-blocked
+        # task is allowed — the user may be queueing work ahead on purpose —
+        # but the response must say the task will not run until its deps are
+        # done. This is the assign-time signal RP-096 never gave: the card
+        # badge and toast render from this warning, while the status-confirm,
+        # H2a optimistic hold and async precheck below are unchanged.
+        dep_warning = None
+        if slot is not None:
+            _dep = agent_contract.check(task)
+            if not _dep['ok']:
+                dep_warning = {'type': 'dep_blocked', 'unmet': _dep['unmet']}
+
         if data:  # apply remaining fields first
             db.update_task(tid, **data)
 
@@ -4134,8 +4156,14 @@ def update_task(tid):
             # budget, overflow to PAYG (slot 3 accepts every model).
             promoted = db.auto_promote_task(tid) if slot in (1, 2) else None
             if promoted and promoted.get('moved'):
-                return jsonify({'ok': True, 'auto_promoted': promoted})
-        return jsonify({'ok': True})
+                out = {'ok': True, 'auto_promoted': promoted}
+                if dep_warning is not None:
+                    out['warning'] = dep_warning
+                return jsonify(out)
+        out = {'ok': True}
+        if dep_warning is not None:
+            out['warning'] = dep_warning
+        return jsonify(out)
 
     db.update_task(tid, **data)
     return jsonify({'ok': True})
@@ -4215,8 +4243,24 @@ def add_task_dependency(tid):
     depends_on_id = int(depends_on_id)
     if depends_on_id == tid:
         return jsonify({'error': 'A task cannot depend on itself'}), 400
-    if not db.get_task(depends_on_id):
+    dep_task = db.get_task(depends_on_id)
+    if not dep_task:
         return jsonify({'error': f'Dependency task {depends_on_id} not found'}), 404
+    # Acknowledge-at-save (RP-096, 2026-10-17): a dependency that is not done
+    # means this task will not run — the run-time gate refuses it. That must
+    # be a conscious choice, not a silent default; RP-096 was created blocked
+    # and nothing on the card ever said so. The client confirms with
+    # acknowledged:true. Programmatic dep writers (copy_task, auto_chain,
+    # archive restore) add deps in the DB layer and are unaffected by design
+    # — the run-time gate still covers them.
+    if dep_task.get('status') != 'done' and not data.get('acknowledged'):
+        return jsonify({
+            'error': 'dependency_not_done',
+            'unmet': [{'id': dep_task['id'],
+                       'display_code': dep_task.get('display_code'),
+                       'title': dep_task.get('title', ''),
+                       'status': dep_task.get('status', '')}],
+        }), 409
     spec_keys = data.get('spec_keys', [])
     db.add_dependency(tid, depends_on_id, spec_keys)
     return jsonify({'ok': True}), 201
@@ -5013,6 +5057,11 @@ def cancel_execution(eid):
     info = db.get_execution_pid(eid)
     if not info:
         return jsonify({'error': 'Execution not found'}), 404
+    if info['status'] == 'paused':
+        # Cancel on a paused run = stop and discard (TODO item 16).
+        from agent_executor import stop_execution
+        res = stop_execution(eid, discard=True)
+        return jsonify(res), (200 if res.get('status') == 'discarded' else 409)
     if info['status'] != 'running':
         return jsonify({'error': f'Execution is {info["status"]}, not running'}), 409
     # Kill the child process if we have its PID
@@ -5047,6 +5096,67 @@ def cancel_execution(eid):
         if info.get('task_id'):
             db._emit_safe(proj_id, {'type': 'task_changed', 'task_id': info['task_id']})
     return jsonify({'ok': True, 'exec_id': eid, 'status': 'cancelled'})
+
+
+def _paused_exec_access(eid):
+    """404 response unless the caller may change this execution's project."""
+    if auth_enabled():
+        _exec = db.get_execution(eid)
+        _pid = _exec.get('project_id') if _exec else None
+        if _pid is None or not has_project_access(g.current_user, _pid, 'member'):
+            return jsonify({'error': 'not_found'}), 404
+    return None
+
+
+def _run_paused_action_bg(fn, eid, **kw):
+    """Run continue/stop in the background (a resumed block can take as long
+    as a run); the UI follows the execution's SSE events."""
+    def _bg():
+        try:
+            res = fn(eid, **kw)
+            if isinstance(res, dict) and res.get('status') == 'done' and res.get('task_id'):
+                _maybe_autochain_dependents(res['task_id'])
+        except Exception as e:
+            print(f'[paused-run] {fn.__name__} exec {eid} failed: {e}', file=sys.stderr)
+    threading.Thread(target=_bg, daemon=True, name=f'{fn.__name__}-{eid}').start()
+
+
+@app.route('/api/executions/<int:eid>/continue', methods=['POST'])
+@require_auth
+def continue_paused_execution(eid):
+    """Continue a run paused at its turn/time limit (TODO item 16).
+    Body: {note?: str} — passed to the model as a note from the user."""
+    denied = _paused_exec_access(eid)
+    if denied:
+        return denied
+    from agent_executor import continue_check, continue_execution
+    why = continue_check(eid)
+    if why:
+        return jsonify({'error': why}), 409
+    note = ((request.json or {}).get('note') or '').strip()
+    _run_paused_action_bg(continue_execution, eid, note=note)
+    return jsonify({'ok': True, 'exec_id': eid, 'status': 'continuing'}), 202
+
+
+@app.route('/api/executions/<int:eid>/stop', methods=['POST'])
+@require_auth
+def stop_paused_execution(eid):
+    """Stop a paused run. Body: {discard?: bool}. discard=false finishes it
+    with what it produced (H3 reviews it); discard=true drops its changes."""
+    denied = _paused_exec_access(eid)
+    if denied:
+        return denied
+    from agent_executor import stop_execution
+    info = db.get_execution(eid)
+    if not info or info.get('status') != 'paused':
+        return jsonify({'error': f"Execution is {(info or {}).get('status')}, not paused"}), 409
+    discard = bool((request.json or {}).get('discard'))
+    if discard:
+        res = stop_execution(eid, discard=True)
+        code = 200 if res.get('status') == 'discarded' else 409
+        return jsonify(res), code
+    _run_paused_action_bg(stop_execution, eid, discard=False)
+    return jsonify({'ok': True, 'exec_id': eid, 'status': 'stopping'}), 202
 
 
 @app.route('/api/executions/<int:exec_id>/progress')
@@ -8107,6 +8217,23 @@ def _kick_run_seq(slot, task_ids):
                 result = run_task(tid)
                 if not isinstance(result, dict):
                     continue
+                # TOCTOU backstop: the pre-skip above read deps before the
+                # run; run_task re-checks under the project lock and can still
+                # refuse with dep_blocked (e.g. the dep was redone while this
+                # task waited). Recorded like the pre-skip and, critically,
+                # handled BEFORE `previous_result = result`: a dep_blocked
+                # dict has no exec_id/output, and feeding it to
+                # generate_queue_handoff on the next iteration would make a
+                # real mistral-medium-latest LLM call (agent_executor:1314)
+                # on garbage. Other statuses keep their exact prior
+                # behaviour (quota_paused / quota-failed break out).
+                if result.get('status') == 'dep_blocked':
+                    skipped_because_deps.append(
+                        (tid, [d['id'] for d in result.get('unmet', [])]))
+                    app.logger.info(
+                        'Slot %s: task %s refused by runtime dep gate: %s',
+                        slot, tid, result.get('error'))
+                    continue
                 previous_result = result
                 status = result.get('status')
                 if status == 'quota_paused':
@@ -8157,12 +8284,19 @@ def _kick_run_seq(slot, task_ids):
 
 
 def _run_task_ids(slot, task_ids):
+    # Pre-flight dep skips (frozen contract item 5): the column run currently
+    # ignores the response entirely, so a fully-blocked column looks like a
+    # dead click — RP-096's card showed nothing at all. Same skipped_by_deps
+    # shape the run-all endpoints already return, so the frontend can toast
+    # the skips identically.
+    skipped_by_deps = _preflight_dep_skips(task_ids)
     ok, msg = _kick_run_seq(slot, task_ids)
     if not ok:
         return jsonify({'error': msg}), 409
     if msg == 'No tasks to run':
         return jsonify({'ok': True, 'slot': slot, 'queued': 0, 'message': msg})
-    return jsonify({'ok': True, 'slot': slot, 'queued': len(task_ids)})
+    return jsonify({'ok': True, 'slot': slot, 'queued': len(task_ids),
+                    'skipped_by_deps': skipped_by_deps})
 
 
 @app.route('/api/tasks/<int:tid>/archive', methods=['POST'])

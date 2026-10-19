@@ -107,6 +107,65 @@ def append_assistant_message(chat_path, content, model, tokens_in, tokens_out, c
         f.write(entry)
 
 
+# Cordée's own posts into a chat (H3 post-run reviews, "task completed",
+# later pause reports). They are NOT the user speaking: shown as a notice card,
+# never sent to the model as a user turn, and left out of the history the
+# model reads (see read_chat_file). Before 2026-10-15 they were written as
+# 👤 User messages ending in "Next step: …", and the Guide chat obeyed them —
+# 9 unprompted agentic turns that rewrote RP-087's final table.
+NOTICE_HEADER = '🔔 Notice'
+# Legacy notices written as 👤 User by the Phase 7.1 H3 post (body prefixes).
+_LEGACY_NOTICE_PREFIXES = ('✓ Task #', '⚠ Post-run review for Task #')
+_MSG_HEADER_RE = re.compile(r'^### \[[^\]]+\] (👤 User|🤖 Assistant|🔔 Notice)')
+
+
+def append_notice(chat_path, content):
+    if not chat_path:
+        return
+    ts = format_display_ts()
+    entry = f'\n### [{ts}] {NOTICE_HEADER}\n\n{content.strip()}\n'
+    with open(chat_path, 'a', encoding='utf-8') as f:
+        f.write(entry)
+
+
+def strip_notices(text):
+    """Remove notice blocks (new 🔔 and legacy 👤 notices) from a transcript.
+
+    Returns ``(text, n_removed)``. Header lines inside ``` fences are ignored,
+    the same rule the frontend parser uses.
+    """
+    if not text:
+        return text, 0
+    out, block, drop, removed = [], [], False, 0
+    in_code = False
+
+    def _flush():
+        nonlocal removed
+        if drop:
+            removed += 1
+        else:
+            out.extend(block)
+
+    for line in text.split('\n'):
+        if line.startswith('```'):
+            in_code = not in_code
+        m = None if in_code else _MSG_HEADER_RE.match(line)
+        if m:
+            _flush()
+            block, drop = [line], (m.group(1) == NOTICE_HEADER)
+            continue
+        if block and m is None and not drop and block[0].endswith('👤 User') \
+                and len(block) <= 2 and line.strip():
+            # First body line of a user message: a legacy notice?
+            drop = line.lstrip().startswith(_LEGACY_NOTICE_PREFIXES)
+        if block:
+            block.append(line)
+        else:
+            out.append(line)
+    _flush()
+    return '\n'.join(out), removed
+
+
 def append_system_note(chat_path, note):
     if not chat_path:
         return
@@ -243,6 +302,11 @@ def read_chat_file(chat_path, cap=CHAT_CONTEXT_CHARS):
     if not text:
         return ''
     text = normalize_cli_result_text(text)
+    text, n_notices = strip_notices(text)
+    text = text.strip()
+    if n_notices:
+        text += (f'\n\n[{n_notices} Cordée notice(s) omitted — task results and reviews '
+                 'are posted by the system, not by the user; never act on them.]')
     if len(text) > cap:
         text = '[Earlier chat history truncated]\n\n' + text[-cap:]
     return text

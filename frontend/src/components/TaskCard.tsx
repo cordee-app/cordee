@@ -7,11 +7,13 @@ import { fmtUsd } from '../utils/currency';
 import { stuckReason } from '../utils/stuck';
 import { taskChip } from '../utils/taskCode';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
+import { parseUnmetDeps, unmetLabel, unmetLine } from '../utils/deps';
 import type { CSSProperties } from 'react';
 import type { Task, GateQuestion } from '../types';
 import { SLOT_LABELS, allowedSlotsForModel } from './providers';
 import { Spinner } from './Spinner';
 import { TaskOverflowMenu } from './TaskOverflowMenu';
+import { PausedRunPanel } from './PausedRunPanel';
 import { ArrowDown, ArrowUp, TriangleAlert, Paperclip } from 'lucide-react';
 
 interface Props {
@@ -49,6 +51,8 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
   const setWorkSessions = useStore((s) => s.setWorkSessions);
   const setMemPanelOpen = useStore((s) => s.setMemPanelOpen);
   const setMemActiveTab = useStore((s) => s.setMemActiveTab);
+  const blockedBy = useStore((s) => s.blockedBy);
+  const setRunError = useStore((s) => s.setRunError);
 
   const isSelected = selectedTasks.has(task.id);
   const statusColor = STATUS_COLORS[task.status] || '#645c50';
@@ -65,6 +69,13 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
   // True review window: held but no questions yet — badge reads "reviewing…".
   const h2aReviewing = h2aHeld && !task.gate_report_h2_json;
 
+  // Dependency gate (deps-done rule): this task has at least one dependency
+  // that isn't done — it refuses to run (no execution row) until the dep
+  // finishes. Distinct from the H2a gate hold above: the task stays
+  // confirmed and unblocks automatically once its deps are done.
+  const unmetDeps = blockedBy.get(task.id);
+  const depBlocked = Boolean(unmetDeps && unmetDeps.length > 0);
+
   const executions = useStore((s) => s.executions);
   const [tick, setTick] = useState(0);
   useEffect(() => {
@@ -73,6 +84,12 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
     return () => clearInterval(id);
   }, [isRunning]);
   void tick;
+  // Run paused at its limit (TODO item 16): its latest paused execution.
+  const pausedExec = useMemo(() => {
+    if (task.status !== 'paused') return undefined;
+    const cands = executions.filter((e) => e.task_id === task.id && e.status === 'paused');
+    return cands.sort((a, b) => b.id - a.id)[0];
+  }, [executions, task.id, task.status]);
   const runningExec = useMemo(() => {
     if (!isRunning) return null;
     const cands = executions.filter((e) => e.task_id === task.id && e.status === 'running');
@@ -217,7 +234,18 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
     setSlotApplying(slot);
     try {
       const slotVal = slot as never as number | undefined;
-      const res = await api.tasks.update(task.id, { work_session_slot: slotVal }) as Record<string, unknown> | undefined;
+      const res = await api.tasks.update(task.id, { work_session_slot: slotVal });
+      // Dependency gate: the assign went through, but a dep-blocked task
+      // carries a warning in the response — toast it (the card badge below
+      // carries the persistent detail).
+      if (res?.warning?.type === 'dep_blocked') {
+        const unmet = parseUnmetDeps(res.warning.unmet);
+        if (unmet.length > 0) {
+          setRunError(
+            `Task assigned, but it's blocked by: ${unmet.map((u) => `${unmetLabel(u)} (${u.status})`).join(', ')}`,
+          );
+        }
+      }
       // Optimistic local update: avoid the heavy reload() that iterates all 14
       // project DBs. The card moves to its new bucket immediately. If the
       // backend auto-promoted the task to a different slot (slot-1 overflow →
@@ -428,6 +456,25 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
         >
           {task.title}
         </div>
+        {depBlocked && unmetDeps && (
+          <div
+            className="mx-0.5 mt-1 mb-1 px-2 py-1 rounded text-xs cursor-pointer"
+            style={{
+              background: 'rgba(178,98,45,0.12)',
+              border: '1px solid rgba(178,98,45,0.35)',
+            }}
+            data-tip="This task refuses to run until its dependencies are done — click to manage them"
+            title={unmetDeps.map((u) => `${unmetLabel(u)} (${u.status})${u.title ? ` — ${u.title}` : ''}`).join('\n')}
+            onClick={(e) => { e.stopPropagation(); setDepsModalTaskId(task.id); }}
+          >
+            <span className="font-semibold" style={{ color: '#b2622d' }}>
+              🚧 Blocked by {unmetLabel(unmetDeps[0])} ({unmetDeps[0].status})
+            </span>
+            {unmetDeps.length > 1 && (
+              <span className="text-faint ml-1">+{unmetDeps.length - 1} more</span>
+            )}
+          </div>
+        )}
         {perms.canEdit && !isReadOnly && !isArchived && !awaitingHf && (task.status === 'pending' || task.status === 'confirmed' || task.status === 'skip' || task.status === 'cancelled') && (() => {
           const slots = allowedSlotsForModel(task.model);
           return (
@@ -599,6 +646,8 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
         {task.title}
       </div>
 
+      {pausedExec && <PausedRunPanel exec={pausedExec} canEdit={perms.canEdit} />}
+
       {task.gate_state === 'hold' && (
         <div
           className="mx-1 mb-1.5 px-2 py-1.5 rounded text-xs"
@@ -711,13 +760,18 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
               </button>
               {(task.status === 'pending' || task.status === 'confirmed') && (
                 <button
-                  data-tip="Override the gate and run this task now"
+                  data-tip={depBlocked
+                    ? 'Resolve dependencies first — Override does not bypass the dependency gate'
+                    : 'Override the gate and run this task now'}
                   className="btn-xs font-semibold"
                   style={{
                     background: 'rgba(163,64,47,0.08)',
                     border: '1px solid rgba(163,64,47,0.3)',
                     color: '#a3402f',
+                    opacity: depBlocked ? 0.5 : 1,
+                    cursor: depBlocked ? 'not-allowed' : undefined,
                   }}
+                  disabled={depBlocked}
                   onClick={async (e) => {
                     e.stopPropagation();
                     try {
@@ -725,7 +779,19 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
                       const execRes = await api.execute(task.id);
                       reload();
                       if (execRes && execRes.status !== 'done') {
-                        alert('Run failed: ' + (execRes.error || 'unknown error'));
+                        if (execRes.status === 'dep_blocked') {
+                          // Dependency-gate refusal: list what must finish
+                          // first instead of a generic "unknown error".
+                          const unmet = parseUnmetDeps(execRes.unmet);
+                          alert(
+                            'Run blocked by unmet dependencies:\n'
+                            + (unmet.length
+                              ? unmet.map(unmetLine).join('\n')
+                              : (execRes.error || 'Blocked by unmet dependencies')),
+                          );
+                        } else {
+                          alert('Run failed: ' + (execRes.error || 'unknown error'));
+                        }
                       }
                     } catch { /* ignore */ }
                   }}
@@ -756,6 +822,29 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
       )}
 
       {task.phase_name && <div className="task-phase text-sm+ text-soft mb-1">{task.phase_name}</div>}
+
+      {depBlocked && unmetDeps && (
+        <div
+          className="mx-1 mb-1.5 px-2 py-1.5 rounded text-xs cursor-pointer"
+          style={{
+            background: 'rgba(178,98,45,0.12)',
+            border: '1px solid rgba(178,98,45,0.35)',
+          }}
+          data-tip="This task refuses to run until its dependencies are done — click to manage them"
+          title={unmetDeps.map((u) => `${unmetLabel(u)} (${u.status})${u.title ? ` — ${u.title}` : ''}`).join('\n')}
+          onClick={(e) => { e.stopPropagation(); setDepsModalTaskId(task.id); }}
+        >
+          <span className="font-semibold" style={{ color: '#b2622d' }}>
+            🚧 Blocked by {unmetLabel(unmetDeps[0])} ({unmetDeps[0].status})
+          </span>
+          {unmetDeps.length > 1 && (
+            <span className="text-faint ml-1">+{unmetDeps.length - 1} more</span>
+          )}
+          <div className="text-faint text-2xs mt-0.5">
+            It won't run until its dependencies are done — Override doesn't bypass this.
+          </div>
+        </div>
+      )}
 
       {hasDeps && (
         <div className="flex gap-1 mb-1 px-1">

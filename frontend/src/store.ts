@@ -3,14 +3,50 @@ import { persist } from 'zustand/middleware';
 import type {
   Project, Task, Model, Execution, Phase, Chat, Role,
   WorkSession, CostSummary, Config, ProviderReadiness, ModelRecommendation,
-  User, QuotaStatus,
+  User, QuotaStatus, DependencyEdge, UnmetDep,
 } from './types';
 import { api } from './api';
+import { parseUnmetDeps, unmetLabel } from './utils/deps';
+import { taskChipById } from './utils/taskCode';
 
 export type MainTab = 'dashboard' | 'board' | 'graph';
 export type SettingsTab = 'general' | 'project' | 'users';
 export type MemTab = 'files' | 'defs' | 'artifacts' | 'docs' | 'perms' | 'git' | 'roles' | 'spec';
 export type NpFileEntry = { name: string; content: string };
+
+/**
+ * Derive the blocked map from the active project's dependency edges: for
+ * every task of the active project, the list of its deps that aren't 'done'
+ * (the run-time gate's green rule — `!= done`, mode-agnostic). Edge
+ * payloads carry title/status but no display_code, so enrich from the tasks
+ * in store when the dep is visible there; cross-project deps fall back to
+ * title+status.
+ */
+function computeBlockedBy(
+  edges: DependencyEdge[],
+  tasks: Task[],
+  projectId: number | null,
+): Map<number, UnmetDep[]> {
+  const map = new Map<number, UnmetDep[]>();
+  if (projectId === null) return map;
+  const byId = new Map<number, Task>();
+  for (const t of tasks) byId.set(t.id, t);
+  for (const e of edges) {
+    if (e.task_project_id !== projectId) continue;
+    if (!e.depends_on_status || e.depends_on_status === 'done') continue;
+    const depTask = byId.get(e.depends_on_id);
+    const entry: UnmetDep = {
+      id: e.depends_on_id,
+      display_code: depTask?.display_code ?? undefined,
+      title: e.depends_on_title || depTask?.title || `Task ${e.depends_on_id}`,
+      status: e.depends_on_status,
+    };
+    const list = map.get(e.task_id);
+    if (list) list.push(entry);
+    else map.set(e.task_id, [entry]);
+  }
+  return map;
+}
 
 interface Store {
   user: User | null;
@@ -74,6 +110,14 @@ interface Store {
 
   depCache: Record<number, { byTask: Record<number, unknown>; rows: unknown[] }>;
   depCacheVersion: Record<number, number>;
+
+  // Dependency gate (deps-done rule): raw edges for the active project plus
+  // the derived blocked map. Refetched on project switch, task_changed /
+  // dep_blocked SSE and dep mutations; recomputed on every tasks change so
+  // the display_code enrichment stays fresh.
+  depEdges: DependencyEdge[];
+  blockedBy: Map<number, UnmetDep[]>;
+  refreshDepEdges: () => Promise<void>;
 
   kanbanTokenBudget: number;
   costToday: number;
@@ -226,11 +270,13 @@ interface Store {
   setLastCfg: (c: Config | null) => void;
   setLastReady: (r: ProviderReadiness | null) => void;
 
-  handleSSEEvent: (evt: { type: string; task_id?: number; exec_id?: number; chat_id?: number; slot?: number; error?: string; quota?: string; limit?: number }) => void;
+  handleSSEEvent: (evt: { type: string; task_id?: number; exec_id?: number; chat_id?: number; slot?: number; error?: string; quota?: string; limit?: number; unmet?: unknown }) => void;
   _lastChangedChatId: number | null;
-  // Last background run failure (e.g. free-tier quota block). Transient —
-  // consumed by the board to toast the error and clear Running indicators.
+  // Last background run failure (e.g. free-tier quota block) or dependency-
+  // gate refusal. Transient — consumed by the board to toast the error and
+  // clear Running indicators.
   runError: { msg: string; slot: number | null; at: number } | null;
+  setRunError: (msg: string, slot?: number | null) => void;
   clearRunError: () => void;
 }
 
@@ -326,6 +372,9 @@ export const useStore = create<Store>()(
       depCache: {},
       depCacheVersion: {},
 
+      depEdges: [],
+      blockedBy: new Map(),
+
       kanbanTokenBudget: 150000,
       costToday: 0,
       costWeek: 0,
@@ -371,7 +420,12 @@ export const useStore = create<Store>()(
       scaffoldName: '',
 
       setProjects: (projects) => set({ projects }),
-      setTasks: (tasks) => set((s) => ({ tasks: typeof tasks === 'function' ? tasks(s.tasks) : tasks })),
+      setTasks: (tasks) => set((s) => {
+        const next = typeof tasks === 'function' ? tasks(s.tasks) : tasks;
+        // Keep the blocked map's display_code enrichment fresh alongside the
+        // task rows it derives from.
+        return { tasks: next, blockedBy: computeBlockedBy(s.depEdges, next, s.activeProject) };
+      }),
       setModels: (models) => set({ models }),
       setExecutions: (executions) => set({ executions }),
       setPhasesData: (phasesData) => set({ phasesData }),
@@ -568,6 +622,21 @@ export const useStore = create<Store>()(
       setLastCfg: (lastCfg) => set({ lastCfg }),
       setLastReady: (lastReady) => set({ lastReady }),
       clearRunError: () => set({ runError: null }),
+      setRunError: (msg, slot) => set({ runError: { msg, slot: slot ?? null, at: Date.now() } }),
+      // Dependency edges for the active project. Never blocks the caller:
+      // on failure the previous map stays until the next refetch.
+      refreshDepEdges: () => {
+        const pid = get().activeProject;
+        if (pid === null) {
+          set({ depEdges: [], blockedBy: new Map() });
+          return Promise.resolve();
+        }
+        return api.projects.dependencies(pid)
+          .then((edges) => {
+            set((s) => ({ depEdges: edges, blockedBy: computeBlockedBy(edges, s.tasks, pid) }));
+          })
+          .catch(() => { /* transient — the next refetch catches up */ });
+      },
       setScaffoldPid: (scaffoldPid) => set({ scaffoldPid }),
       setScaffoldChatId: (scaffoldChatId) => set({ scaffoldChatId }),
       setScaffoldName: (scaffoldName) => set({ scaffoldName }),
@@ -579,6 +648,10 @@ export const useStore = create<Store>()(
           switch (evt.type) {
             case 'task_changed':
               set({ tasks: await api.tasks.list() });
+              // Dependency statuses can flip with any task change (a dep
+              // finishing unblocks its dependents) — keep the blocked map
+              // fresh alongside the task rows.
+              get().refreshDepEdges();
               break;
             case 'execution_changed':
               set({ executions: await api.executions.list(100) });
@@ -613,6 +686,21 @@ export const useStore = create<Store>()(
             case 'work_session_changed':
               set({ workSessions: await api.workSessions.status() });
               break;
+            case 'dep_blocked': {
+              // Dependency-gate refusal (deps not done): no execution row,
+              // the task stays as-is. Toast the reason through the same
+              // channel as run failures and refresh so the card badge and
+              // runnable counts catch up immediately.
+              const unmet = parseUnmetDeps(evt.unmet);
+              const chip = typeof evt.task_id === 'number'
+                ? taskChipById(evt.task_id, get().tasks)
+                : 'Task';
+              const list = unmet.map((u) => `${unmetLabel(u)} (${u.status})`).join(', ');
+              set({ runError: { msg: `${chip} blocked by: ${list || 'unmet dependencies'}`, slot: null, at: Date.now() } });
+              set({ tasks: await api.tasks.list() });
+              get().refreshDepEdges();
+              break;
+            }
             case 'run_failed':
               // Background run-thread failure (e.g. free-tier quota block):
               // the kick returned ok:true so the board shows Running — toast

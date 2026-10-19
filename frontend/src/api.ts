@@ -3,6 +3,7 @@ import type {
   Role, WorkSession, CostSummary, DashboardData, Config, ProviderReadiness,
   ModelRecommendation, ChatMessageResponse, EstimateResult, BudgetInfo,
   MemoryView, ContextOptions, AttachableTask, TaskAttachment, GateAction, MemoryLevel, GitMode,
+  UnmetDep, TaskUpdateWarning, SkippedByDeps,
   ScwSessionStatus, Deployment, FilesCatalog, ProjectHfModel, HfSearchResult, HfCandidate,
   HfQueueGroup, GpuWindow, GpuWindowModel, GpuRunStatus,
   HfImportVerify, HfModelImport,
@@ -331,7 +332,7 @@ export const api = {
     resolveTaskCode: (code: string) =>
       get<{ task_id: number; project_id: number }>(`/api/tasks/resolve?code=${encodeURIComponent(code)}`),
     update: (tid: number, data: Partial<Task & { handoff_context?: string }>) =>
-      patch<{ ok: boolean; auto_promoted?: string }>(`/api/tasks/${tid}`, data),
+      patch<{ ok: boolean; auto_promoted?: string; warning?: TaskUpdateWarning }>(`/api/tasks/${tid}`, data),
     delete: (tid: number) => del<{ ok: true }>(`/api/tasks/${tid}`),
     archive: (tid: number) => post<{ ok: true }>(`/api/tasks/${tid}/archive`),
     redo: (tid: number) => post<Task>(`/api/tasks/${tid}/redo`),
@@ -345,7 +346,9 @@ export const api = {
 
     dependencies: {
       list: (tid: number) => get<TaskDependencies>(`/api/tasks/${tid}/dependencies`),
-      add: (tid: number, data: { depends_on_id: number; spec_keys?: string[] }) =>
+      // `acknowledged: true` = the user confirmed saving a dependency that
+      // isn't done (the 409 dependency_not_done backstop requires it).
+      add: (tid: number, data: { depends_on_id: number; spec_keys?: string[]; acknowledged?: boolean }) =>
         post<{ ok: true }>(`/api/tasks/${tid}/dependencies`, data),
       remove: (tid: number, did: number) => del<{ ok: true }>(`/api/tasks/${tid}/dependencies/${did}`),
     },
@@ -357,10 +360,15 @@ export const api = {
   },
 
   // ── Execute ─────────────────────────────────────────────────────────
+  // A deps-done gate refusal comes back as the DepBlockedResult shape
+  // (status 'dep_blocked' + unmet — no execution row, task stays as-is).
   execute: (taskId: number) => post<{
     status: string; task_id: number; model: string;
     tokens_in: number; tokens_out: number; cost_usd: number;
     error?: string; quota?: string; limit?: number;
+    /** Present when status === 'dep_blocked' — the deps-done gate refused
+     *  the run (no execution row, task stays as-is). */
+    unmet?: UnmetDep[];
   }>('/api/execute', { task_id: taskId }),
 
   // ── Executions ──────────────────────────────────────────────────────
@@ -370,6 +378,10 @@ export const api = {
     output: (eid: number) => get<{ content: string; source?: string }>(`/api/execution/output/${eid}`),
     diff: (eid: number) => get<{ diff: string; base_branch: string; task_branch: string }>(`/api/executions/${eid}/diff`),
     cancel: (eid: number) => post<{ ok: boolean; exec_id: number; status: string }>(`/api/executions/${eid}/cancel`),
+    /** Paused at its turn/time limit (TODO item 16): run another block, optionally with a note. */
+    continue: (eid: number, note?: string) => post<{ ok: boolean; exec_id: number; status: string }>(`/api/executions/${eid}/continue`, { note: note || '' }),
+    /** Paused run: finish with what it produced (discard=false) or drop its changes (discard=true). */
+    stop: (eid: number, discard: boolean) => post<{ ok?: boolean; exec_id: number; status: string; error?: string }>(`/api/executions/${eid}/stop`, { discard }),
     progressUrl: (eid: number) => `/api/executions/${eid}/progress`,
   },
 
@@ -448,8 +460,10 @@ export const api = {
   },
 
   columns: {
-    run: (slot: number, taskIds: number[]) => post<{ ok: boolean; slot: number; queued: number }>(
-      `/api/columns/${slot}/run`, { task_ids: taskIds }),
+    run: (slot: number, taskIds: number[]) => post<{
+      ok: boolean; slot: number; queued: number;
+      skipped_by_deps?: SkippedByDeps[];
+    }>(`/api/columns/${slot}/run`, { task_ids: taskIds }),
   },
 
   // ── Roles ───────────────────────────────────────────────────────────

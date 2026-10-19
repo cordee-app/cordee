@@ -28,6 +28,12 @@ import subprocess
 DEFAULT_BRANCH = 'main'
 GIT_TIMEOUT = 120  # seconds
 
+# Git abbreviates long paths at the default 80-col diffstat width (both
+# `.../name` and `...name` forms). RP-099's 79-char filename was stored as
+# `..._Bilateral_...pptx`, so the Exec Log had no link to the real file.
+# Widen the stat so git emits full paths; callers keep their fallback fixup.
+_DIFFSTAT_FLAG = '--stat=1000'
+
 # Files SuperAgent manages itself — kept out of the project's *code* history so
 # the diff a user reviews is the AI's actual code change, not bookkeeping.
 # Artifacts/ bookkeeping (exec logs, chat logs, memories) is appended to even
@@ -38,10 +44,15 @@ GIT_TIMEOUT = 120  # seconds
 # User-file folders (agent_files working-doc variants). 'docs/' is left out on
 # purpose: in code projects it is project documentation and stays versioned.
 USER_FILE_IGNORE_RULES = ('Working Documents/', 'Working Docs/', 'My Docs/', 'working-docs/')
+# A task's working files (crops, tiles, helper scripts) go in
+# Artifacts/outputs/<task>/_work/ and are never versioned: RP-087's runs
+# committed ~120 MB of tiles, and every paused part of RP-094 committed more.
+WORK_DIR_IGNORE_RULE = 'Artifacts/outputs/**/_work/'
 ARTIFACTS_IGNORE_RULES = (
     'Artifacts/*',
     '!Artifacts/outputs/',
     'Artifacts/outputs/**/exec-*-output.md',
+    WORK_DIR_IGNORE_RULE,
 )
 GITIGNORE_TEMPLATE = """\
 # ── Managed by SuperAgent (execution bookkeeping, not project code) ──
@@ -89,7 +100,8 @@ node_modules/
 # Runtime state git must never own. Tracking any of these makes a branch
 # checkout revert live state — see _untrack_runtime_files and the `checkout -f`
 # in discard_task_branch.
-_RUNTIME_IGNORE_RULES = ('project.db*', 'Artifacts/eu-audit.log', '.trash/') + USER_FILE_IGNORE_RULES
+_RUNTIME_IGNORE_RULES = ('project.db*', 'Artifacts/eu-audit.log', '.trash/',
+                         WORK_DIR_IGNORE_RULE) + USER_FILE_IGNORE_RULES
 _RUNTIME_PATHSPECS    = ('project.db', 'project.db.*', 'project.db-*',
                          'Artifacts/eu-audit.log', '.trash') + tuple(
                             r.rstrip('/') for r in USER_FILE_IGNORE_RULES)
@@ -380,7 +392,7 @@ def commit_task(project_path, task_id, title):
                     _run(project_path, 'commit', '-m',
                          f'Task #{task_id}: remove tombstoned (resurrected) files')
                 _, sha, _ = _run(project_path, 'rev-parse', '--short', 'HEAD')
-                _, diffstat, _ = _run(project_path, 'diff', '--stat', f'{base}...HEAD')
+                _, diffstat, _ = _run(project_path, 'diff', _DIFFSTAT_FLAG, f'{base}...HEAD')
                 return {'ok': True, 'changed': True, 'commit': sha,
                         'diffstat': diffstat, 'branch': branch,
                         'precommitted': True, 'tombstone_note': gate.get('note', '')}
@@ -398,14 +410,14 @@ def commit_task(project_path, task_id, title):
         return {'ok': False, 'changed': False, 'branch': branch, 'error': f'git commit failed: {err}'}
 
     _, sha, _ = _run(project_path, 'rev-parse', '--short', 'HEAD')
-    _, diffstat, _ = _run(project_path, 'diff', '--stat', f'{base}...HEAD')
+    _, diffstat, _ = _run(project_path, 'diff', _DIFFSTAT_FLAG, f'{base}...HEAD')
     result = {'ok': True, 'changed': True, 'commit': sha, 'diffstat': diffstat, 'branch': branch}
     if gate.get('trashed'):
         result['tombstone_note'] = gate.get('note', '')
     return result
 
 
-def commit_chat(project_path, chat_id, chat_name=''):
+def commit_chat(project_path, chat_id, chat_name='', paths=None):
     """
     Commit any file changes left by a chat execution directly on the current branch.
 
@@ -414,15 +426,28 @@ def commit_chat(project_path, chat_id, chat_name=''):
     they are not left as uncommitted noise that confuses subsequent task
     branch operations (stash/checkout).
 
+    ``paths`` (project-relative) limits the commit to those paths — the Guide
+    chat passes ``['Artifacts/chats']`` so a Guide turn can never commit
+    anything else in the tree (2026-10-15: `git add -A` committed the Guide's
+    edits to task outputs as "Chat #7").
+
     Returns {'ok', 'changed', 'commit', 'diffstat'}.
     """
     if not is_repo(project_path):
         return {'ok': False, 'changed': False, 'error': 'not a git repo'}
 
-    if is_clean(project_path):
-        return {'ok': True, 'changed': False, 'commit': '', 'diffstat': ''}
-
-    ok, _, err = _run(project_path, 'add', '-A')
+    if paths:
+        paths = [p for p in paths if os.path.exists(os.path.join(project_path, p))]
+        if not paths:
+            return {'ok': True, 'changed': False, 'commit': '', 'diffstat': ''}
+        _, porcelain, _ = _run(project_path, 'status', '--porcelain', '--', *paths)
+        if not porcelain.strip():
+            return {'ok': True, 'changed': False, 'commit': '', 'diffstat': ''}
+        ok, _, err = _run(project_path, 'add', '-A', '--', *paths)
+    else:
+        if is_clean(project_path):
+            return {'ok': True, 'changed': False, 'commit': '', 'diffstat': ''}
+        ok, _, err = _run(project_path, 'add', '-A')
     if not ok:
         return {'ok': False, 'changed': False, 'error': f'git add failed: {err}'}
 
@@ -430,12 +455,15 @@ def commit_chat(project_path, chat_id, chat_name=''):
     gate = gate_tombstones(project_path, scope='staged')
 
     label = f': {chat_name[:60]}' if chat_name else ''
-    ok, _, err = _run(project_path, 'commit', '-m', f'Chat #{chat_id}{label}')
+    commit_args = ['commit', '-m', f'Chat #{chat_id}{label}']
+    if paths:
+        commit_args += ['--', *paths]   # commit only these paths, whatever else is staged
+    ok, _, err = _run(project_path, *commit_args)
     if not ok:
         return {'ok': False, 'changed': False, 'error': f'git commit failed: {err}'}
 
     _, sha, _ = _run(project_path, 'rev-parse', '--short', 'HEAD')
-    _, diffstat, _ = _run(project_path, 'diff', '--stat', 'HEAD~1..HEAD')
+    _, diffstat, _ = _run(project_path, 'diff', _DIFFSTAT_FLAG, 'HEAD~1..HEAD')
     result = {'ok': True, 'changed': True, 'commit': sha.strip(), 'diffstat': diffstat}
     if gate.get('trashed'):
         result['tombstone_note'] = gate.get('note', '')
@@ -504,6 +532,30 @@ def get_commit_diff(project_path, commit, context=3):
     return {'diff': out, 'total_lines': total, 'truncated': total > 5000}
 
 
+# Files Cordée regenerates from the task database. A conflict in them carries
+# no content to keep: take the base's copy and regenerate it after the merge.
+# A paused run hits this (TODO item 16): its branch and the base both change
+# the task's status line in GUIDE.md while it waits (RP-094: "Checkpoint before
+# resuming" on main vs the WIP commits on the branch), and the merge aborted,
+# leaving the deliverable on an unmerged branch — the Exec Log link 404'd.
+_GENERATED_FILES = ('GUIDE.md',)
+
+
+def _resolve_generated_conflicts(project_path):
+    """During a failed merge: if every conflicted path is a generated file,
+    keep the base's version of each and stage it. True when resolved."""
+    _, out, _ = _run(project_path, 'diff', '--name-only', '--diff-filter=U')
+    conflicted = [l.strip() for l in (out or '').splitlines() if l.strip()]
+    if not conflicted or any(p not in _GENERATED_FILES for p in conflicted):
+        return False
+    for p in conflicted:
+        ok, _, _ = _run(project_path, 'checkout', '--ours', '--', p)
+        if not ok:
+            return False
+        _run(project_path, 'add', '--', p)
+    return True
+
+
 def merge_task_branch(project_path, branch, task_id=None):
     """Approve: merge the task branch into the default branch, then delete it."""
     if not branch or not is_repo(project_path):
@@ -534,6 +586,8 @@ def merge_task_branch(project_path, branch, task_id=None):
     label = f'task #{task_id}' if task_id is not None else branch
     ok, out, err = _run(project_path, 'merge', '--no-ff', branch,
                         '-m', f'Merge {label} (approved)')
+    if not ok and _resolve_generated_conflicts(project_path):
+        ok, out, err = _run(project_path, 'commit', '--no-edit')
     if not ok:
         _run(project_path, 'merge', '--abort')  # leave base pristine on conflict
         restored = restore_stash()
@@ -580,6 +634,48 @@ def revert_merge(project_path, commit):
 
     _, sha, _ = _run(project_path, 'rev-parse', '--short', 'HEAD')
     return {'ok': True, 'reverted': True, 'base': base, 'commit': sha}
+
+
+def pause_task_branch(project_path, branch, task_id, part):
+    """Park a paused run's work (TODO item 16): commit everything on the task
+    branch as a WIP commit, then return to the default branch so other tasks
+    can run. The branch is kept for Continue / Stop."""
+    if not branch or not is_repo(project_path):
+        return {'ok': False, 'error': 'no branch or not a repo'}
+    if current_branch(project_path) != branch:
+        return {'ok': False, 'error': f'not on {branch}'}
+    if not is_clean(project_path):
+        _run(project_path, 'add', '-A')
+        gate_tombstones(project_path, scope='staged')
+        ok, _, err = _run(project_path, 'commit', '-m',
+                          f'Task #{task_id}: paused at limit (part {part})')
+        if not ok:
+            return {'ok': False, 'error': f'git commit failed: {err}'}
+    base = default_branch(project_path)
+    ok, _, err = _run(project_path, 'checkout', base)
+    if not ok:
+        return {'ok': False, 'error': f'checkout {base} failed: {err}'}
+    return {'ok': True, 'branch': branch, 'base': base}
+
+
+def resume_task_branch(project_path, branch, task_id):
+    """Check out a paused run's task branch again (no recreation, unlike
+    start_task_branch). Pre-existing dirty state on the default branch is
+    checkpointed first, the same way a new run does."""
+    if not branch or not is_repo(project_path):
+        return {'ok': False, 'active': False, 'error': 'no branch or not a repo'}
+    base = default_branch(project_path)
+    _run(project_path, 'checkout', base)
+    _untrack_runtime_files(project_path)
+    if not is_clean(project_path):
+        _run(project_path, 'add', '-A')
+        gate_tombstones(project_path, scope='staged')
+        _run(project_path, 'commit', '-m', f'Checkpoint before resuming task #{task_id}')
+    ok, _, err = _run(project_path, 'checkout', branch)
+    if not ok:
+        _run(project_path, 'checkout', base)
+        return {'ok': False, 'active': False, 'branch': branch, 'base': base, 'error': err}
+    return {'ok': True, 'active': True, 'branch': branch, 'base': base}
 
 
 def discard_task_branch(project_path, branch):

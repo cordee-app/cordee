@@ -5,7 +5,8 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import ExitStack
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import agent_router
 import agent_chats
@@ -259,6 +260,77 @@ class AgentRouterCliTests(unittest.TestCase):
 
         self.assertEqual(text, '')
 
+    @staticmethod
+    def _write_vibe_session(root, sid, origin, start, prompt, usages, last_text=''):
+        from datetime import datetime, timezone
+        d = os.path.join(root, sid)
+        os.makedirs(os.path.join(d, 'journal'))
+        with open(os.path.join(d, 'meta.json'), 'w') as f:
+            json.dump({'session_id': sid, 'origin_directory': origin,
+                       'start_time': datetime.fromtimestamp(start, timezone.utc).isoformat()}, f)
+        recs = [{'type': 'core_input', 'payload': {'delta': [{'entry': {'content': [{'text': prompt}]}}]}}]
+        for i, u in enumerate(usages):
+            final = i == len(usages) - 1 and last_text
+            parts = [{'type': 'reasoning', 'content': [{'text': 'thinking'}]}]
+            if final:
+                parts.append({'type': 'text', 'text': last_text})   # Vibe 2.26 shape
+            recs.append({'type': 'action_result', 'payload': {'result': {'result': {
+                'usage': u, 'finish_reason': 'stop' if final else 'tool_call', 'parts': parts}}}})
+            # Each call is mirrored in a core_input record — it must not be counted twice.
+            recs.append({'type': 'core_input', 'payload': {'input': {'command': {'result': {'usage': u}}}}})
+        with open(os.path.join(d, 'journal', '0000000000000001.jsonl'), 'w') as f:
+            f.write('\n'.join(json.dumps(r) for r in recs))
+
+    def test_vibe_session_usage_sums_this_runs_session_only(self):
+        # Regression: from Vibe 2.26 (2026-10-05) the router read the newest
+        # legacy session_* folder, so every run recorded 23292↑ 924↓ $0.0389.
+        import time as _time
+        u = {'input_tokens': 1000, 'cached_input_tokens': 800, 'output_tokens': 50}
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as proj:
+            now = _time.time()
+            self._write_vibe_session(root, 'mine', proj, now, '## Role\n\nTask A', [u, u], 'Done.')
+            self._write_vibe_session(root, 'other-chat', proj, now, '## Role\n\nGuide chat', [u])
+            self._write_vibe_session(root, 'other-proj', '/elsewhere', now, '## Role\n\nTask A', [u])
+            got = agent_router._vibe_session_usage(proj, '## Role\n\nTask A', now - 1, now + 1, root=root)
+            # Ended on a tool call with only reasoning text — not a final answer.
+            self._write_vibe_session(root, 'cut', '/cut', now, 'Task B', [u, u])
+            cut = agent_router._vibe_session_usage('/cut', 'Task B', now - 1, now + 1, root=root)
+        self.assertEqual(got['sessions'], ['mine'])
+        self.assertEqual((got['calls'], got['input'], got['cached'], got['output']), (2, 2000, 1600, 100))
+        self.assertTrue(got['last_has_text'])
+        self.assertFalse(cut['last_has_text'])
+
+    def test_vibe_session_usage_ambiguous_returns_none(self):
+        import time as _time
+        u = {'input_tokens': 1, 'output_tokens': 1}
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as proj:
+            now = _time.time()
+            self._write_vibe_session(root, 'a', proj, now, 'chat one', [u])
+            self._write_vibe_session(root, 'b', proj, now, 'chat two', [u])
+            self.assertIsNone(agent_router._vibe_session_usage(proj, 'unrelated', now - 1, now + 1, root=root))
+
+    def test_vibe_turn_limit_with_exit_zero_is_marked(self):
+        # Regression (exec 20001220): Vibe 2.26 stops at --max-turns with exit 0;
+        # the run came back empty with no turn-limit marker.
+        conversation = [{'role': 'assistant', 'content': [{'type': 'tool_call', 'name': 'bash'}]}]
+        usage = {'calls': agent_router.VIBE_MAX_TURNS, 'input': 4000, 'cached': 0,
+                 'output': 90, 'last_has_text': False, 'sessions': ['s']}
+
+        class _VibeFakePopen(_FakePopen):
+            def __init__(self_inner, cmd, *a, **k):
+                super().__init__(returncode=0, stdout=json.dumps(conversation), stderr='')
+
+        with patch('shutil.which', return_value='/usr/bin/vibe'), \
+             patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'test-key'), \
+             patch.object(agent_router, '_vibe_session_usage', return_value=usage), \
+             patch('subprocess.Popen', side_effect=_VibeFakePopen):
+            text, tok_in, tok_out, cost = agent_router._call_vibe_cli(
+                'mistral-medium-latest', 'Move the files.', project_path=os.getcwd())
+
+        self.assertIn(agent_router.VIBE_TURN_LIMIT_MARKER, text)
+        self.assertEqual((tok_in, tok_out), (4000, 90))
+        self.assertEqual(cost, 0.0)   # subscription model, priced at 0
+
     def test_chat_transcript_normalizes_empty_permission_denial_envelope(self):
         payload = {
             'type': 'result',
@@ -324,7 +396,7 @@ class AgentRouterCliTests(unittest.TestCase):
     # force a final synthesis so the deliverable reads as complete.
 
     def _run_loop_with_responses(self, responses, *, max_turns=40, tools=True,
-                                 exec_id=None, progress=None):
+                                 exec_id=None, progress=None, bodies=None):
         """Drive _run_openai_tool_loop with a scripted sequence of API responses.
 
         Each `responses` entry is a dict shaped like an OpenAI-compatible
@@ -342,6 +414,8 @@ class AgentRouterCliTests(unittest.TestCase):
         call_index = {'i': 0}
 
         def fake_requests_post(url, headers=None, data=None, timeout=None):
+            if bodies is not None:
+                bodies.append(json.loads(data))
             resp = responses[min(call_index['i'], len(responses) - 1)]
             call_index['i'] += 1
             class R:
@@ -448,6 +522,72 @@ class AgentRouterCliTests(unittest.TestCase):
         responses = [tool_turn, tool_turn, tool_turn, synthesis]
         text, _ti, _to, _cost = self._run_loop_with_responses(responses, max_turns=3)
         self.assertIn('Final answer after exhausting tool turns.', text)
+        # RP-087 E3/E7: a forced answer must carry the turn-limit marker so H3
+        # never approves the run as finished.
+        self.assertIn(agent_router.TOOL_TURN_LIMIT_MARKER, text)
+        self.assertIn('(3 turns)', text)
+
+    # ── Pause at the limit (TODO item 16 Phase 1) ──────────────────────────
+    _TOOL_TURN = {
+        'choices': [{'finish_reason': 'tool_calls', 'message': {'tool_calls': [{
+            'id': 'call_x', 'function': {'name': 'read_file', 'arguments': '{"path": "a.txt"}'}}]}}],
+        'usage': {'prompt_tokens': 10, 'completion_tokens': 4},
+    }
+    _STATUS = {
+        'choices': [{'finish_reason': 'stop', 'message': {'content': 'Done: tiles 1-4. Left: 5-8. Need ~20 turns.'}}],
+        'usage': {'prompt_tokens': 15, 'completion_tokens': 9},
+    }
+
+    def test_pausable_run_raises_limit_reached_at_turn_limit(self):
+        bodies = []
+        with agent_router.pause_scope():
+            with self.assertRaises(agent_router.LimitReached) as cm:
+                self._run_loop_with_responses(
+                    [self._TOOL_TURN, self._TOOL_TURN, self._TOOL_TURN, self._STATUS],
+                    max_turns=3, bodies=bodies)
+        e = cm.exception
+        self.assertEqual(e.reason, 'turns')
+        cp = e.checkpoint
+        self.assertEqual(cp['turns'], 3)
+        self.assertIn('Need ~20 turns', cp['status_text'])
+        self.assertEqual(cp['messages'][-1], {'role': 'assistant', 'content': cp['status_text']})
+        self.assertIn('Paused at the turn limit', cp['transcript'][-1])
+        # The status call has no tools and no forced "complete response" ask.
+        self.assertNotIn('tools', bodies[-1])
+        self.assertTrue(all('provide your complete response now' not in json.dumps(b) for b in bodies))
+        self.assertEqual((e.tokens_input, e.tokens_output), (45, 21))   # usage rides out
+
+    def test_pausable_run_pauses_at_time_budget(self):
+        with agent_router.pause_scope(time_budget_s=1e-9):
+            with self.assertRaises(agent_router.LimitReached) as cm:
+                self._run_loop_with_responses([self._TOOL_TURN, self._STATUS], max_turns=10)
+        self.assertEqual(cm.exception.reason, 'time')
+        self.assertEqual(cm.exception.checkpoint['turns'], 1)
+
+    def test_resume_continues_from_checkpoint_with_note(self):
+        cp = {'messages': [{'role': 'user', 'content': 'do the thing'},
+                           {'role': 'assistant', 'content': 'status so far'}],
+              'transcript': ['part one work'], 'segments': 1, 'note': 'write the table now',
+              'tokens_input': 1000, 'tokens_output': 100}
+        final = {'choices': [{'finish_reason': 'stop', 'message': {'content': 'Table written.'}}],
+                 'usage': {'prompt_tokens': 7, 'completion_tokens': 3}}
+        bodies, progress = [], []
+        with agent_router.pause_scope(resume=cp):
+            text, ti, to, _c = self._run_loop_with_responses([final], bodies=bodies,
+                                                             exec_id=5, progress=progress)
+        first = bodies[0]['messages']
+        self.assertEqual(first[:2], cp['messages'])
+        self.assertIn('Note from the user: write the table now', first[-1]['content'])
+        self.assertIn('part one work', text)
+        self.assertIn('Continued by the user (part 2)', text)
+        self.assertIn('Table written.', text)
+        self.assertEqual((ti, to), (7, 3))               # this part only (route meters it)
+        self.assertEqual(progress[-1], (1007, 103))      # live row stays cumulative
+
+    def test_without_pause_scope_turn_limit_is_unchanged(self):
+        text, *_ = self._run_loop_with_responses(
+            [self._TOOL_TURN, self._TOOL_TURN, self._TOOL_TURN, self._STATUS], max_turns=3)
+        self.assertIn(agent_router.TOOL_TURN_LIMIT_MARKER, text)
 
     def test_tool_loop_no_forced_call_when_immediately_empty(self):
         # First turn returns empty final text with no prior transcript → must NOT
@@ -710,6 +850,64 @@ class AgentRouterCliTests(unittest.TestCase):
                         self.assertIn('400', str(e))
         # Exactly one attempt — no retries.
         self.assertEqual(call_index['i'], 1)
+
+    def test_tool_loop_attaches_usage_to_raised_exception(self):
+        # Regression (production incident, gemma-4-26b): the loop raised
+        # RuntimeError after 40 tool turns, but the exception carried no
+        # usage, so 1.23M consumed tokens were metered nowhere and the
+        # executions row was finished with zeros. The except handler must
+        # attach the accumulated totals before re-raising; harmless zeros
+        # when the failure happened before any turn completed.
+        import requests
+        import tempfile
+
+        tool_turn = {
+            'choices': [{
+                'finish_reason': 'tool_calls',
+                'message': {
+                    'tool_calls': [{
+                        'id': 'call_1',
+                        'function': {'name': 'read_file', 'arguments': '{"path": "a.txt"}'},
+                    }],
+                },
+            }],
+            'usage': {'prompt_tokens': 700, 'completion_tokens': 30},
+        }
+        call_index = {'i': 0}
+
+        class _Resp:
+            def __init__(self, status, text=''):
+                self.status_code = status
+                self.text = text
+                self.reason = 'Bad Request' if status != 200 else 'OK'
+
+            def json(self):
+                return tool_turn if self.status_code == 200 else {'message': self.text}
+
+        def fake_requests_post(url, headers=None, data=None, timeout=None):
+            i = call_index['i']
+            call_index['i'] += 1
+            return _Resp(200) if i == 0 else _Resp(400, 'mid-run failure')
+
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(requests, 'post', side_effect=fake_requests_post):
+                import agent_tools
+                with patch.object(agent_tools, 'dispatch', return_value='{"ok": true}'):
+                    with self.assertRaisesRegex(Exception, '400') as cm:
+                        agent_router._run_openai_tool_loop(
+                            provider_label='Scaleway',
+                            api_url='https://example/v1/chat/completions',
+                            api_key='k',
+                            wire_model='gemma-4-26b-a4b-it',
+                            model_id='scw-gemma-4-26b',
+                            prompt='do the thing',
+                            max_tokens=1024,
+                            max_turns=5,
+                            project_path=d,
+                        )
+        self.assertEqual(call_index['i'], 2)  # turn 0 ok, turn 1 raised
+        self.assertEqual(cm.exception.tokens_input, 700)
+        self.assertEqual(cm.exception.tokens_output, 30)
 
 
 class OverseerReferencedFilesTests(unittest.TestCase):
@@ -1339,6 +1537,181 @@ class OverseerOutputTargetTests(unittest.TestCase):
         self.assertNotIn('UNREAD', prompts[0])
 
 
+def _write(path, text='# Routes'):
+    with open(path, 'w') as fh:
+        fh.write(text)
+    return path
+
+
+class OverseerCompletionCheckTests(unittest.TestCase):
+    """H3 must not approve a run whose named deliverable was never written, or
+    one cut off by its turn limit (RP-087 E5/E7: H3 `ok` on both)."""
+
+    DESC = ("Analyze the map.\n\nOutput a single markdown file named "
+            "`routes_2026.md` containing the table.")
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.path = self.td.name
+        self.project = {'name': 'P', 'path': self.path, 'aingel_model': 'm'}
+        self.out_dir = os.path.join(self.path, 'Artifacts', 'outputs', '7-make-routes')
+        os.makedirs(self.out_dir)
+        self.prompts = []
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _h3(self, output_text, reply=None, started_at=None, ask_result=None):
+        reply = reply or {'severity': 'ok', 'findings': [], 'recommendation': 'approve',
+                          'gate_for_next': 'proceed', 'brief_2s': 'Done.'}
+
+        def fake_ask(model, prompt, *a, **kw):
+            self.prompts.append(prompt)
+            if ask_result is not None:
+                return ask_result
+            return json.dumps(reply), None
+
+        with patch.object(agent_overseer, '_ask', fake_ask):
+            return agent_overseer.post_run_analysis(
+                {'id': 7, 'title': 'Make routes', 'description': self.DESC},
+                {'id': 70, 'status': 'done', 'tokens_input': 10, 'tokens_output': 10,
+                 'started_at': started_at},
+                self.project, output_text)
+
+    def test_missing_deliverable_is_an_issue_even_when_guide_says_ok(self):
+        r = self._h3('Tiled the map and read the tags.')
+        self.assertEqual(r['severity'], 'issue')
+        self.assertEqual(r['recommendation'], 'discuss')
+        self.assertEqual(r['gate_for_next'], 'hold')
+        self.assertIn('Deliverable not written: routes_2026.md', r['findings'])
+        self.assertIn('Deliverable not written: routes_2026.md', self.prompts[0])
+
+    def test_deliverable_in_nested_output_folder_counts(self):
+        nested = os.path.join(self.out_dir, 'Artifacts', 'outputs', '7-make-routes')
+        os.makedirs(nested)
+        _write(os.path.join(nested, 'routes_2026.md'))
+        r = self._h3('Wrote the table.')
+        self.assertEqual(r['severity'], 'ok')
+        self.assertEqual(r['gate_for_next'], 'proceed')
+
+    def test_deliverable_from_an_earlier_run_does_not_count(self):
+        f = _write(os.path.join(self.out_dir, 'routes_2026.md'))
+        os.utime(f, (1_700_000_000, 1_700_000_000))   # 2023 — before this run
+        r = self._h3('Wrote the table.', started_at='2026-10-15 08:41:42')
+        self.assertEqual(r['severity'], 'issue')
+
+    def test_fresh_deliverable_counts_with_start_time(self):
+        _write(os.path.join(self.out_dir, 'routes_2026.md'))
+        r = self._h3('Wrote the table.', started_at='2000-01-01 00:00:00')
+        self.assertEqual(r['severity'], 'ok')
+
+    def test_turn_limit_with_deliverable_is_warning_not_hold(self):
+        # RP-089 exec 20001271: the file was written incrementally, the run
+        # then hit its turn limit. The delivered file is the success
+        # criterion — the cut-off stays a recorded warning but does not
+        # block the chain (the old auto-hold also fed the Guide model a
+        # false 'not written' narrative that triggered chat-agent meddling).
+        _write(os.path.join(self.out_dir, 'routes_2026.md'))
+        out = ('Let me now write the deliverable.\n\n---\n⚠️ **'
+               + agent_router.TOOL_TURN_LIMIT_MARKER + ' (40 turns) before the model finished.**')
+        r = self._h3(out)
+        self.assertEqual(r['severity'], 'warning')
+        self.assertEqual(r['gate_for_next'], 'proceed')
+        self.assertTrue(any('turn limit' in f for f in r['findings']))
+
+    def test_vibe_turn_limit_marker_is_warning_when_delivered(self):
+        _write(os.path.join(self.out_dir, 'routes_2026.md'))
+        r = self._h3('partial\n' + agent_router.VIBE_TURN_LIMIT_MARKER + ' (80 turns)')
+        self.assertEqual(r['severity'], 'warning')
+        self.assertEqual(r['gate_for_next'], 'proceed')
+
+    def test_false_unwritten_claims_stripped_when_file_exists(self):
+        # The Guide model infers non-delivery from the turn-limit marker
+        # without checking the disk (RP-089 exec 20001271). With the file
+        # provably present, its 'not written' findings are stripped and
+        # the shipped verdict restored.
+        _write(os.path.join(self.out_dir, 'routes_2026.md'))
+        reply = {'severity': 'issue',
+                 'findings': ['Deliverable file `routes_2026.md` was not written to disk',
+                              'Run stopped at turn limit before completion'],
+                 'recommendation': 'reject', 'gate_for_next': 'hold',
+                 'brief_2s': 'failed'}
+        r = self._h3('partial work', reply=reply)
+        self.assertNotIn('Deliverable file `routes_2026.md` was not written to disk',
+                         r['findings'])
+        self.assertEqual(r['severity'], 'warning')   # turn-limit fact stays
+        self.assertEqual(r['gate_for_next'], 'proceed')
+
+    def test_never_lowers_a_worse_verdict(self):
+        r = self._h3('x', reply={'severity': 'issue', 'findings': ['bad'],
+                                 'recommendation': 'reject', 'gate_for_next': 'skip',
+                                 'brief_2s': 'b'})
+        self.assertEqual(r['severity'], 'issue')
+        self.assertEqual(r['recommendation'], 'reject')
+        self.assertEqual(r['gate_for_next'], 'skip')
+
+    def test_degraded_guide_still_flags_missing_deliverable(self):
+        r = self._h3('x', ask_result=('', 'model unavailable'))
+        self.assertTrue(r.get('degraded'))
+        self.assertEqual(r['severity'], 'issue')
+        self.assertEqual(r['gate_for_next'], 'hold')
+
+    def test_prompt_has_description_and_output_tail(self):
+        verdict = 'No `routes_2026.md` was written.'
+        out = 'start of run\n' + ('→ `bash`\n' * 2000) + verdict
+        files = '\n\n## Files created in this run\n' + '\n'.join(
+            f'- [t{i}.png](/files/1/t{i}.png)' for i in range(69))
+        self._h3(out + files)
+        p = self.prompts[0]
+        self.assertIn('Output a single markdown file named', p)
+        self.assertIn('start of run', p)
+        self.assertIn(verdict, p)
+        self.assertIn('[59 more files]', p)
+        self.assertNotIn('t68.png', p)
+
+    def test_deliverable_in_another_tasks_shared_folder_counts(self):
+        # RP-089: bare name in the write line, the folder (another task's
+        # outputs/shared/) given in prose — written, but reported missing.
+        shared = os.path.join(self.path, 'Artifacts', 'outputs', '3-parent', 'shared')
+        os.makedirs(shared)
+        _write(os.path.join(shared, 'routes_2026.md'))
+        r = self._h3('Wrote the table.', started_at='2000-01-01 00:00:00')
+        self.assertEqual(r['severity'], 'ok')
+
+    def test_stale_file_in_another_tasks_folder_does_not_count(self):
+        shared = os.path.join(self.path, 'Artifacts', 'outputs', '3-parent', 'shared')
+        os.makedirs(shared)
+        f = _write(os.path.join(shared, 'routes_2026.md'))
+        os.utime(f, (1_700_000_000, 1_700_000_000))
+        r = self._h3('Wrote the table.', started_at='2026-10-15 08:41:42')
+        self.assertEqual(r['severity'], 'issue')
+
+    def test_other_folders_need_a_known_start_time(self):
+        shared = os.path.join(self.path, 'Artifacts', 'outputs', '3-parent', 'shared')
+        os.makedirs(shared)
+        _write(os.path.join(shared, 'routes_2026.md'))
+        r = self._h3('Wrote the table.')            # no started_at
+        self.assertEqual(r['severity'], 'issue')
+
+    def test_same_file_named_twice_gives_one_finding(self):
+        self.DESC = ("Write `shared/routes_2026.md` with the rows.\n"
+                     "Then write `routes_2026.md` via bash into the shared folder.")
+        r = self._h3('x')
+        self.assertEqual(r['findings'].count('Deliverable not written: routes_2026.md'), 1)
+
+    def test_model_finding_for_same_file_is_not_repeated(self):
+        r = self._h3('x', reply={'severity': 'issue', 'recommendation': 'discuss',
+                                 'gate_for_next': 'hold', 'brief_2s': 'b',
+                                 'findings': ['Required deliverable `shared/routes_2026.md` was not written.']})
+        self.assertEqual(len(r['findings']), 1)
+
+    def test_no_named_deliverable_no_finding(self):
+        self.DESC = 'Summarise the attached report in chat.'
+        r = self._h3('Summary: ...')
+        self.assertEqual(r['severity'], 'ok')
+        self.assertEqual(r['findings'], [])
+
+
 class SkipTaskSlotRevivalTests(unittest.TestCase):
     """Assigning a provider slot to a 'skip' task revives it (status ->
     'confirmed'); unassigning leaves it 'skip'.
@@ -1405,5 +1778,316 @@ class SkipTaskSlotRevivalTests(unittest.TestCase):
         self.assertIsNone(task['work_session_slot'])
 
 
+class RouteExceptionMeteringTests(unittest.TestCase):
+    """route() must meter failed-but-paid calls, not only successful ones.
+
+    Regression (production incident, gemma-4-26b): a Scaleway task run
+    raised RuntimeError after exhausting 40 tool turns with 1,227,345
+    input / 39,575 output tokens consumed. The exception carried no usage,
+    route() recorded quota/budget only after a successful return, and the
+    executions row was finished with default zeros — AIngel recorded $0.00
+    for a run the provider billed ~$0.35. The tool loop now attaches usage
+    to the exception and route() meters it before re-raising."""
+
+    def test_raising_provider_call_is_metered(self):
+        import agent_config
+        import agent_db
+        import agent_quotas
+
+        def boom(*a, **k):
+            exc = RuntimeError('exhausted 40 tool turns')
+            exc.tokens_input = 1000
+            exc.tokens_output = 200
+            raise exc
+
+        pricing = agent_config.get_pricing('scw-gemma-4-26b')
+        expected_cost = round(
+            1000 * pricing['input'] / 1_000_000 +
+            200 * pricing['output'] / 1_000_000, 6)
+
+        with patch.object(agent_router, 'PROVIDER_DISPATCH',
+                          {'scaleway': boom}), \
+             patch.object(agent_quotas, 'resolve_owner_for_call', return_value=7), \
+             patch.object(agent_quotas, 'is_allowed_model', return_value=True), \
+             patch.object(agent_quotas, 'record_tokens') as rec, \
+             patch.object(agent_db, 'get_project_by_path', return_value={'id': 5}), \
+             patch.object(agent_db, 'update_budget_spend') as spend:
+            with self.assertRaises(RuntimeError):
+                agent_router.route('scw-gemma-4-26b', 'do the thing', caller='test')
+
+        rec.assert_called_once_with(7, 1000, 200)
+        spend.assert_called_once_with(5, expected_cost)
+
+    def test_raising_call_without_usage_records_nothing(self):
+        import agent_db
+        import agent_quotas
+
+        def boom(*a, **k):
+            raise RuntimeError('boom')  # no tokens_input/tokens_output attrs
+
+        with patch.object(agent_router, 'PROVIDER_DISPATCH',
+                          {'scaleway': boom}), \
+             patch.object(agent_quotas, 'resolve_owner_for_call', return_value=7), \
+             patch.object(agent_quotas, 'is_allowed_model', return_value=True), \
+             patch.object(agent_quotas, 'record_tokens') as rec, \
+             patch.object(agent_db, 'get_project_by_path', return_value={'id': 5}), \
+             patch.object(agent_db, 'update_budget_spend') as spend:
+            with self.assertRaises(RuntimeError):
+                agent_router.route('scw-gemma-4-26b', 'do the thing', caller='test')
+
+        rec.assert_not_called()
+        spend.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()
+
+
+class _StopCLI(Exception):
+    """Raised by the fake Popen once the command line has been captured."""
+
+
+class GuideModeRouterTests(unittest.TestCase):
+    """Item 17 Phase B: a Guide chat turn is read-only at the tool layer and can
+    write only inside its scratch folder (2026-10-15: the Guide, with full
+    tools, rewrote RP-087's deliverables)."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.proj = os.path.realpath(self.td.name)
+        self.scratch = os.path.join(self.proj, 'Artifacts', 'chats', '7')
+        os.makedirs(self.scratch)
+        self.agents_dir = os.path.join(self.proj, '_vibe_agents')
+        self._p = patch.object(agent_router, '_VIBE_AGENTS_DIR', self.agents_dir)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self.td.cleanup()
+
+    def _capture(self, call):
+        seen = {}
+
+        def fake_popen(cmd, *a, **k):
+            seen['cmd'] = list(cmd)
+            seen['env'] = dict(k.get('env') or {})
+            raise _StopCLI()
+
+        with patch.object(agent_router.subprocess, 'Popen', side_effect=fake_popen):
+            with self.assertRaises(_StopCLI):
+                call()
+        return seen
+
+    def test_scope_is_set_only_inside_the_block(self):
+        self.assertIsNone(agent_router.current_guide_scope())
+        with agent_router.guide_scope(self.scratch):
+            self.assertEqual(agent_router.current_guide_scope()['write_dir'], self.scratch)
+        self.assertIsNone(agent_router.current_guide_scope())
+
+    def test_vibe_guide_turn_uses_read_only_profile_without_auto_approve(self):
+        with patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'k'), \
+             patch.object(agent_router, 'VIBE_SKIP_PERMISSIONS', True), \
+             agent_router.guide_scope(self.scratch):
+            seen = self._capture(lambda: agent_router._call_vibe_cli(
+                'mistral-glm-5-3', 'hi', project_path=self.proj))
+        cmd = seen['cmd']
+        self.assertNotIn('--auto-approve', cmd)
+        agent = cmd[cmd.index('--agent') + 1]
+        self.assertTrue(agent.startswith('cordee-guide-'))
+        self.assertNotIn('VIBE_BYPASS_TOOL_PERMISSIONS', seen['env'])
+        with open(os.path.join(self.agents_dir, agent + '.toml')) as f:
+            body = f.read()
+        self.assertIn('[tools.bash]\npermission = "never"', body)
+        self.assertIn(json.dumps(os.path.join(self.scratch, '*')), body)
+        self.assertIn('"task"', body)
+
+    def test_vibe_normal_turn_unchanged(self):
+        with patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'k'):
+            seen = self._capture(lambda: agent_router._call_vibe_cli(
+                'mistral-glm-5-3', 'hi', project_path=self.proj))
+        self.assertIn('--auto-approve', seen['cmd'])
+        self.assertEqual(seen['cmd'][seen['cmd'].index('--agent') + 1], 'accept-edits')
+
+    def test_claude_guide_turn_runs_in_plan_mode(self):
+        with patch.object(agent_router, 'CLAUDE_CODE_SKIP_PERMISSIONS', True), \
+             agent_router.guide_scope(self.scratch):
+            seen = self._capture(lambda: agent_router._call_claude_cli(
+                'claude-sonnet', 'hi', project_path=self.proj))
+        cmd = seen['cmd']
+        self.assertEqual(cmd[cmd.index('--permission-mode') + 1], 'plan')
+        self.assertNotIn('--dangerously-skip-permissions', cmd)
+
+    def test_tool_loop_dispatch_limits(self):
+        scope = {'write_dir': self.scratch}
+        r = json.loads(agent_router._guide_dispatch(scope, 'bash', {'command': 'ls'}, self.proj))
+        self.assertIn('not available to the Guide', r['error'])
+        r = json.loads(agent_router._guide_dispatch(scope, 'patch_file', {}, self.proj))
+        self.assertIn('error', r)
+        r = json.loads(agent_router._guide_dispatch(
+            scope, 'write_file', {'path': 'Artifacts/outputs/x.md', 'content': 'bad'}, self.proj))
+        self.assertIn('only inside Artifacts/chats/7/', r['error'])
+        r = json.loads(agent_router._guide_dispatch(
+            scope, 'write_file', {'path': 'Artifacts/chats/7/../../outputs/x.md', 'content': 'b'},
+            self.proj))
+        self.assertIn('error', r)
+        self.assertFalse(os.path.exists(os.path.join(self.proj, 'Artifacts', 'outputs', 'x.md')))
+        agent_router._guide_dispatch(
+            scope, 'write_file', {'path': 'Artifacts/chats/7/notes.md', 'content': 'ok'}, self.proj)
+        self.assertTrue(os.path.exists(os.path.join(self.scratch, 'notes.md')))
+
+    def test_tool_loop_offers_no_shell_in_guide_mode(self):
+        import agent_tools
+        names = {t["function"]["name"] for t in agent_tools.TOOL_SCHEMAS
+                 if t['function']['name'] in agent_router._GUIDE_LOOP_TOOLS}
+        self.assertNotIn('bash', names)
+        self.assertNotIn('patch_file', names)
+        self.assertIn('read_file', names)
+
+
+class PauseReportSummaryTests(unittest.TestCase):
+    """The Guide's read of a paused run: one tool-less call, strict values."""
+
+    def _call(self, reply, model='m'):
+        with patch.object(agent_overseer, '_ask', return_value=(reply, None)) as ask:
+            r = agent_overseer.pause_report_summary(
+                {'id': 1, 'title': 'T', 'description': 'Output a file named `x.md`.'},
+                {'name': 'P', 'path': '/tmp', 'aingel_model': model},
+                {'limit': 'turn', 'deliverables_missing': ['x.md']}, 'transcript text')
+        return r, ask
+
+    def test_parses_and_normalises(self):
+        r, ask = self._call(json.dumps({'progress': 'Looping', 'recommendation': 'stop',
+                                        'suggested_note': '', 'summary': 'It re-reads tiles.'}))
+        self.assertEqual((r['progress'], r['recommendation']), ('looping', 'stop'))
+        prompt = ask.call_args.args[1]
+        self.assertIn('deliverables_missing', prompt)
+        self.assertIn('Output a file named', prompt)
+        self.assertEqual(ask.call_args.args[4], 'pause:report')
+
+    def test_unknown_values_are_blanked(self):
+        r, _ = self._call(json.dumps({'progress': 'great', 'recommendation': 'yolo', 'summary': 's'}))
+        self.assertEqual((r['progress'], r['recommendation']), ('', ''))
+
+    def test_no_guide_model_or_bad_reply_returns_none(self):
+        r, ask = self._call('{}', model='')
+        self.assertIsNone(r)
+        ask.assert_not_called()
+        r, _ = self._call('not json')
+        self.assertIsNone(r)
+
+
+class OverseerFixesFromRP094Tests(unittest.TestCase):
+
+    def test_file_named_is_a_deliverable(self):
+        d = ('Extract all stops of route P30a from the image file `@map.png` and list them '
+             'in a single Markdown file named `P30a_stops.md`.')
+        refs = agent_overseer._extract_referenced_files(d)
+        self.assertEqual(agent_overseer._output_target_refs(d, refs), {'P30a_stops.md'})
+
+    def test_named_input_stays_an_input(self):
+        for d in ('Read the file named `x.pdf` and summarise it.',
+                  'Summarise the report named `a.docx`.'):
+            refs = agent_overseer._extract_referenced_files(d)
+            self.assertEqual(agent_overseer._output_target_refs(d, refs), set(), d)
+
+    def test_ask_ladder_reaches_model_cap_and_counts_attempts(self):
+        seen = []
+
+        def fake_route(model, prompt, mt, **k):
+            seen.append(mt)
+            return ('', 0, 0, 0.0)
+
+        with patch('agent_router.route', side_effect=fake_route), \
+             patch('model_caps.effective_max_tokens', return_value=2048), \
+             patch('model_caps.get_cap', return_value={'max_tokens': 12000}):
+            text, why = agent_overseer._ask('m', 'p', 800, '', 'test')
+        self.assertEqual(seen, [2048, 4096, 8192, 12000])
+        self.assertIn('after 4 attempts', why)
+
+    def test_parts_line(self):
+        self.assertEqual(agent_overseer._parts_line({}), '')
+        self.assertIn('continued it 2 time(s)',
+                      agent_overseer._parts_line({'segments': 3, 'pause_reason': 'time'}))
+        self.assertIn('stopped it there',
+                      agent_overseer._parts_line({'segments': 1, 'pause_reason': 'turns'}))
+
+
+class MistralApiTruncationTests(unittest.TestCase):
+    """Regression (RP-099 / exec 20001317): the Mistral API branch only logged
+    `finish_reason == 'length'`, so a truncated synthesis shipped as `done`.
+    It must now retry at the model cap and mark output that is still truncated.
+    """
+
+    @staticmethod
+    def _response(text, finish_reason, prompt_tokens=100, completion_tokens=50):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=text),
+                finish_reason=finish_reason,
+            )],
+            usage=SimpleNamespace(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            ),
+        )
+
+    def _call(self, responses, max_tokens):
+        complete = Mock(side_effect=responses)
+        client = SimpleNamespace(chat=SimpleNamespace(complete=complete))
+        with patch('mistralai.client.Mistral', return_value=client), \
+             patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'test-key'):
+            result = agent_router.call_mistral(
+                'mistral-large-4', 'prompt', max_tokens=max_tokens,
+                force_mistral_mode='api')
+        return result, complete
+
+    def test_length_then_stop_adopts_retry_and_sums_usage(self):
+        first = self._response('short', 'length',
+                               prompt_tokens=100, completion_tokens=50)
+        second = self._response('a much longer and complete answer', 'stop',
+                                prompt_tokens=120, completion_tokens=60)
+
+        (text, tok_in, tok_out, _cost), complete = self._call(
+            [first, second], max_tokens=8192)
+
+        self.assertEqual(text, 'a much longer and complete answer')
+        self.assertNotIn(agent_router.TRUNCATION_MARKER, text)
+        self.assertEqual(complete.call_count, 2)
+        self.assertEqual((tok_in, tok_out), (220, 110))
+        self.assertEqual(complete.call_args_list[1].kwargs['max_tokens'], 12000)
+
+    def test_still_length_after_retry_appends_marker(self):
+        first = self._response('short', 'length',
+                               prompt_tokens=100, completion_tokens=50)
+        second = self._response('a longer but still truncated answer', 'length',
+                                prompt_tokens=120, completion_tokens=60)
+
+        (text, tok_in, tok_out, _cost), complete = self._call(
+            [first, second], max_tokens=8192)
+
+        self.assertEqual(text, 'a longer but still truncated answer' +
+                         agent_router.TRUNCATION_MARKER)
+        self.assertTrue(text.endswith(agent_router.TRUNCATION_MARKER))
+        self.assertEqual(complete.call_count, 2)
+        self.assertEqual((tok_in, tok_out), (220, 110))
+        self.assertEqual(complete.call_args_list[1].kwargs['max_tokens'], 12000)
+
+    def test_length_without_headroom_is_not_retried_and_marked(self):
+        first = self._response('truncated at the cap', 'length')
+
+        (text, _tok_in, _tok_out, _cost), complete = self._call(
+            [first], max_tokens=12000)
+
+        self.assertEqual(text, 'truncated at the cap' + agent_router.TRUNCATION_MARKER)
+        self.assertEqual(complete.call_count, 1)
+        self.assertEqual(complete.call_args_list[0].kwargs['max_tokens'], 12000)
+
+    def test_stop_is_returned_untouched_in_one_call(self):
+        first = self._response('complete answer', 'stop')
+
+        (text, _tok_in, _tok_out, _cost), complete = self._call(
+            [first], max_tokens=8192)
+
+        self.assertEqual(text, 'complete answer')
+        self.assertNotIn(agent_router.TRUNCATION_MARKER, text)
+        self.assertEqual(complete.call_count, 1)

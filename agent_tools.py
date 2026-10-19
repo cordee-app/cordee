@@ -380,6 +380,17 @@ def list_working_docs(project_path: str) -> dict:
     return {'folder': found_folder, 'files': sorted(files)}
 
 
+# Image files get their own branch in read_file: they are read WHOLE (never
+# truncated — a truncated base64 image is corrupt) and returned full-resolution
+# with an explicit mime, so the tool loop (agent_router._tool_result_content)
+# can deliver them to vision models as image parts instead of base64 text.
+# Explicit map, not mimetypes.guess_type, so the mime is deterministic across
+# hosts for the same extension.
+_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'}
+_IMAGE_MIME = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+               '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp'}
+
+
 def read_file(project_path: str, path: str, max_chars: int = 20_000,
                start_line: int = None, end_line: int = None) -> dict:
     """
@@ -387,7 +398,10 @@ def read_file(project_path: str, path: str, max_chars: int = 20_000,
     path: relative to project root. Returns {content: str} or {error: str}.
     start_line/end_line: 1-based, inclusive. Use to read a specific section of a large file.
     This function now also supports common binary formats (e.g., .pdf, .db, .xlsx, .docx) by returning
-    a base64‑encoded string with a ``binary`` flag.
+    a base64-encoded string with a ``binary`` flag. Images (.png/.jpg/…) are
+    returned whole — never truncated — as base64 with an explicit ``mime`` so
+    vision models can be shown the actual picture (the tool loop turns this
+    into an image part; see agent_router._tool_result_content).
     """
     try:
         full = _safe_join_for_read(project_path, path)
@@ -397,12 +411,29 @@ def read_file(project_path: str, path: str, max_chars: int = 20_000,
     if not os.path.isfile(full):
         return {'error': f'File not found: {path!r}'}
 
-    # Determine if the file is likely binary based on extension
-    _binary_exts = {'.pdf', '.db', '.sqlite', '.xlsx', '.xls', '.docx', '.pptx', '.odt', '.ods', '.odp'}
     _, ext = os.path.splitext(full)
-    is_binary = ext.lower() in _binary_exts
 
     try:
+        # Images are handled BEFORE the binary/text branches. WHY: .png is not
+        # in _binary_exts, so it used to fall through to the utf-8 text reader,
+        # whose errors='replace' pass turned the picture into mojibake — a
+        # vision model (gemma) then looped 40 tool turns on the garbage and
+        # the task failed.
+        if ext.lower() in _IMAGE_EXTS:
+            import base64
+            with open(full, 'rb') as f:
+                data = f.read()
+            return {'path': path,
+                    'content': base64.b64encode(data).decode('ascii'),
+                    'binary': True,
+                    'encoding': 'base64',
+                    'mime': _IMAGE_MIME[ext.lower()],
+                    'size_bytes': len(data)}
+
+        # Determine if the file is likely binary based on extension
+        _binary_exts = {'.pdf', '.db', '.sqlite', '.xlsx', '.xls', '.docx', '.pptx', '.odt', '.ods', '.odp'}
+        is_binary = ext.lower() in _binary_exts
+
         if is_binary:
             # PDFs/DOCX: extract the text layer so the model can actually read
             # them (scanned/image PDFs with no text layer fall back to base64).
@@ -917,7 +948,10 @@ TOOL_SCHEMAS = [
             'name': 'read_file',
             'description': (
                 'Read a file from the project folder. '
-                'Large files are truncated at 20,000 chars — use start_line/end_line to read specific sections '
+                'Image files (.png/.jpg/.jpeg/.gif/.webp/.bmp) are delivered to '
+                'vision-capable models as actual image content — call this to view '
+                'an image directly instead of building OCR workarounds. '
+                'Large text files are truncated at 20,000 chars — use start_line/end_line to read specific sections '
                 'rather than re-reading the whole file. Prefer targeted reads over reading entire large files.'
             ),
             'parameters': {

@@ -218,6 +218,7 @@ Feedback loop: Approve (→ memory) / Reject + Feedback (→ new task) / Skip / 
 | Mistral OCR | `mistral-ocr-latest` | Mistral | $0.00 | $0.00 | 2/3/4 |
 | Codex ChatGPT (gpt-6-luna) | `codex-chatgpt` | OpenAI | $0.00 | $0.00 | 3 |
 | SCW DeepSeek-V4 Flash | `scw-deepseek-v4-flash` | Scaleway | $0.43 | $0.86 | 4 |
+| SCW DeepSeek-V4.1 Flash (vision) | `scw-deepseek-v4.1-flash` | Scaleway | $0.65 | $1.94 | 4 |
 | SCW Qwen3.8 27B | `scw-qwen3.8-27b` | Scaleway | $0.65 | $3.56 | 4 |
 | SCW GPT-OSS 120B | `scw-gpt-oss-120b` | Scaleway | $0.16 | $0.65 | 4 |
 | SCW Llama 3.3 70B | `scw-llama-3.3-70b` | Scaleway | $0.97 | $0.97 | 4 |

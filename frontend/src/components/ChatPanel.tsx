@@ -65,7 +65,11 @@ function chatMd(raw: string): string {
   return html;
 }
 
-const MSG_HEADER_RE = /^### \[([^\]]+)\] (👤|🤖) (?:User|Assistant.*)$/;
+const MSG_HEADER_RE = /^### \[([^\]]+)\] (👤|🤖|🔔) (?:User|Assistant.*|Notice)$/;
+// Cordée's own posts (post-run reviews, "task completed"): agent_chats.append_notice
+// writes them under a "🔔 Notice" header. Older ones were written as 👤 User;
+// these body prefixes identify them so they render as notices too.
+const LEGACY_NOTICE_PREFIXES = ['✓ Task #', '⚠ Post-run review for Task #'];
 // System notes are whole lines (agent_chats.append_system_note writes
 // "\n_[ts] note_\n"). Anchoring both ends keeps an italic `_[x] y_` inside a
 // message body from being lifted out as a phantom system line.
@@ -94,7 +98,9 @@ function parseChatTranscript(raw: unknown): ChatTranscriptEntry[] {
     }
     // Drop the trailing "---" separator append_assistant_message writes.
     content = content.replace(/\n*---\s*$/, '').trim();
-    msgs.push({ role, content, timestamp });
+    const shownRole =
+      role === 'user' && LEGACY_NOTICE_PREFIXES.some((p) => content.startsWith(p)) ? 'notice' : role;
+    msgs.push({ role: shownRole, content, timestamp });
     role = null;
     buf = [];
   };
@@ -109,7 +115,7 @@ function parseChatTranscript(raw: unknown): ChatTranscriptEntry[] {
       const hm = line.match(MSG_HEADER_RE);
       if (hm) {
         flush();
-        role = hm[2] === '👤' ? 'user' : 'assistant';
+        role = hm[2] === '👤' ? 'user' : hm[2] === '🔔' ? 'notice' : 'assistant';
         timestamp = hm[1];
         continue;
       }
@@ -613,6 +619,14 @@ const ChatPanelInner = () => {
                   <span className="text-xs text-text-faint italic">
                     {msg.content}
                   </span>
+                </div>
+              ) : msg.role === 'notice' ? (
+                <div key={i} className="mb-3">
+                  <div className="text-xs text-text-faint mb-0.5">🔔 Cordée notice · {msg.timestamp}</div>
+                  <div
+                    className="px-3 py-2 rounded-lg text-xs leading-relaxed break-words whitespace-pre-wrap border border-border-muted dark:border-border-dark-muted text-text-soft dark:text-text-dark-soft"
+                    dangerouslySetInnerHTML={{ __html: chatMd(msg.content) }}
+                  />
                 </div>
               ) : (
                 <div key={i} className="mb-3">

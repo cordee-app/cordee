@@ -9,7 +9,7 @@ interface NotifItem {
   title: string;
   desc: string;
   time: string;
-  type: 'failed' | 'approve' | 'running';
+  type: 'failed' | 'approve' | 'running' | 'paused';
   taskId?: number;
   execId?: number;
   unread: boolean;
@@ -60,6 +60,21 @@ export const Notifications = () => {
         type: 'approve',
         execId: e.id,
         taskId: e.task_id,
+        unread: true,
+      });
+    }
+
+    // Runs paused at their limit wait for the user (TODO item 16).
+    const paused = executions.filter(e => e.status === 'paused').slice(0, 5);
+    for (const e of paused) {
+      items.push({
+        icon: '\u23F8',
+        title: `${execChip(e)} paused at its ${e.pause_reason === 'time' ? 'time' : 'turn'} limit`,
+        desc: `Continue or stop — ${(e.task_title || '').slice(0, 50)}`,
+        time: String(e.last_heartbeat_at || e.started_at || ''),
+        type: 'paused',
+        taskId: e.task_id,
+        execId: e.id,
         unread: true,
       });
     }
@@ -172,6 +187,8 @@ export const Notifications = () => {
                 <TriangleAlert size={16} className="text-danger" />
               ) : item.type === 'approve' ? (
                 <CircleCheck size={16} className="text-status-done dark:text-status-done-dark" />
+              ) : item.type === 'paused' ? (
+                <span style={{ color: '#8a5a12' }}>{'\u23F8'}</span>
               ) : (
                 <LoaderCircle size={16} className="text-status-running dark:text-status-running-dark animate-spin" />
               )}
