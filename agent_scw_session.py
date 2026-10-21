@@ -1,9 +1,13 @@
 """Scaleway session storage — Phase 2.
 
 Per-project isolated storage envelope on Scaleway: a dedicated Scaleway Project,
-a project-scoped IAM API key (with expiry), a Key Manager key, and an SSE-KMS
-S3 bucket. All four resources are created together in `create_session()` and
-torn down together in `close_session()` (crypto-shred).
+a Key Manager key, and an SSE-KMS S3 bucket. The resources are created together
+in `create_session()` and torn down together in `close_session()` (crypto-shred).
+
+Credentials: every call uses the organisation API key from the environment
+(`SCW_ACCESS_KEY` / `SCW_SECRET_KEY`). A project-scoped IAM key with expiry was
+planned but is not provisioned yet, so a session isolates storage and KMS keys
+by Project — not credentials.
 
 REST patterns verified against the smoke-test scripts in scripts/vault-smoke-test/
 and the live Scaleway API on 2026-08-06.
@@ -15,6 +19,7 @@ import random
 import re
 import string
 import subprocess
+import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone, timedelta
@@ -87,8 +92,66 @@ def _s3_client(region='fr-par', access_key=None, secret_key=None):
     )
 
 
+# Scaleway's account/v3/projects API validates names against
+# ^[a-zA-Z0-9\._\- ]+$ — anything else is rejected with HTTP 400.
+_SCW_NAME_RE = re.compile(r'[^A-Za-z0-9._\- ]+')
+
+# NFKD does not decompose stroke letters or ligatures, so they are mapped by
+# hand first: without this 'Łódź' loses its 'L' (-> 'odz') and 'Ø'/'ß'/'Æ'
+# would be dropped instead of transliterated.
+_SCW_TRANSLIT = str.maketrans({
+    'Ł': 'L', 'ł': 'l', 'Ø': 'O', 'ø': 'o', 'Đ': 'D', 'đ': 'd',
+    'Ð': 'D', 'ð': 'd', 'Þ': 'TH', 'þ': 'th', 'Æ': 'AE', 'æ': 'ae',
+    'Œ': 'OE', 'œ': 'oe', 'ß': 'ss', 'İ': 'I', 'ı': 'i',
+})
+
+# Typographic quotes are stripped, not replaced: turning them into hyphens
+# produced names like 'Bob-s -App'.
+_SCW_QUOTES_RE = re.compile(
+    "[\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f\u2032\u2033\u00b4\u02bc'\"]"
+)
+
+
+def _ascii_fold(text):
+    """Fold stroke letters then NFKD-decompose: 'Łódź' -> 'Lodz'."""
+    s = (text or '').translate(_SCW_TRANSLIT)
+    s = unicodedata.normalize('NFKD', s)
+    return ''.join(c for c in s if not unicodedata.combining(c))
+
+
+def _scw_display_name(name):
+    """ASCII-safe project name for the Scaleway console.
+
+    Scaleway's account API only accepts ^[a-zA-Z0-9\\._\\- ]+$, so the
+    accented brand prefix in 'Cordée' made every project create fail with
+    HTTP 400. Transliterate to ASCII, drop typographic quotes, replace
+    anything else, cap the length.
+    """
+    s = _SCW_QUOTES_RE.sub('', _ascii_fold(name))
+    s = _SCW_NAME_RE.sub('-', s)
+    s = re.sub(r'-{2,}', '-', s)
+    s = re.sub(r'\s+', ' ', s).strip(' -')
+    return s[:100] or 'project'
+
+
+def _scw_error_text(resp, status):
+    """Turn a Scaleway error payload into one readable sentence."""
+    if isinstance(resp, dict):
+        hints = [d.get('help_message', '') for d in (resp.get('details') or [])
+                 if isinstance(d, dict) and d.get('help_message')]
+        if hints:
+            return f"Scaleway rejected the request: {'; '.join(hints)} (HTTP {status})"
+        msg = resp.get('message') or resp.get('_error') or ''
+        if msg:
+            return f'Scaleway error: {msg} (HTTP {status})'
+    return f'Scaleway error (HTTP {status}): {resp}'
+
+
 def _slugify(name):
-    s = re.sub(r'[^a-z0-9]+', '-', (name or '').lower()).strip('-')
+    # Also used for S3 bucket names ('aingel-<slug>-<6>' <= 63 chars), and
+    # project names are not length-limited: keep the slug at <= 40 chars.
+    s = re.sub(r'[^a-z0-9]+', '-', _ascii_fold(name).lower()).strip('-')
+    s = s[:40].strip('-')
     return s or 'project'
 
 
@@ -127,8 +190,11 @@ def _audit(project_path, allowed, reason=''):
 def create_session(project_id, project_name, region='fr-par', **_):
     """Create a full Scaleway session for a project.
 
-    Sequence: Scaleway Project → project-scoped IAM API key (1y expiry) →
-    Key Manager key → SSE-KMS bucket → versioning.
+    Sequence: Scaleway Project → Key Manager key → SSE-KMS bucket → versioning.
+    All calls use the organisation API key from the environment; no
+    project-scoped IAM key is created. The returned `scw_access_key` /
+    `scw_secret_key` are that same organisation key — they are not persisted in
+    the DB and are never sent to a client.
     Returns a dict with the scw_* fields, or {'ok': False, 'error': ...}.
     """
     proj = agent_db.get_project(project_id)
@@ -142,14 +208,14 @@ def create_session(project_id, project_name, region='fr-par', **_):
         _audit(project_path, False, 'missing SCW access/secret key')
         return {'ok': False, 'error': 'SCW_ACCESS_KEY/SCW_SECRET_KEY not set'}
 
-    scw_project_name = f'Cordée - {project_name}'
+    scw_project_name = _scw_display_name(f'Cordée - {project_name}')
     resp, status = _scw_rest(
         'https://api.scaleway.com/account/v3/projects',
         {'name': scw_project_name, 'organization_id': org_id},
     )
     if status not in (200, 201) or 'id' not in resp:
         _audit(project_path, False, f'project create failed: {resp}')
-        return {'ok': False, 'error': f'project create failed (HTTP {status}): {resp}'}
+        return {'ok': False, 'error': f'project create failed: {_scw_error_text(resp, status)}'}
     scw_project_id = resp['id']
 
     scw_access_key = _scw_access_key()
@@ -167,7 +233,7 @@ def create_session(project_id, project_name, region='fr-par', **_):
     if kms_status not in (200, 201) or 'id' not in kms_resp:
         _audit(project_path, False, f'kms create failed: {kms_resp}')
         _scw_rest(f'https://api.scaleway.com/account/v3/projects/{scw_project_id}', method='DELETE')
-        return {'ok': False, 'error': f'kms key create failed (HTTP {kms_status}): {kms_resp}'}
+        return {'ok': False, 'error': f'kms key create failed: {_scw_error_text(kms_resp, kms_status)}'}
     kms_key_id = kms_resp.get('id') or kms_resp.get('key_id')
 
     bucket_name = f'aingel-{_slugify(project_name)}-{_rand6()}'
@@ -178,7 +244,7 @@ def create_session(project_id, project_name, region='fr-par', **_):
         _audit(project_path, False, f'bucket create failed: {e}')
         _scw_rest(f'https://api.scaleway.com/key-manager/v1alpha1/regions/{region}/keys/{kms_key_id}', method='DELETE')
         _scw_rest(f'https://api.scaleway.com/account/v3/projects/{scw_project_id}', method='DELETE')
-        return {'ok': False, 'error': f'bucket create failed: {e}'}
+        return {'ok': False, 'error': f'bucket create failed: {type(e).__name__}: {e}'}
 
     sse_set = False
     for kms_ref in (kms_key_id, f'arn:scw:kms:{region}::{kms_key_id}'):

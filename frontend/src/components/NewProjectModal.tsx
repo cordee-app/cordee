@@ -8,7 +8,7 @@ const isVault = Boolean((typeof window !== 'undefined' && (window as unknown as 
 export const NewProjectModal = () => {
   const {
     showNewProjectModal, setShowNewProjectModal,
-    models, roleTemplates,
+    models, roleTemplates, config,
     npFilesPicked, setNpFilesPicked,
     npImprovedText, setNpImprovedText,
     setProjects, setTasks, setPhasesData, setChats,
@@ -25,8 +25,8 @@ export const NewProjectModal = () => {
   const [aingelNameVal, setAingelNameVal] = useState('');
   const [aingelModelVal, setAingelModelVal] = useState('');
   const [scwSession, setScwSession] = useState(false);
-  const [provisioning, setProvisioning] = useState(false);
   const [improving, setImproving] = useState(false);
+  const [submitError, setSubmitError] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [showImproved, setShowImproved] = useState(false);
 
@@ -62,7 +62,7 @@ export const NewProjectModal = () => {
     setAingelNameVal('');
     setAingelModelVal('');
     setScwSession(false);
-    setProvisioning(false);
+    setSubmitError('');
     setShowImproved(false);
     setNpImprovedText('');
     setNpFilesPicked([]);
@@ -102,10 +102,20 @@ export const NewProjectModal = () => {
 
   const canSubmit = name.trim() && pitch.trim();
   const template = roleTemplates.find(t => String(t.id) === projectType);
+  // Mirror create_project's resolution: eu_only is sent as `scwSession ? true
+  // : euOnly`, so label the "Default" option with the model it resolves to.
+  const defaultScaffoldModelId = (euOnly || scwSession)
+    ? config?.eu_default_model
+    : config?.default_model;
+  const defaultScaffoldModelLabel = models.find(m => m.id === defaultScaffoldModelId)?.label;
 
   const handleEuChange = (checked: boolean) => {
     setEuOnly(checked);
-    setScaffoldingModel('');
+    // Do NOT clear the scaffolding pick here: the effect above already drops it
+    // when it is not in the filtered list, so an EU-compliant Mistral choice
+    // survives the toggle. Clearing it unconditionally silently reset the user's
+    // choice to "— Default —", and the API then scaffolded with the EU default
+    // (scw-qwen3.6-35b) on an EU-only project, 2026-10-21.
     setAingelModelVal('');
     if (!checked) setScwSession(false);
   };
@@ -174,16 +184,20 @@ export const NewProjectModal = () => {
   };
 
   const handleSubmit = async () => {
+    if (submitting) return;
     if (!canSubmit) return;
+    setSubmitError('');
     setSubmitting(true);
+    let result: Awaited<ReturnType<typeof api.projects.create>> | null = null;
     try {
-      const result = await api.projects.create({
+      result = await api.projects.create({
         name: name.trim(),
         pitch: pitch.trim(),
         stack_hints: stackHints.trim() || undefined,
         scaffolding_model: scaffoldingModel || undefined,
         project_type: template?.name || undefined,
         eu_only: scwSession ? true : euOnly,
+        scw_session: scwSession,
         aingel_name: aingelNameVal.trim() || undefined,
         aingel_model: aingelModelVal || undefined,
       });
@@ -193,34 +207,36 @@ export const NewProjectModal = () => {
           await api.projects.roles.fromTemplate(result.project.id, template.id);
         } catch { /* non-fatal */ }
       }
+    } catch (e) {
+      // Keep the modal open so the typed name and pitch survive: the backend
+      // rolls the project back when EU-session provisioning fails.
+      setSubmitError(e instanceof Error ? e.message : 'unknown');
+      return;
+    } finally {
+      setSubmitting(false);
+    }
+    if (!result) return;
 
-      if (scwSession && result.project?.id) {
-        setProvisioning(true);
-        try {
-          await api.projects.scwSession.create(result.project.id);
-        } catch (e) {
-          alert('Scaleway session provisioning failed: ' + (e instanceof Error ? e.message : 'unknown'));
-        } finally {
-          setProvisioning(false);
-        }
-      }
+    setShowNewProjectModal(false);
+    reset();
 
-      setShowNewProjectModal(false);
-      reset();
+    // Keep the scaffolding chat visible in the Chats sidebar. Do NOT open the
+    // AIngel panel here — it sits at z-1100 and would hide the ScaffoldProgress
+    // modal (z-1000), making the draft logs and "Apply Guide" button invisible.
+    // The user can open the AIngel panel or the Chats sidebar after the
+    // scaffolding modal is dismissed.
+    if (result.project?.id) {
+      setActiveProject(result.project.id);
+      setScaffoldPid(result.project.id);
+      setScaffoldChatId(result.chat?.id ?? null);
+      setScaffoldName(result.project.name || name.trim());
+    }
 
-      // Keep the scaffolding chat visible in the Chats sidebar. Do NOT open the
-      // AIngel panel here — it sits at z-1100 and would hide the ScaffoldProgress
-      // modal (z-1000), making the draft logs and "Apply Guide" button invisible.
-      // The user can open the AIngel panel or the Chats sidebar after the
-      // scaffolding modal is dismissed.
-      if (result.project?.id) {
-        setActiveProject(result.project.id);
-        setScaffoldPid(result.project.id);
-        setScaffoldChatId(result.chat?.id ?? null);
-        setScaffoldName(result.project.name || name.trim());
-      }
-
-      // Load the rest of the data in the background – this can take a while but the UI is already responsive.
+    // Load the rest of the data in the background – this can take a while but the UI is already responsive.
+    // Failures here are non-fatal and must not surface as a create error: the
+    // modal is already closed, so a user-facing alert or inline message would
+    // be lost (or set on an unmounted component).
+    try {
       const [projs, t, chatsList, phases] = await Promise.all([
         api.projects.list(),
         api.tasks.list(),
@@ -232,9 +248,7 @@ export const NewProjectModal = () => {
       setChats(chatsList);
       setPhasesData(phases);
     } catch (e) {
-      alert('Error: ' + (e instanceof Error ? e.message : 'unknown'));
-    } finally {
-      setSubmitting(false);
+      console.error('Project created, but refreshing dashboard data failed:', e);
     }
   };
 
@@ -281,7 +295,7 @@ export const NewProjectModal = () => {
         <div className="form-group mb-3">
           <label className="block text-sm font-semibold text-text-soft mb-[3px]">Scaffolding model</label>
           <select data-tip="Choose the model that scaffolds the project" className="w-full py-[7px] px-2.5 border border-default rounded text-base" value={scaffoldingModel} onChange={e => setScaffoldingModel(e.target.value)}>
-            <option value="">— Default —</option>
+            <option value="">{defaultScaffoldModelLabel ? `— Default (${defaultScaffoldModelLabel}) —` : '— Default —'}</option>
             {filteredScaffoldModels().map((m: Model) => (
               <option key={m.id} value={m.id}>{m.label}</option>
             ))}
@@ -361,10 +375,12 @@ export const NewProjectModal = () => {
           )}
         </div>
 
+        {submitError && <div className="text-dangerStrong text-sm mb-2">{submitError}</div>}
+
         <div className="modal-actions flex justify-end gap-2 mt-4">
           <button data-tip="Close without creating a project" className="btn py-[7px] px-[18px] border border-default rounded cursor-pointer text-md-" onClick={() => setShowNewProjectModal(false)}>Cancel</button>
-          <button data-tip="Create the project and start scaffolding" className="btn btn-primary py-[7px] px-[18px] border border-accent rounded cursor-pointer text-md- bg-accent text-white" onClick={handleSubmit} disabled={!canSubmit || submitting || provisioning}>
-            {provisioning ? 'Provisioning Scaleway session…' : submitting ? 'Creating project…' : 'Create Project'}
+          <button data-tip="Create the project and start scaffolding" className="btn btn-primary py-[7px] px-[18px] border border-accent rounded cursor-pointer text-md- bg-accent text-white" onClick={handleSubmit} disabled={!canSubmit || submitting}>
+            {submitting ? (scwSession ? 'Provisioning EU session…' : 'Creating project…') : 'Create Project'}
           </button>
         </div>
       </div>

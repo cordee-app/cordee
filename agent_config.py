@@ -545,7 +545,11 @@ def default_model_for(proj=None, *, cheap=False):
 
 AUDIT_LOG_NAME = 'eu-audit.log'
 _AUDIT_LOCK = threading.Lock()
+# Public aliases: agent_api copies a rolled-back project's audit trail into the
+# central log and must share the same lock as eu_audit().
+AUDIT_LOCK = _AUDIT_LOCK
 _CENTRAL_AUDIT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Artifacts')
+CENTRAL_AUDIT_DIR = _CENTRAL_AUDIT_DIR
 
 
 def eu_audit(project_path, *, model, provider, allowed, caller='', bytes_out=0, reason=''):

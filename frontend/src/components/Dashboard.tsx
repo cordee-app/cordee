@@ -3,7 +3,7 @@ import { cn } from '../utils/cn';
 import { fmtUsd, fmtPct } from '../utils/currency';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useProjectPermissions, roleAtLeast } from '../hooks/useProjectPermissions';
-import { Lock, Trash2, Users, Archive, PackagePlus } from 'lucide-react';
+import { Lock, ShieldOff, Trash2, Users, Archive, PackagePlus } from 'lucide-react';
 import type { CSSProperties } from 'react';
 
 function projectColor(name: string): string {
@@ -368,6 +368,15 @@ export const Dashboard = () => {
                   <span className="ml-1.5 inline-flex items-center gap-1 text-[10px] uppercase tracking-wide text-accent dark:text-accent-dark-DEFAULT px-1 py-px rounded border border-accent/25 dark:border-accent-dark-DEFAULT/40" style={{ background: 'rgba(99,102,241,.12)' }}>
                     <Lock size={11} />
                     EU Session
+                  </span>
+                )}
+                {p.eu_only && !p.scw_session_enabled && (
+                  <span
+                    className="ml-1.5 inline-flex items-center gap-1 text-[10px] uppercase tracking-wide text-warning px-1 py-px rounded border border-warning/25"
+                    data-tip="No KMS-encrypted bucket — files stay on local disk"
+                  >
+                    <ShieldOff size={11} />
+                    No session
                   </span>
                 )}
                 {!!p.active_deployment_cost_usd && p.active_deployment_cost_usd > 0 && (

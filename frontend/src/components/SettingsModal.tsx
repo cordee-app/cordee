@@ -781,6 +781,11 @@ export const SettingsModal = () => {
                     ) : (
                       <div>
                         <div className="text-xs text-text-faint mb-2">Provisions a dedicated Scaleway Project with KMS-encrypted bucket. Data is crypto-shredded when closed.</div>
+                        {scwStatus && !scwStatus.enabled && (
+                          <div className="text-warning text-sm mb-2" data-tip="No KMS-encrypted bucket exists for this project yet">
+                            No EU session — files stay on this host's local disk.
+                          </div>
+                        )}
                         {!ro && (
                           <button
                             data-tip="Provision an encrypted Scaleway session"

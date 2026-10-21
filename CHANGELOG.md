@@ -8,6 +8,12 @@ All notable changes to this project will be documented in this file. The format 
 ### Changed
 - Rebranded AIngel → Cordée (UI, docs, theme). Internal identifiers unchanged.
 - Relicensed under AGPL-3.0 with a commercial-licence option and a contributor licence agreement (`CLA.md`).
+- Creating a confidential project now provisions its EU Scaleway session inside `POST /api/projects`, before scaffolding starts: a provisioning failure rolls the project back and returns a readable error instead of leaving a half-provisioned project that continues to scaffold.
+
+### Fixed
+- Scaleway project names are transliterated to ASCII (`Cordée - Example Client` → `Cordee - Example Client`). The accented brand prefix violated Scaleway's `^[a-zA-Z0-9._\- ]+$` name rule and made every session creation fail with HTTP 400.
+- Scaleway bucket and KMS key names are length-capped so long project names stay inside the 63-character S3 limit.
+- The "Create Project" modal keeps the typed name and pitch on a failed create and shows the server's error inline, instead of dismissing and continuing to scaffolding.
 
 ### Added
 - Initial public release of Cordée — an AI-guided project management system with EU data sovereignty.

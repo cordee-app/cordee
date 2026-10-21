@@ -448,6 +448,10 @@ def get_config():
         'claude_code_skip_permissions': CLAUDE_CODE_SKIP_PERMISSIONS,
         'vibe_skip_permissions': agent_config.VIBE_SKIP_PERMISSIONS,
         'claude_pro_token_budget': agent_config.SESSION_TOKEN_BUDGET,
+        # Resolved scaffolding defaults, so the New Project picker can label
+        # "Default" with the model it actually resolves to (see create_project).
+        'default_model': agent_config.DEFAULT_MODEL,
+        'eu_default_model': agent_config.EU_DEFAULT_MODEL,
         # /opt/RAG legal corpora live on the vault host only — non-vault
         # installs (e.g. a laptop) have no /opt/RAG and would 404 on search.
         'rag_corpora': agent_rag.list_corpora() if agent_config.IS_VAULT else [],
@@ -937,6 +941,69 @@ def _maybe_update_scaffold_draft(chat_id, reply_text):
     return True
 
 
+def _rollback_new_project(project):
+    """Undo a create_project that failed after the row was inserted.
+
+    Folder first, then the row: if the folder cannot be removed, keep the
+    row so the normal DELETE /api/projects/<id> path can retry and so the
+    name is not permanently blocked by the 'folder already exists' check.
+    Returns an error string when cleanup was incomplete, else None.
+    """
+    path = (project or {}).get('path') or ''
+    if path:
+        root = os.path.realpath(PROJECTS_ROOT)
+        real = os.path.realpath(path)
+        if real == root or not real.startswith(root + os.sep):
+            return f'refusing to remove {path}: outside PROJECTS_ROOT'
+        if os.path.exists(real):
+            # Preserve the project-local egress audit before the folder — and
+            # the raw Scaleway failure payload it holds — is deleted. Audit
+            # first, then delete, and never let the copy fail the rollback.
+            try:
+                src = os.path.join(real, 'Artifacts', agent_config.AUDIT_LOG_NAME)
+                if os.path.exists(src):
+                    with open(src, 'r', encoding='utf-8', errors='replace') as fh:
+                        lines = [ln for ln in fh.readlines() if ln.strip()]
+                    if lines:
+                        if not lines[-1].endswith('\n'):
+                            lines[-1] += '\n'
+                        dst_dir = agent_config.CENTRAL_AUDIT_DIR
+                        os.makedirs(dst_dir, exist_ok=True)
+                        with agent_config.AUDIT_LOCK:
+                            dst = os.path.join(dst_dir, agent_config.AUDIT_LOG_NAME)
+                            with open(dst, 'a', encoding='utf-8') as fh:
+                                fh.writelines(lines)
+            except Exception as e:
+                app.logger.warning('rollback audit copy failed for %s: %s', real, e)
+            try:
+                shutil.rmtree(real)
+            except Exception as e:
+                app.logger.warning('rollback rmtree failed for %s: %s', real, e)
+                return f'folder cleanup failed ({e}) — delete the project from the dashboard'
+    try:
+        db.delete_project(project['id'])
+    except Exception as e:
+        app.logger.warning('rollback delete_project failed: %s', e)
+        return f'project row cleanup failed ({e})'
+    return None
+
+
+def _apply_scw_session_result(pid, result):
+    """Persist a create_session result and return the refreshed project row.
+
+    create_session already writes these fields but only logs a warning if
+    the DB write fails, so re-apply and re-read to prove the row really
+    points at the live Scaleway resources (otherwise the session is
+    unclosable from the UI and keeps billing).
+    """
+    for k in ('scw_project_id', 'scw_session_bucket', 'scw_kms_key_id',
+              'scw_session_region', 'scw_session_created_at'):
+        if result.get(k) is not None:
+            db.set_project_field(pid, k, result[k])
+    db.set_project_field(pid, 'scw_session_enabled', 1)
+    return db.get_project(pid)
+
+
 @app.route('/api/projects', methods=['POST'])
 @require_auth
 def create_project():
@@ -955,6 +1022,9 @@ def create_project():
     llm_mode = (data.get('llm_mode') or 'standard').strip()
     execution_type = (data.get('execution_type') or 'standard').strip()
     aingel_name = (data.get('aingel_name') or '').strip() or None
+    # Provision the Scaleway session server-side, before the chat/queue/thread
+    # exist, so a failure can roll the project back atomically.
+    scw_session = bool(data.get('scw_session', False))
 
     if not name:
         return jsonify({'error': 'name required'}), 400
@@ -967,6 +1037,8 @@ def create_project():
     ok, err = _eu_guard(eu_only, model)
     if not ok:
         return _eu_reject(None, model, 'create_project', err)
+    if scw_session and not (agent_config.IS_VAULT or eu_only):
+        return jsonify({'error': 'Scaleway sessions require IS_VAULT or an EU-only project'}), 400
 
     slug = slugify(name)
     # Refuse duplicate slug
@@ -1009,6 +1081,78 @@ def create_project():
             db.add_project_member(project['id'], _creator['id'], 'owner')
         except Exception as _e:
             app.logger.warning('owner bootstrap failed: %s', _e)
+
+    # Provision the Scaleway session BEFORE the chat, the progress queue and the
+    # scaffolding thread exist: a failure here only has to undo a folder + row,
+    # so a 5xx really means "no project was created". Retry path stays
+    # POST /api/projects/<pid>/scw-session.
+    if scw_session:
+        def _shred_session(_result):
+            try:
+                agent_scw_session.close_session(
+                    project_id=project['id'],
+                    scw_project_id=_result.get('scw_project_id'),
+                    bucket_name=_result.get('scw_session_bucket'),
+                    kms_key_id=_result.get('scw_kms_key_id'),
+                    region=_result.get('scw_session_region') or 'fr-par',
+                )
+            except Exception as e:
+                app.logger.warning('cleanup close_session failed: %s', e)
+
+        try:
+            result = agent_scw_session.create_session(
+                project_id=project['id'],
+                project_name=project.get('name') or f'project-{project["id"]}',
+            )
+        except Exception as e:
+            # create_session normally returns {'ok': False}, but a bug or an
+            # unexpected SDK error must fail the same way rather than escape
+            # as a 500 with the project row already inserted.
+            result = {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+        if not result.get('ok'):
+            err = result.get('error') or 'session create failed'
+            # Compliance trail must survive the folder removal below.
+            agent_config.eu_audit(
+                None, model='scw-session', provider='scaleway', allowed=False,
+                caller='create_project',
+                reason=f'session provisioning failed, project rolled back: {err}',
+            )
+            cleanup_err = _rollback_new_project(project)
+            msg = f'Scaleway session provisioning failed: {err}'
+            if cleanup_err:
+                msg += f' ({cleanup_err})'
+            return jsonify({'error': msg}), 502
+        updated = _apply_scw_session_result(project['id'], result)
+        if not updated:
+            # Row vanished under us — treat as total failure, unwind best-effort.
+            _shred_session(result)
+            agent_config.eu_audit(
+                None, model='scw-session', provider='scaleway', allowed=False,
+                caller='create_project',
+                reason='session created but project row disappeared, resources shredded and rolled back',
+            )
+            cleanup_err = _rollback_new_project(project)
+            msg = 'Scaleway session provisioning failed: project row disappeared'
+            if cleanup_err:
+                msg += f' ({cleanup_err})'
+            return jsonify({'error': msg}), 502
+        if not updated.get('scw_session_enabled'):
+            # Persistence failed although the Scaleway resources exist: shred them
+            # before rolling back so nothing keeps billing invisibly.
+            _shred_session(result)
+            agent_config.eu_audit(
+                None, model='scw-session', provider='scaleway', allowed=False,
+                caller='create_project',
+                reason='session fields could not be persisted, resources shredded and project rolled back',
+            )
+            cleanup_err = _rollback_new_project(project)
+            msg = 'Scaleway session provisioning failed: could not persist session fields'
+            if cleanup_err:
+                msg += f' ({cleanup_err})'
+            return jsonify({'error': msg}), 502
+        project = updated              # IMPORTANT: refresh — the old dict is stale
+        if project.get('path'):
+            _write_aingel_json(project['path'], project)
 
     # Create the scaffolding chat
     chat = db.create_chat(
@@ -1128,11 +1272,21 @@ def create_project():
         except Exception as e:
             app.logger.warning('aingel auto-init failed: %s', e)
 
-    return jsonify({
+    payload = {
         'project': project,
         'chat': db.get_chat(chat['id']),
         'reply': None,  # reply will come via SSE
-    }), 201
+    }
+    if scw_session:
+        # Mirrors POST /api/projects/<pid>/scw-session — never any secrets.
+        payload['session'] = {
+            'project_id': project.get('scw_project_id'),
+            'bucket': project.get('scw_session_bucket'),
+            'kms_key_id': project.get('scw_kms_key_id'),
+            'region': project.get('scw_session_region') or 'fr-par',
+            'created_at': project.get('scw_session_created_at'),
+        }
+    return jsonify(payload), 201
 
 
 def _extract_guide_from_message(text):
@@ -2334,13 +2488,10 @@ def create_scw_session(pid):
         )
         if not result.get('ok'):
             return jsonify({'error': result.get('error', 'session create failed')}), 500
-        for k in ('scw_project_id', 'scw_session_bucket', 'scw_kms_key_id',
-                  'scw_session_region'):
-            if result.get(k) is not None:
-                db.set_project_field(pid, k, result[k])
-        db.set_project_field(pid, 'scw_session_enabled', 1)
-        updated = db.get_project(pid)
-        if updated and updated.get('path'):
+        updated = _apply_scw_session_result(pid, result)
+        if not updated or not updated.get('scw_session_enabled'):
+            return jsonify({'error': 'session created but its fields could not be persisted'}), 500
+        if updated.get('path'):
             _write_aingel_json(updated['path'], updated)
         return jsonify({
             'ok': True,

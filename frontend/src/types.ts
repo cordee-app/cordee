@@ -363,6 +363,8 @@ export interface Config {
   claude_code_skip_permissions?: boolean;
   vibe_skip_permissions?: boolean;
   claude_pro_token_budget?: number;
+  default_model?: string;
+  eu_default_model?: string;
   rag_corpora?: { id: string; label: string }[];
   instance_name?: string;
   is_vault?: boolean;

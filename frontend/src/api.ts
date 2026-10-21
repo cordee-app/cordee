@@ -154,6 +154,7 @@ export const api = {
       name: string; pitch: string; stack_hints?: string;
       scaffolding_model?: string; project_type?: string;
       eu_only?: boolean;
+      scw_session?: boolean;
       aingel_name?: string; aingel_model?: string;
     }) => post<{ project: Project; chat: Chat; reply: string }>('/api/projects', data),
     update: (pid: number, data: Record<string, unknown>) => patch<{ ok: true }>(`/api/projects/${pid}`, data),
