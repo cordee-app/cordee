@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file. The format 
 - Creating a confidential project now provisions its EU Scaleway session inside `POST /api/projects`, before scaffolding starts: a provisioning failure rolls the project back and returns a readable error instead of leaving a half-provisioned project that continues to scaffold.
 
 ### Fixed
+- Regenerated `GUIDE.md` no longer repeats the phase prefix (`## Phase 1 — Phase 1 — …`, present in every project), and the first phase heading is no longer glued to the generated-file comment.
 - Scaleway project names are transliterated to ASCII (`Cordée - Example Client` → `Cordee - Example Client`). The accented brand prefix violated Scaleway's `^[a-zA-Z0-9._\- ]+$` name rule and made every session creation fail with HTTP 400.
 - Scaleway bucket and KMS key names are length-capped so long project names stay inside the 63-character S3 limit.
 - The "Create Project" modal keeps the typed name and pitch on a failed create and shows the server's error inline, instead of dismissing and continuing to scaffolding.

@@ -131,6 +131,22 @@ def _format_task_line(task):
     return line
 
 
+# `parse_guide` stores a whole GUIDE heading ('Phase 1 — Title') as
+# `phase_name`, and this writer numbers the headings itself. Strip any prefix
+# already present (repeatedly, for legacy double imports) so regenerated files
+# read '## Phase 1 — Title' and not '## Phase 1 — Phase 1 — Title'.
+_PHASE_PREFIX_RE = re.compile(
+    r'^(?:phase\s+\d+\s*[\u2014\u2013:-]\s*)+', re.IGNORECASE
+)
+
+
+def _phase_label(phase):
+    """Return a phase name without its leading 'Phase N — ' prefix."""
+    original = (phase or '').strip()
+    label = _PHASE_PREFIX_RE.sub('', original).strip()
+    return label or original
+
+
 def regenerate_guide(project_path, project_id):
     """Regenerate `<project>/GUIDE.md` from the project's tasks.
 
@@ -156,11 +172,11 @@ def regenerate_guide(project_path, project_id):
 
         out = []
         out.append(f"# {project_name} \u2014 Roadmap\n")
-        out.append(_AUTO_GEN_HEADER.rstrip())
-        out.append('')
+        out.append(_AUTO_GEN_HEADER)
+        out.append('\n')
 
         for idx, phase in enumerate(phases, start=1):
-            out.append(f"## Phase {idx} \u2014 {phase}\n")
+            out.append(f"## Phase {idx} \u2014 {_phase_label(phase)}\n")
             phase_rows = [r for r in rows if ((r['phase_name'] or '').strip() or 'Notebook') == phase]
             if not phase_rows:
                 out.append('_No tasks yet._\n')
