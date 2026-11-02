@@ -11,6 +11,8 @@ interface Props {
   isArchived?: boolean;
   /** Task is held by an AIngel gate (H2a review/questions pending) — block edit/archive/delete. */
   held?: boolean;
+  /** Task is currently running — block edit only (other actions keep their existing rules). */
+  running?: boolean;
 }
 
 /**
@@ -20,7 +22,7 @@ interface Props {
  * Replaces the inline Edit/Archive buttons on TaskCard. Keeps the card compact
  * while grouping rare-but-destructive actions behind a single button.
  */
-export const TaskOverflowMenu = ({ task, isArchived = false, held = false }: Props) => {
+export const TaskOverflowMenu = ({ task, isArchived = false, held = false, running = false }: Props) => {
   const perms = useProjectPermissions(task.project_id);
   const [open, setOpen] = useState(false);
   const [phaseSubOpen, setPhaseSubOpen] = useState(false);
@@ -48,7 +50,7 @@ export const TaskOverflowMenu = ({ task, isArchived = false, held = false }: Pro
   // answer the review questions or override before editing the task.
   const canArchive = !isArchived && !held && (isDone || isFailed || isSkip);
   const canRedo = !held && (isDone || isFailed || isSkip);
-  const canEdit = !isArchived && !held;
+  const canEdit = !isArchived && !held && !running;
 
   // Phases available for this task's project. `get_all_phases` returns
   // {project: <name>, phases: [{title}]} — there is no project_id field, so

@@ -286,16 +286,11 @@ body {
 /* ── Execution Log ───────────────────────────────────────────────── */
 .execution-log {
   border-top: 1px solid #e4e4e7;
-  max-height: 200px;
+  max-height: 300px;
   overflow-y: auto;
   flex-shrink: 0;
   background: #fafafb;
 }
-.log-header {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 6px 16px; font-size: 11px; color: #5c5c66; border-bottom: 1px solid #ececef;
-}
-.log-header h4 { margin: 0; font-size: 12px; font-weight: 600; }
 .log-table table { width: 100%; border-collapse: collapse; font-size: 11px; }
 .log-table th { text-align: left; padding: 4px 8px; background: #f4f4f5; color: #5c5c66; font-weight: 600; }
 .log-table td { padding: 3px 8px; border-bottom: 1px solid #f4f4f5; }
@@ -1536,7 +1531,6 @@ code, pre, .dash-exec-cost { font-family: var(--c-font-mono); }
 
 /* Execution log */
 .execution-log { background: var(--c-muted); border-top-color: var(--c-border); }
-.log-header { color: var(--c-text-muted); border-bottom-color: var(--c-border-subtle); }
 .log-table th { background: var(--c-subtle); color: var(--c-text-muted); }
 .log-table td { border-bottom-color: var(--c-border-subtle); }
 .log-row.status-done { background: var(--c-sage-100); }

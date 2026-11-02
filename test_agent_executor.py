@@ -1207,9 +1207,19 @@ class PauseAtLimitTests(unittest.TestCase):
         self.assertEqual(r.status_code, 202, r.get_json())
         self.assertEqual(started, [('continue_execution', eid, {'note': 'go on'})])
 
-    def test_non_tool_loop_models_are_not_pausable(self):
+    def test_pausable_routes(self):
+        # In-process tool loop (Scaleway/Ollama) and both CLI routes can pause
+        # at their limit with a resumable checkpoint (item 16 Phase 3).
         self.assertTrue(agent_executor._pausable_route('scw-qwen3.6-35b'))
-        self.assertFalse(agent_executor._pausable_route('mistral-glm-5-3'))
+        self.assertTrue(agent_executor._pausable_route('claude-sonnet-5-5'))
+        # Mistral is only resumable through the Vibe CLI, and only for models
+        # the CLI accepts (VIBE_MODELS); the API route has no session handle.
+        self.assertTrue(agent_executor._pausable_route('mistral-large-4'))
+        self.assertFalse(agent_executor._pausable_route(
+            'mistral-large-4', force_mistral_mode='api'))
+        self.assertFalse(agent_executor._pausable_route('mistral-ocr-latest'))
+        # Codex stays out of scope: no resume flag, no turn cap.
+        self.assertFalse(agent_executor._pausable_route('codex-chatgpt'))
 
 class OrphanCliStopTests(unittest.TestCase):
     """The orphan sweep stops the agent CLI of a run whose supervisor died
@@ -1325,3 +1335,83 @@ class MissingDeliverableWarningTests(unittest.TestCase):
             self.task, '/nonexistent/not-a-project', 'text',
             started_at=time.time() - 60)
         self.assertIsNone(warn)
+
+
+class ReviewInFlightHoldTests(unittest.TestCase):
+    """H2 must hold the card for the WHOLE review, not only when it returns.
+
+    Regression: the confirm-time H2a optimistic hold covers the first review.
+    On a re-run (e.g. a rejected task) the gate was only written once
+    ``pre_run_check`` came back, so the card stayed open/editable/redistributable
+    for the 2-15s review window. run_task now re-enters the same transient H2a
+    marker before every review round.
+
+    The stale-report case matters: the frontend's "reviewing…" badge
+    (``h2aReviewing``) requires ``gate_report_h2_json`` to be NULL, so a re-run
+    carrying the previous round's report must clear it as well.
+    """
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self._patch = patch.object(
+            agent_db, 'DB_PATH', os.path.join(self.td.name, 'aingel.db'))
+        self._patch.start()
+        agent_db.init_db()
+        self.path = os.path.join(self.td.name, 'proj')
+        os.makedirs(self.path, exist_ok=True)
+        proj = agent_db.upsert_project('P', 'p', self.path)
+        self.proj_id = proj['id']
+        agent_db.set_project_field(self.proj_id, 'aingel_autopilot', 1)
+        self.task_id = agent_db.create_task(self.proj_id, 'Rejected task',
+                                            project_path=self.path)
+        # Re-run state: gate cleared to open by the rejection, but the
+        # previous round's H2 report is still on the row (stale).
+        agent_db.update_task(self.task_id, project_path=self.path,
+                             status='confirmed',
+                             gate_state='open', gate_source='H3',
+                             gate_reason='',
+                             gate_report_h2_json='{"gate": "hold", '
+                                                  '"reason": "previous round"}')
+
+    def tearDown(self):
+        self._patch.stop()
+        self.td.cleanup()
+
+    def test_gate_is_held_while_pre_run_check_is_in_flight(self):
+        seen = {}
+
+        def fake_pre_run_check(**kwargs):
+            # Snapshot the row exactly as the UI would read it at this moment.
+            seen.update(agent_db.get_task(self.task_id, project_path=self.path))
+            return {
+                'completeness': 'complete', 'missing_files': [],
+                'binary_unparsable': [], 'capability_warnings': [],
+                'dep_blockers': [], 'self_serve': [], 'output_targets': [],
+                'strategic_advice': '', 'gate': 'run',
+                'reason': 'all files inlined',
+            }
+
+        built = {'mode': 'inline', 'prompt': 'do it', 'max_tokens': 100}
+        with patch.object(agent_executor.agit, 'resolve_enabled', return_value=False), \
+             patch('agent_scw_session.sync_bucket_to_working_docs', return_value=None), \
+             patch('prompt_builder.build', return_value=built), \
+             patch.object(agent_executor, 'route',
+                          return_value=('Deliverable text', 1, 2, 0.001)), \
+             patch('agent_overseer.pre_run_check', side_effect=fake_pre_run_check), \
+             patch.object(agent_executor, '_generate_brief_async',
+                          lambda *a, **k: None):
+            result = agent_executor.run_task(self.task_id)
+
+        self.assertEqual(result.get('status'), 'done')
+        # At the instant the review ran, the card was locked in the same
+        # H2a hold the confirm-time path uses, with no stale report.
+        self.assertEqual(seen.get('gate_state'), 'hold')
+        self.assertEqual(seen.get('gate_source'), 'H2a')
+        self.assertEqual(seen.get('gate_reason'), 'Guide is reviewing this task…')
+        self.assertIsNone(seen.get('gate_report_h2_json'))
+        self.assertTrue(seen.get('gate_decided_at'))
+        # The completed review's own decision replaces the transient marker.
+        after = agent_db.get_task(self.task_id, project_path=self.path)
+        self.assertEqual(after['gate_state'], 'open')
+        self.assertEqual(after['gate_source'], 'H2')
+        self.assertEqual(json.loads(after['gate_report_h2_json'])['gate'], 'run')

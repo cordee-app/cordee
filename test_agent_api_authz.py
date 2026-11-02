@@ -637,5 +637,85 @@ class CustomModelImportAuthzTests(_TwoTenantApp, unittest.TestCase):
         self.assertIn('disappeared', row['error_message'])
 
 
+class TaskReviewGuardTests(_TwoTenantApp, unittest.TestCase):
+    """H2a mid-review guard on PATCH /api/tasks/<tid> and POST /api/execute.
+
+    While the Guide reviews a task (gate_state='hold', gate_source='H2a') the
+    UI fades the card, but a direct API caller must not be able to edit content
+    or start the run mid-review. The slot change and the /gate flows stay open.
+    """
+
+    def _review_task(self):
+        tid = agent_db.create_task(
+            self.proj_a['id'], 'Review me', description='do the thing',
+            project_path=self.path_a)
+        agent_db.update_task(tid, project_path=self.path_a,
+                             gate_state='hold', gate_source='H2a',
+                             gate_reason='Guide is reviewing this task…')
+        return tid
+
+    def test_patch_content_is_refused(self):
+        tid = self._review_task()
+        self._login(self.user_a)
+        resp = self.client.patch(f'/api/tasks/{tid}', json={'title': 'renamed'})
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn('under review', resp.get_json()['error'])
+        self.assertEqual(
+            agent_db.get_task(tid, self.path_a)['title'], 'Review me')
+
+    def test_patch_slot_confirm_still_allowed(self):
+        tid = self._review_task()
+        self._login(self.user_a)
+        resp = self.client.patch(f'/api/tasks/{tid}', json={'work_session_slot': 1})
+        self.assertEqual(resp.status_code, 200)
+        task = agent_db.get_task(tid, self.path_a)
+        self.assertEqual(task['work_session_slot'], 1)
+        self.assertEqual(task['status'], 'confirmed')
+
+    def test_patch_slot_unconfirm_still_allowed(self):
+        tid = self._review_task()
+        agent_db.update_task(tid, project_path=self.path_a,
+                             work_session_slot=1, status='confirmed')
+        self._login(self.user_a)
+        resp = self.client.patch(f'/api/tasks/{tid}', json={'work_session_slot': None})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(agent_db.get_task(tid, self.path_a)['work_session_slot'])
+
+    def test_patch_open_task_still_succeeds(self):
+        tid = agent_db.create_task(
+            self.proj_a['id'], 'Plain', description='no review',
+            project_path=self.path_a)
+        self._login(self.user_a)
+        resp = self.client.patch(f'/api/tasks/{tid}', json={'title': 'renamed'})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            agent_db.get_task(tid, self.path_a)['title'], 'renamed')
+
+    def test_execute_is_refused(self):
+        tid = self._review_task()
+        self._login(self.user_a)
+        with patch.object(self.agent_api, 'run_task') as run:
+            resp = self.client.post('/api/execute', json={'task_id': tid})
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn('under review', resp.get_json()['error'])
+        run.assert_not_called()
+
+    def test_gate_answer_resolves_hold(self):
+        # The review itself is finished through /gate — the PATCH guard must
+        # never intercept that flow.
+        tid = self._review_task()
+        self._login(self.user_a)
+        resp = self.client.post(
+            f'/api/tasks/{tid}/gate',
+            json={'action': 'answer', 'answers': {'q1': 'Use Python 3.12'}})
+        self.assertEqual(resp.status_code, 200)
+        task = agent_db.get_task(tid, self.path_a)
+        self.assertEqual(task['gate_state'], 'open')
+        self.assertIn('Use Python 3.12', task['description'])
+        # And the task can now be edited again.
+        resp = self.client.patch(f'/api/tasks/{tid}', json={'title': 'after review'})
+        self.assertEqual(resp.status_code, 200)
+
+
 if __name__ == '__main__':
     unittest.main()

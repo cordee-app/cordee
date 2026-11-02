@@ -151,6 +151,7 @@ def _init_project_db_schema(conn):
             git_commit       TEXT DEFAULT '',
             git_diffstat     TEXT DEFAULT '',
             git_merge_commit TEXT DEFAULT '',
+            git_commit_error TEXT DEFAULT '',
             aingel_brief     TEXT DEFAULT '',
             batch_parent_id  INTEGER DEFAULT NULL,
             created_by       INTEGER DEFAULT NULL,
@@ -274,6 +275,10 @@ def _init_project_db_schema(conn):
         ('segments', 'INTEGER DEFAULT 1'),
         # The report shown while paused: facts from code + the Guide's read.
         ('pause_report_json', 'TEXT'),
+        # Commit-blocked (pre-commit hook rejection etc.): the error from the
+        # failed `git commit`, so the Exec Log can show why nothing was merged
+        # while the staged-files diffstat still links the deliverables.
+        ('git_commit_error', "TEXT DEFAULT ''"),
     ]:
         _add_column_if_missing(conn, 'executions', col, defn)
     # ── Indexes (after migrations so newly-added columns are indexed safely) ───
@@ -4233,7 +4238,12 @@ def overview_file_path(project_path):
 
 
 def update_execution_git(exec_id, branch=None, commit=None, diffstat=None,
-                         merge_commit=None, project_path=None):
+                         merge_commit=None, project_path=None, commit_error=None):
+    """Update the git bookkeeping columns of an execution row.
+
+    Each kwarg is independent and optional: ``None`` leaves that column
+    untouched, any other value (including ``''``) overwrites it.
+    """
     if not project_path:
         reg = _get_exec_reg(exec_id)
         project_path = reg['project_path'] if reg else None
@@ -4248,6 +4258,8 @@ def update_execution_git(exec_id, branch=None, commit=None, diffstat=None,
         sets.append('git_diffstat=?');     vals.append(diffstat)
     if merge_commit is not None:
         sets.append('git_merge_commit=?'); vals.append(merge_commit)
+    if commit_error is not None:
+        sets.append('git_commit_error=?'); vals.append(commit_error)
     if not sets:
         return
     vals.append(exec_id)
@@ -4317,12 +4329,12 @@ def get_executions(limit=50):
                        e.tokens_input, e.tokens_output, e.started_at, e.finished_at,
                        e.last_heartbeat_at, e.child_pid, e.chat_id, e.aingel_brief,
                        e.error_message, e.git_branch, e.git_commit, e.git_diffstat,
-                       e.git_merge_commit,
+                       e.git_merge_commit, e.git_commit_error,
                        e.memory_status, e.gpu_cost_usd, e.batch_parent_id, e.session_id,
                        e.rag_label, e.rag_provenance_json, e.context_used_json,
                        e.pause_reason, e.segments, e.pause_report_json,
                        t.title task_title, t.external_id task_ext_id,
-                       t.display_code task_display_code,
+                       t.display_code task_display_code, t.phase_name,
                        CASE WHEN e.task_id IS NULL THEN NULL
                             ELSE ROW_NUMBER() OVER (PARTITION BY e.task_id ORDER BY e.id)
                        END AS exec_no

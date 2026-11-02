@@ -237,9 +237,20 @@ def _mistral_wire_id(model_id):
 # exec() with `OSError [Errno 7] Argument list too long: 'vibe'` before vibe
 # even runs (regression: exec #20001013, AIngel review chat post whose
 # auto-inlined context pushed the prompt past the per-arg limit). Cap below
-# the limit with headroom for UTF-8 multibyte chars; the tail-truncation
-# below keeps the newest context. If a task genuinely needs more, it should
-# use a tool-loop model (Scaleway/Ollama) or batch mode, not the vibe argv.
+# the limit with headroom for UTF-8 multibyte chars.
+#
+# What to do when a prompt does not fit depends on WHO is calling (see
+# `_fit_vibe_prompt`):
+#   * Chats / guides put the newest user request at the END, so keeping the
+#     tail is correct — older context is dropped and a header says so.
+#   * Task runs put the task description and its constraints at the FRONT, so
+#     tail truncation amputates the instructions themselves. That is NEVER
+#     acceptable: the run is rejected with VibePromptTooLargeError instead
+#     (regression: RP-114-E1 — ~230 KB of extracted PDF text inlined from two
+#     referenced PDFs, each capped at 200,000 chars by _extract_pdf_text —
+#     just under the single-file token gate, far over the argv cap — pushed
+#     the task description off the argv; the model invented a different
+#     task and destroyed an unrelated document).
 VIBE_PROMPT_MAX_CHARS = 100_000
 # Byte-level cap actually enforced at exec() time (the OS limit is a byte
 # limit; a 100k-char CJK/emoji prompt encodes to 300k bytes). Keep below
@@ -337,8 +348,16 @@ def _flatten_content(raw):
 # Vibe's per-run tool-turn budget (`--max-turns`). VIBE_TURN_LIMIT_MARKER is
 # appended to the recovered text when a run exhausts it; the executor keys on
 # it to skip the simulation detector (80 real turns prove the tools ran).
-VIBE_MAX_TURNS = 80
+# Env-overridable: the live end-to-end test lowers it, and operators can tune
+# it without a code change.
+VIBE_MAX_TURNS = max(1, int(os.getenv('VIBE_MAX_TURNS', '80')))
 VIBE_TURN_LIMIT_MARKER = 'Vibe CLI hit its turn limit'
+# Claude CLI turn budget for pausable task runs (Phase 3). The claude CLI has
+# no default turn cap; `--max-turns` (hidden, print mode) lets a run pause
+# cleanly instead of working until the 900-s kill. The timeout is also
+# env-tunable so the time-limit pause can be tested without a 15-min wait.
+CLAUDE_MAX_TURNS = max(1, int(os.getenv('AINGEL_CLAUDE_MAX_TURNS', '60')))
+CLAUDE_CLI_TIMEOUT_SECS = max(60, int(os.getenv('CLAUDE_CLI_TIMEOUT_SECS', '900')))
 # Same role for the in-process OpenAI-compatible tool loop (Scaleway/Ollama):
 # appended when the loop exhausts max_turns and the run was closed by the
 # forced "answer now" call. H3 keys on it so such a run is never approved as
@@ -360,6 +379,58 @@ class VibeCLIError(RuntimeError):
 class VibeCLITimeout(Exception):
     """Raised when a Vibe CLI run exceeds VIBE_CLI_TIMEOUT_SECS. Not a
     RuntimeError subclass, so the tenacity retry loop does not restart it."""
+
+
+class VibePromptTooLargeError(RuntimeError):
+    """A task-run prompt exceeds the vibe argv byte cap.
+
+    Tail truncation would drop the task description and constraints (they sit at
+    the FRONT of a task prompt), so the run fails instead of executing an
+    invented task. Actionable: reduce the referenced files/context_refs or use a
+    tool-loop model (Scaleway/Ollama/Claude).
+    """
+
+
+def _fit_vibe_prompt(prompt, caller=''):
+    """Fit ``prompt`` to ``VIBE_PROMPT_MAX_BYTES``; returns ``(prompt, truncated)``.
+
+    Tail truncation is right for chats/guides (newest context is at the end) and
+    must never be applied to task runs: ``caller='run_task:<id>'`` (or
+    ``run_task:<id>:<phase>``) raises VibePromptTooLargeError instead, because
+    the front of the assembled prompt holds the task description and the
+    constraints/output-format block (regression: RP-114-E1).
+    """
+    prompt = prompt or ''
+    original_bytes = len(prompt.encode('utf-8'))
+    if original_bytes <= VIBE_PROMPT_MAX_BYTES:
+        return prompt, False
+    caller = caller or ''
+    if caller.startswith('run_task:'):
+        _log.warning(
+            'Vibe prompt too large for a task run (caller=%s, %d bytes > '
+            '%d-byte cap) — refusing to truncate the task instructions',
+            caller, original_bytes, VIBE_PROMPT_MAX_BYTES)
+        raise VibePromptTooLargeError(
+            f'Vibe prompt is {original_bytes} bytes, above the '
+            f'{VIBE_PROMPT_MAX_BYTES}-byte argv cap (caller={caller}). The prompt '
+            f'was assembled with oversized inline file content; tail truncation '
+            f'would drop the task description, so the run was refused. Use a '
+            f'tool-loop model (Scaleway/Ollama/Claude) or reduce the referenced '
+            f'files/context_refs.')
+    # Chats/guides: keep the newest context (the tail) and flag the loss. Truncate
+    # on a UTF-8 boundary so we never split a character mid-sequence.
+    truncated_text = prompt.encode('utf-8')[-VIBE_PROMPT_MAX_BYTES:].decode(
+        'utf-8', errors='ignore')
+    _log.warning(
+        'Vibe prompt truncated (caller=%s, %d bytes > %d-byte cap, %d bytes '
+        'retained)', caller or 'unknown', original_bytes, VIBE_PROMPT_MAX_BYTES,
+        len(truncated_text.encode('utf-8')))
+    return (
+        '## Context truncated\n\n'
+        'The full context exceeded the size limit, so only the most recent '
+        'portion is shown below. Earlier context was dropped.\n\n'
+        + truncated_text
+    ), True
 
 
 class LimitReached(Exception):
@@ -404,6 +475,215 @@ def pause_scope(time_budget_s=None, resume=None):
 
 def current_pause_scope():
     return _PAUSE_SCOPE.get()
+
+
+# ── CLI pause/resume helpers (item 16 Phase 3) ───────────────────────────────
+# The tool loop checkpoints its in-process `messages`; a CLI has no such list,
+# so its checkpoint carries the CLI's own resumable session id plus the
+# transcript/facts the pause report already consumes. The executor's
+# LimitReached handler treats the checkpoint as an opaque dict, so the only
+# difference between a tool-loop and a CLI pause is the checkpoint contents.
+_CONTINUE_NOTE = ('The user chose to continue this run for another block of turns. '
+                  'Carry on from where you stopped; do not redo finished work.')
+
+
+def continue_message(note=''):
+    """The prompt a resumed CLI run gets — same wording as the tool loop's."""
+    note = (note or '').strip()
+    return _CONTINUE_NOTE + (f'\n\nNote from the user: {note}' if note else '')
+
+
+def _transcript_seed(resume):
+    """Checkpoint transcript + the part banner a resumed run continues from.
+
+    The banner text matches the tool loop's, so `_pause_facts`' repeated-action
+    parsing still counts only the current part's actions."""
+    prior = list((resume or {}).get('transcript') or [])
+    if resume:
+        part = int((resume or {}).get('segments') or 1) + 1
+        note = ((resume or {}).get('note') or '').strip()
+        prior.append(f'--- ▶ Continued by the user (part {part})'
+                     + (f': "{note}"' if note else '') + ' ---')
+    return prior
+
+
+def vibe_session_dir(session_id, root=None):
+    return os.path.join(root or VIBE_SESSION_ROOT, session_id or '')
+
+
+def _vibe_continuation_block(resume, room=4000):
+    """Prompt suffix for a continued Vibe block (fresh session, replayed task).
+
+    The Vibe CLI cannot resume a session headlessly, so the continuation
+    re-sends the task prompt with a summary of the previous block appended:
+    the model sees its own narration and tool calls, then inspects the files
+    left on the (re-checked-out) task branch. ``room`` is a byte budget for the
+    whole block; the oldest transcript lines are dropped first."""
+    part = int((resume or {}).get('segments') or 1) + 1
+    note = ((resume or {}).get('note') or '').strip()
+    lines = [str(t).strip() for t in ((resume or {}).get('transcript') or [])
+             if str(t).strip()]
+    head = (f'\n\n---\nCONTINUATION — part {part} of a task that stopped at its '
+            'turn limit.\nThe task above was already started in this project. '
+            'Work already done:\n\n')
+    tail = ('\n\nCarry on from where it stopped: inspect the files on disk, do '
+            'not redo finished work, and finish the remaining steps.')
+    if note:
+        tail += f'\n\nNote from the user: {note}'
+    body = '\n'.join(lines)
+    budget = max(200, int(room or 4000) - len((head + tail).encode('utf-8')))
+    if len(body.encode('utf-8')) > budget:
+        cut = body.encode('utf-8')[-budget:].decode('utf-8', errors='ignore')
+        body = '…\n' + cut
+    return head + (body or '(no steps recorded)') + tail
+
+
+def _vibe_journal_transcript(session_dir, skip_results=0):
+    """(narration + `→ tool` lines, action_result count) from a Vibe journal.
+
+    The journal is the only record that survives a SIGKILLed run and the only
+    place with real tool calls. ``skip_results`` drops the action_result
+    records already covered by the checkpoint transcript (a resumed run)."""
+    import glob
+    out, seen = [], 0
+    try:
+        for jf in sorted(glob.glob(os.path.join(session_dir, 'journal', '*.jsonl'))):
+            with open(jf, encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get('type') != 'action_result':
+                        continue
+                    seen += 1
+                    if seen <= skip_results:
+                        continue
+                    res = ((rec.get('payload') or {}).get('result') or {}).get('result')
+                    if not isinstance(res, dict):
+                        continue
+                    for p in res.get('parts') or []:
+                        if not isinstance(p, dict) or p.get('type') == 'reasoning':
+                            continue
+                        txt = (p.get('text') or '').strip()
+                        if not txt:
+                            for c in (p.get('content') or []):
+                                if isinstance(c, dict) and (c.get('text') or '').strip():
+                                    txt = (c['text'] or '').strip()
+                                    break
+                        if txt:
+                            out.append(txt)
+                        if p.get('type') == 'tool_call':
+                            try:
+                                args = json.loads(p.get('arguments_json') or '{}')
+                            except (ValueError, TypeError):
+                                args = {}
+                            target = (args.get('command') or args.get('path')
+                                      or args.get('file_path') or '')
+                            action = f"→ `{p.get('name') or 'tool'}`"
+                            if target:
+                                action += f' `{str(target)[:80]}`'
+                            out.append(action)
+    except Exception as e:
+        _log.warning('vibe journal transcript failed: %s', e)
+    return out, seen
+
+
+def _vibe_status_line(seg, text=''):
+    """Human status for a Vibe pause report.
+
+    Prefers the CLI's last assistant message; a run stopped on a bare tool call
+    has none, so fall back to the last narration line, then to the last action.
+    """
+    status = (text or '').strip()
+    if status:
+        return status
+    for line in reversed(seg or []):
+        if not line.startswith('→ '):
+            return line
+    for line in reversed(seg or []):
+        if line.startswith('→ '):
+            return f'Last action: {line}'
+    return ''
+
+
+def _pick_vibe_session(vibe_usage, root=None):
+    """The resume handle: newest of the run's session folders.
+
+    A retried run can leave several folders (tenacity re-spawns the CLI); the
+    live conversation is in the most recently bumped one."""
+    ids = [s for s in ((vibe_usage or {}).get('sessions') or []) if s]
+    if not ids:
+        return None
+    if len(ids) == 1:
+        return ids[0]
+
+    def _bumped(sid):
+        try:
+            with open(os.path.join(root or VIBE_SESSION_ROOT, sid, 'meta.json'),
+                      encoding='utf-8') as f:
+                m = json.load(f)
+            return m.get('bumped_at') or m.get('end_time') or m.get('start_time') or ''
+        except Exception:
+            return ''
+    return max(ids, key=_bumped)
+
+
+def _cli_checkpoint(*, kind, session_id, reason, turns, elapsed_s, status_text,
+                    transcript, model_id, seg_in, seg_out):
+    """The LimitReached checkpoint for a CLI route.
+
+    Keeps the tool-loop contract (reason/turns/elapsed_s/status_text/transcript/
+    usage) and adds ``cli_session`` — ``kind`` ('claude' resumes the CLI's own
+    session; 'vibe' replays the task prompt with a continuation block) plus the
+    session id for diagnostics. ``messages`` stays present-but-empty: a CLI
+    checkpoint is never resumed by the tool loop (the executor pins the row's
+    model on resume)."""
+    return {
+        'reason': reason,
+        'turns': max(0, int(turns or 0)),
+        'elapsed_s': max(0, int(elapsed_s or 0)),
+        'status_text': (status_text or '').strip()[:4000],
+        'transcript': [str(t) for t in (transcript or []) if t],
+        'model_id': model_id,
+        'messages': [],
+        'cli_session': {'kind': kind, 'session_id': session_id},
+        'segment_tokens_input': int(seg_in or 0),
+        'segment_tokens_output': int(seg_out or 0),
+    }
+
+
+def _raise_limit(reason, checkpoint, seg_in, seg_out):
+    """Raise LimitReached with this segment's usage attached.
+
+    route()'s choke point meters failed calls from exc.tokens_input/output
+    (agent_router.py route()), so a paused CLI segment is billed like a
+    paused tool-loop segment."""
+    exc = LimitReached(reason, checkpoint)
+    exc.tokens_input = int(seg_in or 0)
+    exc.tokens_output = int(seg_out or 0)
+    raise exc
+
+
+def cleanup_cli_session(kind, session_id):
+    """Delete a run's persisted CLI session when its checkpoint is dropped.
+
+    Claude task runs now persist a session per execution (that is what makes
+    resume possible); it must not accumulate forever. Vibe sessions are left
+    alone — they are the usage telemetry store _vibe_session_usage reads."""
+    if not session_id or kind != 'claude':
+        return
+    try:
+        import glob
+        pat = os.path.join(os.path.expanduser('~'), '.claude', 'projects', '*',
+                           f'{session_id}.jsonl')
+        for p in glob.glob(pat):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    except Exception as e:
+        _log.warning('claude session cleanup failed: %s', e)
 
 
 class ExecutionCancelledError(Exception):
@@ -543,7 +823,8 @@ def _vibe_session_usage(project_path, prompt, t0, t1, root=None):
     return out if out['calls'] else None
 
 
-def _call_vibe_cli(model_id, prompt, max_tokens=4096, *, project_path=None, exec_id=None):
+def _call_vibe_cli(model_id, prompt, max_tokens=4096, *, project_path=None,
+                   exec_id=None, caller=''):
     """Route through the Vibe CLI. Tool support (Read/Edit/Write/Bash) gated by
     .vibe/config.toml. Always bills to the Mistral API key's monthly budget
     (Le Chat Pro subscription).
@@ -644,38 +925,52 @@ def _call_vibe_cli(model_id, prompt, max_tokens=4096, *, project_path=None, exec
         _vibe_extra['MISTRAL_ORG_KEY'] = MISTRAL_ORG_KEY
     env = agent_config.cli_subprocess_env(_vibe_extra)
 
+    # Pause state (item 16 Phase 3): a task run on the Vibe route can pause at
+    # its turn/time limit and be continued later (the prompt is replayed with a
+    # continuation block — Vibe has no headless resume). Other callers (chats,
+    # H3, guide, autopilot) never set the scope and keep the old behaviour:
+    # recovered text + VIBE_TURN_LIMIT_MARKER.
+    _pause = current_pause_scope()
+    _resume = (_pause or {}).get('resume') if _pause else None
+    _cs = (_resume or {}).get('cli_session') or {}
+    _resuming = bool(_resume and _cs.get('kind') == 'vibe')
+
     # Build the guardrail-prefixed prompt BEFORE constructing cmd, so the
     # final prompt is the single source of truth and we send it exactly once.
     deny_patterns = _get_deny_patterns_for_system_prompt(project_path)
+    _deny_prefix = ''
     if deny_patterns:
-        prompt = (
+        _deny_prefix = (
             "IMPORTANT: Do NOT run these commands under any circumstances:\n"
             f"{deny_patterns}\n\n"
             "If you need to run any of these, stop and explain why first.\n\n"
-        ) + prompt
-
-    # Cap the prompt so it fits on the argv. vibe has no --prompt-file flag and
-    # stdin is unusable (see stdin=DEVNULL / EBADF), so an oversized prompt would
-    # raise `OSError [Errno 7] Argument list too long` before vibe runs. Keep the
-    # tail (the newest context / user request) and note the truncation so the
-    # model knows older context was dropped. Measure in BYTES — the OS limit
-    # is a byte limit and project content is often multibyte (Polish diacritics,
-    # CJK), so a char-count cap alone can let a 100k-char prompt through at
-    # >128 KiB encoded. Truncate on a UTF-8 boundary so we never split a
-    # character mid-sequence.
-    prompt_bytes = prompt.encode('utf-8')
-    if len(prompt_bytes) > VIBE_PROMPT_MAX_BYTES:
-        truncated = prompt_bytes[-VIBE_PROMPT_MAX_BYTES:].decode('utf-8', errors='ignore')
-        prompt = (
-            '## Context truncated\n\n'
-            'The full context exceeded the size limit, so only the most recent '
-            'portion is shown below. Earlier context was dropped.\n\n'
-            + truncated
         )
+
+    if _resuming:
+        # The Vibe CLI has no headless resume. `--resume` / `--continue` are
+        # mutually exclusive with `--prompt` (clap rejects the pair) and only
+        # open the interactive TUI; `VIBE_CLI=python` accepts the pair but runs
+        # the classic harness and rotates the session journal (verified live on
+        # 2026-10-29). So a continued block is a FRESH Vibe session that gets
+        # the task prompt again, plus what the previous block already did.
+        _base_prompt = _deny_prefix + prompt
+        _room = max(800, VIBE_PROMPT_MAX_BYTES
+                    - len(_base_prompt.encode('utf-8')) - 500)
+        sent_prompt = _base_prompt + _vibe_continuation_block(_resume, room=_room)
+        sent_prompt, _prompt_truncated = _fit_vibe_prompt(sent_prompt, caller=caller)
+    else:
+        prompt = _deny_prefix + prompt
+        # Cap the prompt so it fits on the argv. vibe has no --prompt-file flag and
+        # stdin is unusable (see stdin=DEVNULL / EBADF), so an oversized prompt would
+        # raise `OSError [Errno 7] Argument list too long` before vibe runs. Chats keep
+        # the tail (newest context); task runs are REFUSED — their instructions are at
+        # the front and must never be truncated (see _fit_vibe_prompt / RP-114-E1).
+        prompt, _prompt_truncated = _fit_vibe_prompt(prompt, caller=caller)
+        sent_prompt = prompt
 
     cmd = [
         'vibe',
-        '--prompt', prompt,
+        '--prompt', sent_prompt,
         '--agent', 'accept-edits',     # MUST pass — programmatic default is 'auto-approve'
         '--auto-approve',              # approve all tool calls without prompting (programmatic mode)
         '--output', 'json',
@@ -696,7 +991,30 @@ def _call_vibe_cli(model_id, prompt, max_tokens=4096, *, project_path=None, exec
         env['VIBE_BYPASS_TOOL_PERMISSIONS'] = 'true'
 
     _t0 = time.time()
-    result = _run_vibe_cli(cmd, env, project_path)
+    try:
+        result = _run_vibe_cli(cmd, env, project_path)
+    except VibeCLITimeout:
+        if not _pause:
+            raise
+        # Time-limit pause: the run was SIGKILLed, so stdout is unusable. The
+        # session journal holds the usage and the conversation written so far.
+        vibe_usage = None
+        try:
+            vibe_usage = _vibe_session_usage(project_path, prompt, _t0, time.time())
+        except Exception as e:
+            _log.warning('Vibe usage lookup failed at the time limit: %s', e)
+        _sid = _pick_vibe_session(vibe_usage)
+        if not _sid:
+            raise   # no resumable session — today's behaviour (fail the run)
+        _seg_in = int((vibe_usage or {}).get('input') or 0)
+        _seg_out = int((vibe_usage or {}).get('output') or 0)
+        _seg, _ = _vibe_journal_transcript(vibe_session_dir(_sid))
+        _raise_limit('time', _cli_checkpoint(
+            kind='vibe', session_id=_sid, reason='time',
+            turns=int((vibe_usage or {}).get('calls') or 0),
+            elapsed_s=time.time() - _t0, status_text=_vibe_status_line(_seg),
+            transcript=_transcript_seed(_resume) + _seg, model_id=model_id,
+            seg_in=_seg_in, seg_out=_seg_out), _seg_in, _seg_out)
     vibe_turn_limit = getattr(result, '_vibe_turn_limit', False)
     try:
         vibe_usage = _vibe_session_usage(project_path, prompt, _t0, time.time())
@@ -708,6 +1026,37 @@ def _call_vibe_cli(model_id, prompt, max_tokens=4096, *, project_path=None, exec
     # with an empty reply and no marker.
     if vibe_usage and vibe_usage['calls'] >= VIBE_MAX_TURNS and not vibe_usage['last_has_text']:
         vibe_turn_limit = True
+
+    def _pause_or_mark(_text):
+        """Turn-limit handling: pause with a checkpoint, or append the marker.
+
+        Pausing needs the executor's scope (task runs only) and a session id
+        that identifies the journal to read back; without either, the old
+        marker behaviour is kept."""
+        _sid = _pick_vibe_session(vibe_usage)
+        if vibe_turn_limit and _pause and _sid:
+            _seg_in = int((vibe_usage or {}).get('input') or 0)
+            _seg_out = int((vibe_usage or {}).get('output') or 0)
+            _seg, _ = _vibe_journal_transcript(vibe_session_dir(_sid))
+            _raise_limit('turns', _cli_checkpoint(
+                kind='vibe', session_id=_sid, reason='turns',
+                turns=int((vibe_usage or {}).get('calls') or 0),
+                elapsed_s=time.time() - _t0, status_text=_vibe_status_line(_seg, _text),
+                transcript=_transcript_seed(_resume) + _seg, model_id=model_id,
+                seg_in=_seg_in, seg_out=_seg_out), _seg_in, _seg_out)
+        if vibe_turn_limit:
+            _text = ((_text or '').rstrip()
+                     or '_(The model left no final text: its last action was a tool call.)_')
+            _text += (
+                f"\n\n---\n⚠️ **{VIBE_TURN_LIMIT_MARKER} ({VIBE_MAX_TURNS} turns) before "
+                "the model produced a final answer.** The text above is the last "
+                "assistant message; files it wrote may be incomplete. The task is "
+                "likely too large for one run (split it into smaller tasks) or "
+                "needs tools the Vibe CLI doesn't provide (e.g. Proton MCP email "
+                "tools, external web research)."
+            )
+        return _text
+
     try:
         data = json.loads(result.stdout)
         # Vibe returns an array of messages; use the last assistant message that
@@ -730,41 +1079,33 @@ def _call_vibe_cli(model_id, prompt, max_tokens=4096, *, project_path=None, exec
         else:
             text = result.stdout.strip()
 
-        # When Vibe hit its turn limit, the exit was non-zero but we recovered
-        # the partial conversation above. Append a clear marker so the caller
-        # (and the user, via the output file) knows the run was incomplete —
-        # the model kept acting but never produced a final answer.
-        if vibe_turn_limit:
-            text = (text or '').rstrip() or '_(The model left no final text: its last action was a tool call.)_'
-            text += (
-                f"\n\n---\n⚠️ **{VIBE_TURN_LIMIT_MARKER} ({VIBE_MAX_TURNS} turns) before "
-                "the model produced a final answer.** The text above is the last "
-                "assistant message; files it wrote may be incomplete. The task is "
-                "likely too large for one run (split it into smaller tasks) or "
-                "needs tools the Vibe CLI doesn't provide (e.g. Proton MCP email "
-                "tools, external web research)."
-            )
+        # Phase 3: a paused run raises instead of finishing; otherwise the
+        # partial conversation gets the marker (user-visible via the output file).
+        text = _pause_or_mark(text)
 
         # Tokens come from this call's own session journal (see
         # _vibe_session_usage); cost from Cordée's PRICING, never Vibe's own
         # estimate — Vibe models bill to the subscription and are priced at 0.
         # Heuristic fallback (1 token ≈ 4 chars) only when the session can't be
-        # identified, logged so the drift is visible.
+        # identified, logged so the drift is visible. A continued block opens a
+        # fresh session, so its totals never include the earlier parts.
         if vibe_usage:
-            tok_in, tok_out = vibe_usage['input'], vibe_usage['output']
+            tok_in = int(vibe_usage['input'])
+            tok_out = int(vibe_usage['output'])
         else:
-            tok_in = max(1, len(prompt) // 4)
+            tok_in = max(1, len(sent_prompt) // 4)
             tok_out = max(1, len(result.stdout) // 4)
             _log.warning('Vibe CLI: session not identified; heuristic tokens (in=%d, out=%d)',
                          tok_in, tok_out)
         cost = _pricing_cost(model_id, tok_in, tok_out)
     except (json.JSONDecodeError, ValueError) as e:
         _log.warning(f'Failed to parse Vibe CLI output: {e}')
-        text = result.stdout.strip()
+        text = _pause_or_mark(result.stdout.strip())
         if vibe_usage:
-            tok_in, tok_out = vibe_usage['input'], vibe_usage['output']
+            tok_in = int(vibe_usage['input'])
+            tok_out = int(vibe_usage['output'])
         else:
-            tok_in  = max(1, len(prompt) // 4)
+            tok_in  = max(1, len(sent_prompt) // 4)
             tok_out = max(1, len(text) // 4)
         cost = _pricing_cost(model_id, tok_in, tok_out)
     return text, tok_in, tok_out, cost
@@ -822,13 +1163,35 @@ def _call_claude_cli(model_id, prompt, max_tokens=4096, *, project_path=None, au
     else:
         raise ValueError(f'auth_mode must be "pro" or "api", got {auth_mode!r}')
 
+    # Pause state (item 16 Phase 3): a pausable task run persists a session we
+    # pin ourselves (`--session-id`), so the id survives even a SIGKILL at the
+    # time limit. Chats/H3/guide/autopilot keep session persistence OFF — no
+    # transcript accumulation outside task runs, no resumable artifacts.
+    _pause = current_pause_scope()
+    _resume = (_pause or {}).get('resume') if _pause else None
+    _cs = (_resume or {}).get('cli_session') or {}
+    _resuming = bool(_cs.get('kind') == 'claude' and _cs.get('session_id'))
+    _session_id = _cs.get('session_id') if _resuming else None
+    if _pause and not _session_id:
+        import uuid
+        _session_id = str(uuid.uuid4())
+    _prior = _transcript_seed(_resume) if _resuming else []
+    _sent_prompt = continue_message(_resume.get('note')) if _resuming else prompt
+    _t0 = time.time()
+
     cmd = [
         'claude', '--print',
         "--model", model_id,
         '--output-format', 'json',
-        '--no-session-persistence',
         '--permission-mode', 'acceptEdits',
     ]
+    if _resuming:
+        cmd += ['--resume', _session_id]
+    elif _pause:
+        # Task run that may pause: keep the session on disk and cap the turns.
+        cmd += ['--session-id', _session_id, '--max-turns', str(CLAUDE_MAX_TURNS)]
+    else:
+        cmd.append('--no-session-persistence')
     if current_guide_scope():
         # Guide mode: plan mode is read-only (no edits, no shell side effects).
         cmd[cmd.index('acceptEdits')] = 'plan'
@@ -845,20 +1208,62 @@ def _call_claude_cli(model_id, prompt, max_tokens=4096, *, project_path=None, au
         except Exception:
             pass
     try:
-        stdout, stderr = proc.communicate(input=prompt, timeout=900)
+        stdout, stderr = proc.communicate(input=_sent_prompt,
+                                          timeout=CLAUDE_CLI_TIMEOUT_SECS)
     except subprocess.TimeoutExpired:
         _kill_process_group(proc)
-        stdout, stderr = proc.communicate()
-        raise
+        try:
+            proc.communicate()
+        except Exception:
+            pass
+        if not _pause:
+            raise
+        # Time-limit pause: the session id is ours (pinned above), so the run
+        # resumes from it. The killed segment's tokens never reached the
+        # envelope — recorded as 0 rather than invented.
+        _raise_limit('time', _cli_checkpoint(
+            kind='claude', session_id=_session_id, reason='time',
+            turns=0, elapsed_s=time.time() - _t0, status_text='',
+            transcript=list(_prior), model_id=model_id, seg_in=0, seg_out=0), 0, 0)
     import subprocess as _sp
     result = _sp.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+    def _pause_on_max_turns(data):
+        """Turn-limit pause: `--max-turns` early-exits with subtype
+        error_max_turns (and a non-zero exit code), which is not a failure.
+        The `result` text is the partial narration the user and H3 can use."""
+        _usage = data.get('usage') or {}
+        _seg_in = int(_usage.get('input_tokens') or 0)
+        _seg_out = int(_usage.get('output_tokens') or 0)
+        _partial = (data.get('result') or '').strip()
+        _raise_limit('turns', _cli_checkpoint(
+            kind='claude', session_id=_session_id, reason='turns',
+            turns=int(data.get('num_turns') or 0) or CLAUDE_MAX_TURNS,
+            elapsed_s=time.time() - _t0, status_text=_partial,
+            transcript=list(_prior) + ([_partial] if _partial else []),
+            model_id=model_id, seg_in=_seg_in, seg_out=_seg_out),
+            _seg_in, _seg_out)
+
     if result.returncode != 0:
+        # The envelope is still on stdout: a turn-limit stop must pause, not
+        # fail, so inspect it before the generic error path.
+        _env = _load_result_envelope(result.stdout)
+        if _pause and _env and (
+                (_env.get('subtype') or '') == 'error_max_turns'
+                or 'Reached max turns' in str(_env.get('result') or '')):
+            _pause_on_max_turns(_env)
         err = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(f'claude CLI error (exit {result.returncode}): {err}')
     try:
         data = _load_result_envelope(result.stdout)
         if not data:
             raise RuntimeError(f'claude CLI returned malformed JSON: {result.stdout.strip() or "empty output"}')
+        # Phase 3: same pause when the CLI exits 0 but flags the turn limit.
+        _max_turns_hit = (
+            (data.get('subtype') or '') == 'error_max_turns'
+            or 'Reached max turns' in str(data.get('result') or ''))
+        if _max_turns_hit and _pause:
+            _pause_on_max_turns(data)
         if data.get('is_error'):
             raise RuntimeError(f'claude CLI returned error: {data.get("result", "unknown error")}')
         denials = data.get('permission_denials') or []
@@ -1193,7 +1598,8 @@ def _call_mistral_ocr(model_id, prompt, max_tokens=4096, *, project_path=None, e
 
 
 def call_mistral(model_id, prompt, max_tokens=4096, *, project_path=None,
-                 force_mistral_mode=None, web_search=False, exec_id=None, **_):
+                 force_mistral_mode=None, web_search=False, exec_id=None,
+                 caller=None, **_):
     """Route Mistral models. Two modes:
     - 'vibe' (CLI path): full tool support, bills to Le Chat Pro subscription
     - 'api'  (SDK path): text-only fallback, bills to API credits
@@ -1228,7 +1634,8 @@ def call_mistral(model_id, prompt, max_tokens=4096, *, project_path=None,
             effective_mode = 'api'
         else:
             return _call_vibe_cli(model_id, prompt, max_tokens,
-                                  project_path=project_path, exec_id=exec_id)
+                                  project_path=project_path, exec_id=exec_id,
+                                  caller=caller or '')
 
     if effective_mode == 'api':
         # API mode (text-only fallback). Bills to the Pro subscription's
@@ -2146,7 +2553,9 @@ def route(model_id, prompt, max_tokens=4096, *, project_path=None,
     `force_anthropic_mode` is forwarded too; only `call_anthropic` honors it,
     `force_mistral_mode` is forwarded to `call_mistral`, other providers accept
     and ignore via **_. `caller` is a free-text label recorded in the EU egress
-    audit log. `policy_path` resolves the EU-only policy when the caller
+    audit log and forwarded to providers that need it — `call_mistral` uses it to
+    refuse tail-truncating an oversized task-run prompt (`run_task:<id>`) instead
+    of silently dropping the task description. `policy_path` resolves the EU-only policy when the caller
     deliberately passes `project_path=None` to disable tools (the large-file
     batch path) — the data still belongs to that project.
     `web_search` is forwarded to `call_mistral` only; the Conversations API
@@ -2209,7 +2618,7 @@ def route(model_id, prompt, max_tokens=4096, *, project_path=None,
         result = fn(model_id, prompt, max_tokens, project_path=project_path,
                     exec_id=exec_id,
                     force_anthropic_mode=force_anthropic_mode, force_mistral_mode=force_mistral_mode,
-                    web_search=web_search)
+                    web_search=web_search, caller=caller)
     except Exception as exc:
         # The choke point meters failed calls too — a provider call that
         # raised was still made and paid for (regression: a Scaleway run

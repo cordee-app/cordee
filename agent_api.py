@@ -22,6 +22,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _RESERVED = object()
 _running_slots: dict = {}
 _running_slots_lock = threading.Lock()
+# Kanban column labels (slot 1-5) — match the Kanban column headers in the
+# frontend (providers.ts) and agent_overseer's local map, so refusal messages
+# name the column the way the user sees it.
+SLOT_LABELS = {1: 'Claude Pro', 2: 'Mistral Pro', 3: 'PAYG', 4: 'EU Scaleway', 5: 'Ollama Cloud'}
 _chat_execution_lock = threading.Lock()
 _active_chat_execution = None
 
@@ -2037,7 +2041,7 @@ def run_all_claude(pid):
 
     ok, msg = _kick_run_seq(SLOT, [t['id'] for t in ordered])
     if not ok:
-        return jsonify({'error': msg, 'queued_for_later': len(ordered)}), 409
+        return jsonify({'error': _redact_busy_message(msg, SLOT), 'queued_for_later': len(ordered)}), 409
     return jsonify({
         'ok': True, 'slot': SLOT, 'queued': len(ordered),
         'skipped_by_deps': skipped_by_deps,
@@ -2101,7 +2105,7 @@ def run_all_mistral(pid):
 
     ok, msg = _kick_run_seq(SLOT, [t['id'] for t in ordered])
     if not ok:
-        return jsonify({'error': msg, 'queued_for_later': len(ordered)}), 409
+        return jsonify({'error': _redact_busy_message(msg, SLOT), 'queued_for_later': len(ordered)}), 409
     return jsonify({
         'ok': True, 'slot': SLOT, 'queued': len(ordered),
         'skipped_by_deps': skipped_by_deps,
@@ -2164,7 +2168,7 @@ def run_all_scaleway(pid):
 
     ok, msg = _kick_run_seq(SLOT, [t['id'] for t in ordered])
     if not ok:
-        return jsonify({'error': msg, 'queued_for_later': len(ordered)}), 409
+        return jsonify({'error': _redact_busy_message(msg, SLOT), 'queued_for_later': len(ordered)}), 409
     return jsonify({
         'ok': True, 'slot': SLOT, 'queued': len(ordered),
         'skipped_by_deps': skipped_by_deps,
@@ -3518,6 +3522,12 @@ def resolve_task_gate(tid):
         # Append the clarification block to the description. If one was already
         # appended by a prior answer, replace it (idempotency) rather than stack
         # duplicate blocks.
+        # NOTE: agent_overseer._USER_CLARIFICATIONS_MARKER splits reviewer
+        # prompts on this EXACT string (_description_for_review) — the two
+        # definitions must change together or neither; drift would silently
+        # re-create the RP-112 review loop (task 10001279: reviewers re-asked
+        # questions the user had already answered because the answers block
+        # sat past their description caps).
         marker = '**User clarifications (Guide pre-run check):**'
         current = (task.get('description') or '').rstrip()
         idx = current.find('\n\n' + marker)
@@ -4144,6 +4154,25 @@ _TASK_CLIENT_FIELDS = frozenset({
     'corpus_id', 'requires_rag', 'context_refs', 'execution_type',
 })
 
+# Fields a client may still PATCH while the Guide's pre-run review (H2a) holds
+# the task. The review is resolved through POST /api/tasks/<tid>/gate, so the
+# only thing the card legitimately writes during the window is the slot change
+# (confirm / un-confirm). Everything else is task content and is refused.
+_TASK_REVIEW_PATCH_ALLOWED = frozenset({'work_session_slot'})
+
+
+def _task_in_review(task):
+    """True while an H2a pre-run review holds the task.
+
+    The UI fades the card and disables Run, but that block is cosmetic — the
+    direct PATCH / execute endpoints must refuse too, mirroring the scheduler
+    skip in _run_seq(). The review itself is finished via the /gate endpoint.
+    """
+    if not task:
+        return False
+    return task.get('gate_state') == 'hold' and task.get('gate_source') == 'H2a'
+
+
 # Per-task processing types. Empty/None = a normal run.
 _TASK_EXECUTION_TYPES = ('research', 'deployment')
 
@@ -4168,6 +4197,12 @@ def update_task(tid):
     task = db.get_task(tid)
     if not task:
         return jsonify({'error': 'Task not found'}), 404
+    # Server-side H2a guard: while the Guide is reviewing the task the UI only
+    # fades the card, so a direct API caller could still edit content mid-review
+    # and invalidate the report it is about to produce. Only the slot change
+    # (confirm / un-confirm) stays writable; the /gate endpoint is unaffected.
+    if _task_in_review(task) and (set(data) - _TASK_REVIEW_PATCH_ALLOWED):
+        return jsonify({'error': 'Task is under review; wait for the review to finish.'}), 409
     if 'execution_type' in data:
         try:
             data['execution_type'] = _norm_task_execution_type(data['execution_type'])
@@ -4295,6 +4330,12 @@ def update_task(tid):
                                        gate_state='hold',
                                        gate_source='H2a',
                                        gate_reason='Guide is reviewing this task…',
+                                       # Null the previous round's report: the UI
+                                       # shows "reviewing…" only while the hold has
+                                       # no report (h2aReviewing), so a stale one
+                                       # would suppress the indicator. Mirrors the
+                                       # optimistic local patch in TaskCard.tsx.
+                                       gate_report_h2_json=None,
                                        gate_decided_at=datetime.utcnow().isoformat())
                         threading.Thread(
                             target=_run_h2a_precheck_async,
@@ -4994,6 +5035,10 @@ def execute():
     task_id = data.get('task_id')
     if not task_id:
         return jsonify({'error': 'task_id is required'}), 400
+    # Server-side H2a guard: the scheduler already skips tasks held for the
+    # Guide's pre-run review; the direct endpoint must not be a bypass.
+    if _task_in_review(db.get_task(task_id)):
+        return jsonify({'error': 'Task is under review; wait for the review to finish.'}), 409
     result = run_task(task_id)
     # Spend is recorded centrally in route(); here we only surface the current
     # budget snapshot so the UI can show it.
@@ -8298,6 +8343,66 @@ def _preflight_model_allowed(task_ids):
     return None
 
 
+def _resolve_busy_holder(tid):
+    """Resolve the task currently holding a column into (detail, task).
+    detail looks like 'RP-114 (Example Client)'. db.get_task returns None on a
+    registry miss / missing project.db; pre-backfill rows may have a NULL
+    display_code — render those as '#<id>'. Never raises."""
+    if not tid:
+        return None, None
+    try:
+        t = db.get_task(int(tid))
+    except Exception:
+        return None, None
+    if not t:
+        return None, None
+    code = t.get('display_code') or f"#{t.get('id')}"
+    proj = (t.get('project_name') or '').strip()
+    detail = f'{code} ({proj})' if proj else code
+    return detail, t
+
+
+def _slot_busy_message(slot, holder_tid):
+    """Detailed column-busy refusal message naming the holder, e.g.
+    'Column 4 (EU Scaleway) is already running RP-114 (Example Client)'.
+    Falls back to the plain form when the holder can't be resolved.
+    db.get_task already enriches project_name from the central projects
+    table (agent_db._enrich_task), so no second get_project() read."""
+    col = f'Column {slot} ({SLOT_LABELS[slot]})' if slot in SLOT_LABELS else f'Column {slot}'
+    detail, _t = _resolve_busy_holder(holder_tid)
+    if detail:
+        return f'{col} is already running {detail}'
+    return f'{col} is already running'
+
+
+def _redact_busy_message(msg, slot):
+    """HTTP-boundary anti-enumeration: a requester who cannot see the
+    holder's project must not learn another tenant's task/project from a
+    409 body (the anti-enumeration discipline run_column applies to ids).
+    Pass-through unless msg is a column-busy refusal — quota / model
+    pre-flight errors return through the same (ok=False) path and must not
+    be rewritten. Outside a request (autochain, scheduler) callers don't
+    invoke this at all, so logs keep the full detail."""
+    if not isinstance(msg, str) or 'is already running' not in msg:
+        return msg
+    try:
+        if not auth_enabled():
+            return msg
+        user = g.get('current_user')
+        with _running_slots_lock:
+            entry = _running_slots.get(slot) or {}
+            tid = entry.get('current')
+            if not tid:
+                tid = (entry.get('task_ids') or [None])[0]
+        detail, t = _resolve_busy_holder(tid)
+        if detail and t and user and has_project_access(user, t.get('project_id'), 'member'):
+            return msg
+        col = f'Column {slot} ({SLOT_LABELS[slot]})' if slot in SLOT_LABELS else f'Column {slot}'
+        return f'{col} is already running a task from another project'
+    except Exception:
+        return msg
+
+
 def _kick_run_seq(slot, task_ids):
     """Start a background run thread for `slot` over the supplied task_ids.
     Returns (ok, message). Safe to call from any thread — does not need a
@@ -8314,17 +8419,25 @@ def _kick_run_seq(slot, task_ids):
     _merr = _preflight_model_allowed(task_ids)
     if _merr is not None:
         return False, str(_merr)
+    busy_holder_tid = None
     with _running_slots_lock:
         entry = _running_slots.get(slot)
         if entry:
             t = entry.get('thread')
             if t is _RESERVED or (t is not None and t.is_alive()):
-                return False, f'Column {slot} is already running'
-            # Stale entry: the previous thread died without clearing the flag.
-            _running_slots.pop(slot, None)
-        if not task_ids:
-            return True, 'No tasks to run'
-        _running_slots[slot] = {'thread': _RESERVED, 'started': time.time()}
+                # Name the live task so the refusal says who holds the column.
+                busy_holder_tid = entry.get('current') or ((entry.get('task_ids') or [None])[0])
+            else:
+                # Stale entry: the previous thread died without clearing the flag.
+                _running_slots.pop(slot, None)
+        if busy_holder_tid is None:
+            if not task_ids:
+                return True, 'No tasks to run'
+            _running_slots[slot] = {'thread': _RESERVED, 'started': time.time(),
+                                    'task_ids': list(task_ids),
+                                    'current': task_ids[0] if task_ids else None}
+    if busy_holder_tid is not None:
+        return False, _slot_busy_message(slot, busy_holder_tid)
     # Emit work_session_changed for all subscribers
     agent_events.emit_global_safe({'type': 'work_session_changed', 'slot': slot, 'status': 'started'})
 
@@ -8365,6 +8478,10 @@ def _kick_run_seq(slot, task_ids):
 
                 if previous_result:
                     generate_queue_handoff(previous_result, tid)
+                with _running_slots_lock:
+                    _entry = _running_slots.get(slot)
+                    if _entry:
+                        _entry['current'] = tid
                 result = run_task(tid)
                 if not isinstance(result, dict):
                     continue
@@ -8429,7 +8546,9 @@ def _kick_run_seq(slot, task_ids):
 
     t = threading.Thread(target=_run_seq, daemon=True, name=f'slot-{slot}-run')
     with _running_slots_lock:
-        _running_slots[slot] = {'thread': t, 'started': time.time()}
+        _running_slots[slot] = {'thread': t, 'started': time.time(),
+                                'task_ids': list(task_ids),
+                                'current': task_ids[0] if task_ids else None}
     t.start()
     return True, None
 
@@ -8443,7 +8562,7 @@ def _run_task_ids(slot, task_ids):
     skipped_by_deps = _preflight_dep_skips(task_ids)
     ok, msg = _kick_run_seq(slot, task_ids)
     if not ok:
-        return jsonify({'error': msg}), 409
+        return jsonify({'error': _redact_busy_message(msg, slot)}), 409
     if msg == 'No tasks to run':
         return jsonify({'ok': True, 'slot': slot, 'queued': 0, 'message': msg})
     return jsonify({'ok': True, 'slot': slot, 'queued': len(task_ids),

@@ -48,6 +48,55 @@ _OUTPUT_SNIPPET_CHARS = _OUTPUT_HEAD_CHARS + _OUTPUT_TAIL_CHARS
 _H3_DESC_CHARS = 4000
 _OVERVIEW_MAX_CHARS = 8000  # ~2k words
 
+# The /gate 'answer' flow (agent_api.resolve_task_gate) appends the user's
+# clarifications to the END of the description, under this marker (kept in
+# sync with agent_api.py — do not import it, that would be circular).
+_USER_CLARIFICATIONS_MARKER = '**User clarifications (Guide pre-run check):**'
+# Safety valve: answers are normally 1-3 short lines, but a pasted answer
+# must not blow the reviewer prompt.
+_USER_CLARIFICATIONS_MAX_CHARS = 2000
+
+
+def _description_for_review(desc, body_cap):
+    """Description text for a reviewer prompt: cap the body, NEVER the answers.
+
+    A plain ``desc[:cap]`` cuts off the trailing 'User clarifications' block on
+    long descriptions, so the reviewer re-asks questions the user already
+    answered (regression: task 10001279 / RP-112 — 2,874-char description,
+    answers at offset 2,698, both H2 and H2a capped at 2,500 → the Guide
+    re-asked answered questions every round while hold guards made the task
+    unstartable). Cap only what precedes the marker; always append the full
+    answers block.
+    """
+    desc = (desc or '').strip()
+    if not desc:
+        return desc
+    idx = desc.find(_USER_CLARIFICATIONS_MARKER)
+    if idx < 0:
+        # No answers block: plain head-cap, byte for byte as before.
+        if len(desc) > body_cap:
+            return desc[:body_cap] + '…[truncated]'
+        return desc
+    body = desc[:idx].rstrip()
+    answers = desc[idx:]
+    if len(body) > body_cap:
+        body = body[:body_cap] + '…[truncated]'
+    if len(answers) > _USER_CLARIFICATIONS_MAX_CHARS:
+        answers = answers[:_USER_CLARIFICATIONS_MAX_CHARS] + '\n…[answers truncated]'
+    if not body:
+        return answers.strip()
+    return (body + '\n\n' + answers).strip()
+
+# `git --stat` output: the summary line ("2 files changed, 51 insertions(+),
+# 1020 deletions(-)") and the per-file lines (" path | 1069 +----…").
+_DIFFSTAT_FILES_RE = re.compile(r'(\d+)\s+files?\s+changed', re.I)
+_DIFFSTAT_INS_RE = re.compile(r'(\d+)\s+insertions?\(\+\)', re.I)
+_DIFFSTAT_DEL_RE = re.compile(r'(\d+)\s+deletions?\(-\)', re.I)
+# A 200-file run's diffstat is ~12k chars; H3's input budget is small. The
+# deterministic backstop reads the full string, so a truncated *prompt* display
+# never weakens the safety net.
+_DIFFSTAT_PROMPT_CHARS = 6000
+
 
 def _budget_keys(model: str, caller: str) -> List[str]:
     """kv keys remembering the smallest max_tokens that worked, most specific first."""
@@ -892,9 +941,9 @@ def pre_run_check(task: Dict[str, Any],
         if lines:
             dep_outcomes_block = 'Dependency outcomes:\n' + '\n'.join(lines) + '\n'
 
-    desc = (task.get('description') or '').strip()
-    if len(desc) > 2500:
-        desc = desc[:2500] + '…[truncated]'
+    # Cap the body but never the trailing 'User clarifications' block — see
+    # _description_for_review (regression: task 10001279 / RP-112).
+    desc = _description_for_review(task.get('description'), 2500)
 
     prompt = (
         f"You are the Guide (project overseer) for the project \"{project.get('name','')}\". "
@@ -980,6 +1029,10 @@ def pre_run_check(task: Dict[str, Any],
     prompt += f"Description:\n{desc}\n\n"
     prompt += (
         "Rules for `gate`:\n"
+        "- If the Description ends with a 'User clarifications (Guide pre-run check):' "
+        "block, those are the user's final answers to earlier review questions — the "
+        "user has ALREADY answered them. Treat them as decided requirements when judging "
+        "completeness and the gate; do NOT flag them as unresolved ambiguity.\n"
         "- run: every referenced file is inlined, OR the route is agentic and the file is inside the project (self-serve); no blocking binary mismatches. A folder listed above as existing inside the project is reachable by an agentic model and is never a reason to hold.\n"
         + ("- run (OCR route): the model capabilities include `ocr`, so the referenced PDF/PNG/JPEG files are "
            "read by the OCR route itself — they need not be inlined and are not binary mismatches. Hold or "
@@ -1189,9 +1242,9 @@ def pre_check_questions(task: Dict[str, Any],
     if not aingel_model:
         return {'questions': [], 'gate_state': 'open', 'reason': 'no aingel_model configured'}
 
-    desc = (task.get('description') or '').strip()
-    if len(desc) > 2500:
-        desc = desc[:2500] + '…[truncated]'
+    # Cap the body but never the trailing 'User clarifications' block — see
+    # _description_for_review (regression: task 10001279 / RP-112).
+    desc = _description_for_review(task.get('description'), 2500)
 
     # File names + sizes only — never extract content here.
     # Relevance-first ordering: files whose name (or a distinctive token of it)
@@ -1241,6 +1294,10 @@ def pre_check_questions(task: Dict[str, Any],
         f"{root_block}"
         f"Description:\n{desc}\n\n"
         f"Rules:\n"
+        f"- If the Description ends with a 'User clarifications (Guide pre-run check):' "
+        f"block, those are questions the user has ALREADY answered — their answers are "
+        f"final decisions. Do NOT re-ask anything already answered there; only ask about "
+        f"genuinely new, different ambiguities.\n"
         f"- The file list above is authoritative: it contains up to {len(file_list)} paths, "
         f"with files whose names most closely relate to the task description listed FIRST. "
         f"A file matching the description appears near the top if it exists. "
@@ -1331,8 +1388,16 @@ def post_run_analysis(task: Dict[str, Any],
                       self_serve_files: Optional[List[Dict[str, Any]]] = None,
                       route_agentic: bool = False,
                       rag_label: Optional[str] = None,
-                      rag_provenance: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                      rag_provenance: Optional[Dict[str, Any]] = None,
+                      git_diffstat: str = '') -> Dict[str, Any]:
     """Structured post-run analysis. Replaces the 2-sentence Haiku brief.
+
+    ``git_diffstat`` is the run's ``git --stat`` summary (already stored on the
+    execution row by the executor). It is the only reliable evidence of how
+    much of an existing file a run removed: on exec 20001366 the model's own
+    summary said it "appended" draft answers while the diffstat showed 1,020
+    deletions against 51 insertions — a 1,040-line document replaced by 70
+    lines. H3 read only the summary and approved the "append".
 
     Returns a dict with keys:
         severity        — 'ok' | 'warning' | 'issue'
@@ -1353,9 +1418,10 @@ def post_run_analysis(task: Dict[str, Any],
         blocked_hits = [f'{blocked_tool_count} tool call(s) blocked by permission system']
 
     snippet = _output_snippet(output_text)
-    description = ((task or {}).get('description') or '').strip()
-    if len(description) > _H3_DESC_CHARS:
-        description = description[:_H3_DESC_CHARS] + '\n…[truncated]'
+    # Cap the body but never the trailing 'User clarifications' block — see
+    # _description_for_review (regression: task 10001279 / RP-112).
+    description = _description_for_review((task or {}).get('description'),
+                                          _H3_DESC_CHARS)
 
     finish = execution.get('finish_reason') or execution.get('status') or ''
     status = execution.get('status') or ''
@@ -1444,6 +1510,28 @@ def post_run_analysis(task: Dict[str, Any],
         completion_block = ('Completion check (by code — treat as facts):\n'
                             + ''.join(f'  - {f}\n' for f in completion_findings) + '\n')
 
+    # Git diffstat (see docstring). Two uses: show the Guide the run's real
+    # churn so an overwrite cannot hide behind the model's own summary, and a
+    # code-level backstop for catastrophic cases that fires even when the
+    # Guide's reply is unusable (mirrors the completion findings).
+    overwrite_findings = _diffstat_overwrite_findings(git_diffstat, description)
+    diffstat_block = ''
+    diffstat_rule = ''
+    if (git_diffstat or '').strip():
+        shown = git_diffstat.strip()
+        if len(shown) > _DIFFSTAT_PROMPT_CHARS:
+            half = _DIFFSTAT_PROMPT_CHARS // 2
+            shown = (shown[:half] + '\n…[diffstat truncated]…\n' + shown[-half:])
+        diffstat_block = (f"Git changes this run (diffstat):\n```\n"
+                          f"{shown}\n```\n\n")
+        diffstat_rule = (
+            "- If the diffstat above shows an existing tracked file losing substantially more "
+            "lines than it gains (deletions ≫ insertions — the change bar is mostly '-', or the "
+            "file loses more than 30% of its lines) and the task DESCRIPTION does not name that "
+            "file as the intended target, treat it as a destructive overwrite: severity=issue, add "
+            "a finding naming the file and the counts, recommendation=discuss or reject, and note "
+            "the file can be restored from git history.\n")
+
     prompt = (
         f"You are the Guide (project overseer) for the project \"{project.get('name','')}\". "
         f"A task just finished. In ONE response, return JSON ONLY (no prose) with this schema:\n"
@@ -1462,6 +1550,7 @@ def post_run_analysis(task: Dict[str, Any],
         f"{completion_block}"
         f"{file_check_block}"
         f"{rag_block}"
+        f"{diffstat_block}"
         f"Output (head and tail, {len(output_text or '')} chars in total):\n```\n{snippet}\n```\n\n"
         "Rules:\n"
         "- Judge the output against the task DESCRIPTION, not the title. Read the END of the "
@@ -1472,6 +1561,7 @@ def post_run_analysis(task: Dict[str, Any],
         "- recommendation=discuss when severity != ok.\n"
         "- gate_for_next=hold when severity=warning or issue (next task may depend on this one being clean).\n"
         "- gate_for_next=skip when severity=issue and the next task is clearly unreachable.\n"
+        f"{diffstat_rule}"
         "- unread_files: copy the UNVERIFIED list above if non-empty; else []. It is informational: "
         "on its own it NEVER raises severity above ok and must not go into findings. Raise severity "
         "only if the output ignores, contradicts or fabricates that file's content.\n"
@@ -1485,15 +1575,19 @@ def post_run_analysis(task: Dict[str, Any],
     text, degraded = _ask(aingel_model, prompt, 900, project_path, 'autopilot:H3')
     if degraded:
         _log.warning('[overseer H3] exec %s: %s', execution.get('id'), degraded)
-        return _apply_completion_findings(_permissive_h3(degraded), completion_findings,
-                                          bool(missing_deliverables))
+        return _apply_overwrite_findings(
+            _apply_completion_findings(_permissive_h3(degraded), completion_findings,
+                                       bool(missing_deliverables)),
+            overwrite_findings)
 
     parsed = _safe_json(text)
     if not parsed:
         _log.warning('[overseer H3] exec %s: could not parse JSON: %s',
                      execution.get('id'), (text or '')[:200])
-        return _apply_completion_findings(_permissive_h3('reply was not parseable JSON'),
-                                          completion_findings, bool(missing_deliverables))
+        return _apply_overwrite_findings(
+            _apply_completion_findings(_permissive_h3('reply was not parseable JSON'),
+                                       completion_findings, bool(missing_deliverables)),
+            overwrite_findings)
     parsed.setdefault('severity', 'ok')
     parsed.setdefault('findings', [])
     parsed.setdefault('recommendation', 'approve')
@@ -1563,9 +1657,11 @@ def post_run_analysis(task: Dict[str, Any],
                 parsed['severity'] = 'ok'
                 parsed['recommendation'] = 'approve'
                 parsed['gate_for_next'] = 'proceed'
-    return _apply_completion_findings(parsed, completion_findings,
-                                      bool(missing_deliverables),
-                                      all_delivered=all_delivered)
+    return _apply_overwrite_findings(
+        _apply_completion_findings(parsed, completion_findings,
+                                   bool(missing_deliverables),
+                                   all_delivered=all_delivered),
+        overwrite_findings)
 
 
 _FILES_CREATED_HEADING = '## Files created in this run'
@@ -1777,6 +1873,97 @@ def _apply_completion_findings(parsed: Dict[str, Any], findings: List[str],
     return parsed
 
 
+def _diffstat_overwrite_findings(git_diffstat: str,
+                                 description: str = '') -> List[str]:
+    """Code-detected destructive overwrite from the run's ``git --stat``.
+
+    Regression: exec 20001366 (task 10001281) replaced a 1,040-line document
+    with 70 lines. The model's summary said it had appended draft answers, and
+    H3 — which never saw the diffstat — reported an append and asked whether
+    the appended text was worth keeping. The stored diffstat said it plainly:
+    ``2 files changed, 51 insertions(+), 1020 deletions(-)``.
+
+    Deliberately conservative: additions-heavy runs (a run that writes a new
+    large deliverable) and ordinary edits must never trip it. The gate is high
+    — at least 500 deleted lines AND deletions more than double insertions —
+    so a large file the task was legitimately asked to rewrite is the only
+    plausible false positive, and a ``discuss`` recommendation is a cheap
+    price for catching a destroyed deliverable.
+
+    ``description`` is accepted for signature symmetry with the prompt rule
+    (which exempts a file the task names as its target). It does not suppress
+    the finding on purpose: a description also names files to *append to*,
+    which is exactly the E1 case. Unused beyond documentation.
+    """
+    text = git_diffstat or ''
+    if not text.strip():
+        return []
+    files_m = _DIFFSTAT_FILES_RE.search(text)
+    del_m = _DIFFSTAT_DEL_RE.search(text)
+    if not files_m or not del_m:
+        return []
+    ins_m = _DIFFSTAT_INS_RE.search(text)
+    insertions = int(ins_m.group(1)) if ins_m else 0
+    deletions = int(del_m.group(1))
+    if not (deletions >= 500 and deletions > 2 * insertions):
+        return []
+
+    victims: List[str] = []
+    for line in text.splitlines():
+        if '|' not in line:
+            continue
+        _path, _bar = line.split('|', 1)
+        if 'Bin' in _bar:
+            continue  # "Bin 0 -> 1234 bytes" — the arrow is not a change bar
+        n_plus = _bar.count('+')
+        n_minus = _bar.count('-')
+        if not n_minus or n_minus < 3 * n_plus:
+            continue
+        name = _path.strip().strip('"').strip("'")
+        if name.startswith('...'):
+            name = name.lstrip('.').lstrip('/')
+        name = name.strip()
+        if name and name not in victims:
+            victims.append(name)
+
+    if victims:
+        names = ', '.join(victims[:5])
+        if len(victims) > 5:
+            names += f' (+{len(victims) - 5} more)'
+    else:
+        names = 'existing tracked file(s)'
+    return [
+        f'Destructive overwrite suspected: {names} — '
+        f'{int(files_m.group(1))} file(s) changed, '
+        f'{insertions} insertions(+), {deletions} deletions(-). '
+        f'Verify these edits were intended; the file can be restored from '
+        f'git history.'
+    ]
+
+
+def _apply_overwrite_findings(parsed: Dict[str, Any],
+                              findings: List[str]) -> Dict[str, Any]:
+    """Raise an H3 verdict for a code-detected destructive overwrite.
+
+    Mirrors ``_apply_completion_findings``: never lowers a verdict, merges by
+    text, and forces the next task to be held for the user. Applied after the
+    completion findings so a ``discuss``/``hold`` cannot be relaxed back by the
+    all-deliverables-present path.
+    """
+    if not findings:
+        return parsed
+    existing = list(parsed.get('findings') or [])
+    already = {f.lower() for f in existing}
+    parsed['findings'] = existing + [f for f in findings if f.lower() not in already]
+    if parsed.get('severity') in ('ok', 'warning'):
+        parsed['severity'] = 'issue'
+    if parsed.get('recommendation') == 'approve':
+        parsed['recommendation'] = 'discuss'
+    if parsed.get('gate_for_next') == 'proceed':
+        parsed['gate_for_next'] = 'hold'
+    return parsed
+
+
 def _permissive_h3(degraded_reason: str = '') -> Dict[str, Any]:
     """Approve when post-run analysis could not be obtained.
 
@@ -1816,9 +2003,10 @@ def pause_report_summary(task: Dict[str, Any], project: Dict[str, Any],
     model = (project or {}).get('aingel_model') or ''
     if not model:
         return None
-    description = ((task or {}).get('description') or '').strip()
-    if len(description) > _H3_DESC_CHARS:
-        description = description[:_H3_DESC_CHARS] + '\n…[truncated]'
+    # Cap the body but never the trailing 'User clarifications' block — see
+    # _description_for_review (regression: task 10001279 / RP-112).
+    description = _description_for_review((task or {}).get('description'),
+                                          _H3_DESC_CHARS)
     prompt = (
         f"You are the Guide for the project \"{(project or {}).get('name', '')}\". "
         "A task run has paused at its limit and the user must decide whether to continue it. "

@@ -224,6 +224,9 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
   const handleEdit = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (h2aHeld) return; // locked while AIngel holds the task for review/questions
+    // Locked while the task is running. The second pre-run review window has no
+    // gate hold yet, so `isRunning` is the only reliable lock signal there.
+    if (isRunning) return;
     if (!perms.canEdit) return;
     setShowAddModal(true);
     setModModalTaskId(task.id);
@@ -436,7 +439,7 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
           )}
           <span className="text-xs text-faint ml-auto">{estTokens}</span>
           <div style={{ position: 'relative', display: 'inline-flex' }}>
-            <TaskOverflowMenu task={task} isArchived={isArchived} held={h2aHeld} />
+            <TaskOverflowMenu task={task} isArchived={isArchived} held={h2aHeld} running={isRunning} />
           </div>
         </div>
         {isRunning && (
@@ -951,7 +954,7 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
 
       <div className="task-actions flex gap-2 px-1 pb-1 items-center">
         {perms.canEdit && (
-          <button data-tip={h2aHeld ? 'Answer the Guide review questions first' : 'Edit task'} className="btn-xs" onClick={handleEdit} disabled={isArchived || h2aHeld}>
+          <button data-tip={h2aHeld ? 'Answer the Guide review questions first' : isRunning ? 'Wait for the run to finish before editing' : 'Edit task'} className="btn-xs" onClick={handleEdit} disabled={isArchived || h2aHeld || isRunning}>
             Edit
           </button>
         )}
@@ -970,7 +973,7 @@ export const TaskCard = ({ task, variant = 'full' }: Props) => {
           </button>
         )}
         <div style={{ marginLeft: 'auto', position: 'relative' }}>
-          <TaskOverflowMenu task={task} isArchived={isArchived} held={h2aHeld} />
+          <TaskOverflowMenu task={task} isArchived={isArchived} held={h2aHeld} running={isRunning} />
         </div>
       </div>
     </div>

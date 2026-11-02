@@ -19,6 +19,7 @@ Run:  python3 -m unittest test_agent_contract -v
 """
 import os
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -462,6 +463,95 @@ class FlagStaleDependentsTests(_TempDbCase):
             agent_events.unsubscribe(proj_b['id'], qb)
 
         self.assertEqual(event, {'type': 'task_changed', 'task_id': dependent})
+
+
+class ColumnBusyMessageTests(_TempDbCase):
+    """_kick_run_seq: a busy-column refusal names the task holding it,
+    falling back to the generic form when the holder can't be resolved."""
+
+    def test_busy_kick_names_holder_task_and_project(self):
+        # Imported lazily like test_agent_api_authz does — importing the
+        # server module at test-module scope has import-time side effects.
+        import agent_api
+        ids = []
+        for i in (1, 2):
+            tid = agent_db.create_task(self.proj_id, f'T{i}',
+                                       description='x', project_path=self.path)
+            agent_db.update_task(tid, status='confirmed', work_session_slot=4,
+                                 project_path=self.path)
+            ids.append(tid)
+        holder_id, other_id = ids
+
+        release = threading.Event()
+        # Hygiene: unblock the daemon runner even if an assertion fails —
+        # a stuck thread would hold slot 4 and poison later tests.
+        self.addCleanup(release.set)
+
+        def blocked_run(task_id=None, resume=None):
+            release.wait(timeout=10)
+            return {'status': 'done', 'exec_id': 1, 'task_id': task_id}
+
+        with patch.object(agent_api, 'run_task', side_effect=blocked_run) as run_mock, \
+             patch.object(agent_api, 'generate_queue_handoff'):
+            ok, _msg = agent_api._kick_run_seq(4, [holder_id])
+            self.assertTrue(ok)
+            # The runner sets 'current' right before run_task; poll for it so
+            # the busy-refusal below deterministically names the holder.
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with agent_api._running_slots_lock:
+                    entry = agent_api._running_slots.get(4) or {}
+                if entry.get('current') == holder_id:
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail('slot 4 runner never registered the holder task')
+
+            result = agent_api._kick_run_seq(4, [other_id])
+            self.assertEqual(len(result), 2)
+            ok2, msg = result
+            self.assertFalse(ok2)
+            holder = agent_db.get_task(holder_id)
+            detail = holder.get('display_code') or f"#{holder['id']}"
+            self.assertIn(detail, msg)
+            self.assertIn('Proj', msg)
+            self.assertIn('EU Scaleway', msg)
+            self.assertIn('is already running', msg)
+            # Assertions done — unblock the runner so the drain below is
+            # deterministic (addCleanup only covers the failure paths).
+            release.set()
+        # Drain the runner thread: it pops the slot in its finally block, so
+        # a still-registered slot would leak into later tests.
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with agent_api._running_slots_lock:
+                running = agent_api._running_slots.get(4)
+            if running is None:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail('slot runner thread did not finish within 10s')
+        self.assertEqual(run_mock.call_count, 1)
+
+    def test_busy_kick_generic_when_holder_unresolvable(self):
+        import agent_api
+        tid = agent_db.create_task(self.proj_id, 'Kicker',
+                                   description='x', project_path=self.path)
+        # A holder id that cannot be resolved to a task (registry miss /
+        # missing project.db) must yield the generic refusal, not a crash.
+        with agent_api._running_slots_lock:
+            agent_api._running_slots[4] = {
+                'thread': agent_api._RESERVED, 'started': time.time(),
+                'task_ids': [999999001], 'current': 999999001}
+        try:
+            result = agent_api._kick_run_seq(4, [tid])
+            self.assertEqual(len(result), 2)
+            ok, msg = result
+            self.assertFalse(ok)
+            self.assertEqual(msg, 'Column 4 (EU Scaleway) is already running')
+        finally:
+            with agent_api._running_slots_lock:
+                agent_api._running_slots.pop(4, None)
 
 
 if __name__ == '__main__':

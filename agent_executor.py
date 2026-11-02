@@ -98,6 +98,9 @@ def _flush_pending_chat_commits(project_path):
                 db.drop_pending_chat_commit(row_id)
                 flushed += 1
                 continue
+            if gc.get('error'):
+                _log.warning('chat %s: deferred git commit failed: %s',
+                             row.get('chat_id'), gc.get('error'))
             db.bump_pending_chat_commit(row_id, gc.get('error'))
             attempts = int(row.get('attempts') or 0) + 1
             if attempts >= 5:
@@ -1115,7 +1118,6 @@ def _extract_batch_writes(text, project_path, out_rel=os.path.join('Artifacts', 
     _FILE_EXTS = r'\.(md|txt|json|csv|html|py|js|ts|tsx|sh|yaml|yml|xml)'
     # Find fenced code blocks and look for a filename in the preceding non-empty line.
     fence_pat = re.compile(r'```(\w+)?\s*\n(.*?)\n```', re.S)
-    lines = text.split('\n')
     for m in fence_pat.finditer(text):
         content = m.group(2)
         if not content or not content.strip():
@@ -1124,8 +1126,9 @@ def _extract_batch_writes(text, project_path, out_rel=os.path.join('Artifacts', 
         start_pos = m.start()
         prefix = text[:start_pos]
         prefix_lines = prefix.rstrip('\n').split('\n')
-        if len(prefix_lines) < 2:
-            continue
+        # The filename may legitimately be the first line of the output
+        # (models lead with it per the batch constraints). split('\n')
+        # always returns >=1 element; an empty prev_line is skipped below.
         prev_line = prefix_lines[-1].strip()
         if not prev_line:
             # Try one more line back.
@@ -2287,6 +2290,9 @@ def _generate_brief_async(exec_id, task, project_path,
             route_agentic=route_agentic,
             rag_label=rag_label,
             rag_provenance=rag_provenance,
+            # The run's real churn (git --stat). Stored on the row before this
+            # thread starts, so H3 can tell an append from an overwrite.
+            git_diffstat=(exec_row.get('git_diffstat') or ''),
         )
 
         brief_2s = (review.get('brief_2s') or '').strip()
@@ -2518,9 +2524,29 @@ def _aingel_overview_async(project, project_path):
 MAX_CONTINUES = max(0, int(os.getenv('AINGEL_MAX_CONTINUES', '3')))
 
 
-def _pausable_route(model_id):
-    """True when the task's model runs on the in-process tool loop."""
-    return (MODELS.get(model_id) or {}).get('provider') in ('scaleway', 'ollama')
+def _pausable_route(model_id, force_anthropic_mode=None, force_mistral_mode=None):
+    """True when the task's model can pause at its turn/time limit.
+
+    Three families, all with a checkpoint the Continue path understands:
+      - scaleway / ollama: the in-process tool loop (messages list);
+      - anthropic: the claude CLI, which we pin a --session-id for (true resume);
+      - mistral on the Vibe CLI: the checkpoint carries the transcript, and the
+        continuation replays the task prompt in a fresh session (Vibe has no
+        headless resume).
+    Mistral routed through the plain API (VIBE_MODE='api') or GPT/codex has no
+    checkpoint handle, so it keeps the old force-an-answer behaviour.
+    """
+    provider = (MODELS.get(model_id) or {}).get('provider')
+    if provider in ('scaleway', 'ollama'):
+        return True
+    if provider == 'anthropic':
+        # Both claude CLI auth modes (pro / api) support --session-id + --resume.
+        return True
+    if provider == 'mistral':
+        from agent_config import VIBE_MODELS
+        return ((force_mistral_mode or agent_config.MISTRAL_MODE) == 'vibe'
+                and model_id in VIBE_MODELS)
+    return False
 
 
 def checkpoint_path(project_path, exec_id):
@@ -2546,6 +2572,18 @@ def load_checkpoint(project_path, exec_id):
 
 
 def _drop_checkpoint(project_path, exec_id):
+    # Deleting the checkpoint also discards the run's resumable CLI session
+    # (claude keeps one JSONL per execution because we pin --session-id).
+    # Vibe session folders are left in place: they are the usage telemetry
+    # store _vibe_session_usage reads.
+    try:
+        cp = load_checkpoint(project_path, exec_id)
+        cs = (cp or {}).get('cli_session') or {}
+        if cs.get('session_id'):
+            import agent_router
+            agent_router.cleanup_cli_session(cs.get('kind'), cs.get('session_id'))
+    except Exception as e:
+        _log.warning('checkpoint CLI session cleanup failed for exec %s: %s', exec_id, e)
     try:
         os.remove(checkpoint_path(project_path, exec_id))
     except OSError:
@@ -3026,6 +3064,9 @@ def run_task(task_id=None, resume=None):
             else:
                 _log.warning('git: could not start task branch for task %s: %s',
                              task['id'], gstart.get('error'))
+            if gstart.get('checkpoint_error'):
+                _log.warning('task %s: checkpoint commit failed (%s) — pre-existing changes travel onto the task branch',
+                             task['id'], gstart['checkpoint_error'])
 
         try:
             import agent_scw_session
@@ -3037,7 +3078,7 @@ def run_task(task_id=None, resume=None):
         built = build_prompt(task, project_path, project=proj)
         mode = built.get('mode')           # 'inline' or 'batch' (large-file chunk-and-aggregate)
         if resume:
-            mode = 'inline'   # only the tool loop pauses; a resumed run continues it
+            mode = 'inline'   # batch runs never pause; a resumed run continues inline
         prompt = built.get('prompt')
         batch_payload = built.get('batch_payload', '')
         max_tokens = built.get('max_tokens', MAX_TOKENS)
@@ -3126,6 +3167,16 @@ def run_task(task_id=None, resume=None):
                 # here blocked. Overseer turns a non-empty list into an
                 # immediate deterministic hold — no LLM call.
                 dep_unmet = agent_contract.check(task)['unmet']
+                # Transient review-in-flight hold: the same marker the
+                # confirm-time H2a optimistic hold uses, so every review
+                # round (first run or re-run) blocks the task identically.
+                # Overwritten by update_task_h2_gate() when the review
+                # completes, and by the H3/Lane B writes afterwards.
+                db.update_task(task['id'], project_path=project_path,
+                               gate_state='hold', gate_source='H2a',
+                               gate_reason='Guide is reviewing this task…',
+                               gate_decided_at=datetime.utcnow().isoformat(),
+                               gate_report_h2_json=None)
                 h2 = overseer.pre_run_check(
                     task=task,
                     project=proj,
@@ -3441,16 +3492,24 @@ def run_task(task_id=None, resume=None):
                 if resume and resume.get('finalize'):
                     # Stop and review: no model call. The transcript so far,
                     # marked as cut off, goes through the normal done path.
+                    # The wording follows the route that paused: a Vibe run must
+                    # not be labelled with the tool-loop marker.
                     _cp = resume.get('checkpoint') or {}
+                    _cli_kind = ((_cp.get('cli_session') or {}).get('kind') or '')
+                    _marker = (VIBE_TURN_LIMIT_MARKER if _cli_kind == 'vibe'
+                               else TOOL_TURN_LIMIT_MARKER)
                     text = ('\n\n'.join(t for t in (_cp.get('transcript') or []) if t).strip()
-                            + f"\n\n---\n⚠️ **{TOOL_TURN_LIMIT_MARKER} — stopped by the user "
+                            + f"\n\n---\n⚠️ **{_marker} — stopped by the user "
                             "at the limit.** The run did not finish; review what it produced.")
                     tok_in = tok_out = 0
                     cost = 0.0
                 else:
-                    # Scaleway/Ollama tool loop: pause at the turn/time limit
-                    # instead of a forced answer (item 16). Other routes ignore it.
-                    _pausable = _pausable_route(task['model'])
+                    # Pausable route: the in-process tool loop, the claude CLI,
+                    # or the Vibe CLI (item 16). Each pauses at its turn/time
+                    # limit instead of being forced to answer; the checkpoint
+                    # carries whatever handle that route needs to resume.
+                    _pausable = _pausable_route(task['model'], force_anthropic_mode,
+                                                force_mistral_mode)
                     with (pause_scope(resume=(resume or {}).get('checkpoint'))
                           if _pausable else contextlib.nullcontext()):
                         text, tok_in, tok_out, cost = route(task['model'], prompt, max_tokens,
@@ -3616,41 +3675,6 @@ def run_task(task_id=None, resume=None):
             db.update_task(task['id'], status='done', actual_cost=cost, stale=0,
                            project_path=project_path)
 
-            # Auto-generate a 2-3 sentence brief (fire-and-forget, does not block result)
-            # Phase 7.2: pass referenced/caught/self-serve file lists so H3 can verify
-            # that referenced files were actually read by the task agent.
-            import threading as _threading
-            # Free-tier brief gate
-            _briefs_ok = True
-            try:
-                import agent_quotas
-                _owner = agent_quotas.resolve_owner_id(task, proj)
-                if _owner and not agent_quotas.can_use_briefs(_owner):
-                    _briefs_ok = False
-            except Exception:
-                pass
-            if _briefs_ok:
-                try:
-                    import agent_overseer as _overseer
-                    h3_referenced = _overseer._extract_referenced_files(
-                        task.get('description') or '', _overseer.context_ref_names(task))
-                except Exception:
-                    h3_referenced = []
-                h3_caught = caught_files
-                h3_self_serve = (h2.get('self_serve') if isinstance(h2, dict) else []) or []
-                h3_agentic = not _task_uses_direct_text_route(task)
-                _threading.Thread(target=_generate_brief_async,
-                                  args=(exec_id, task, project_path),
-                                  kwargs={
-                                      'referenced_files': h3_referenced,
-                                      'caught_files': h3_caught,
-                                      'self_serve_files': h3_self_serve,
-                                      'route_agentic': h3_agentic,
-                                      'rag_label': rag_label,
-                                      'rag_provenance': rag_provenance,
-                                  },
-                                  daemon=True).start()
-
             # Count actual consumption against the slot's budget.
             task_slot = task.get('work_session_slot')
             if task_slot:
@@ -3666,6 +3690,9 @@ def run_task(task_id=None, resume=None):
             if git_active:
                 gc = agit.commit_task(project_path, task['id'], task['title'])
                 if gc.get('ok') and gc.get('changed'):
+                    if gc.get('branch_moved'):
+                        _log.warning('task %s: commit landed on %s — the run left the task branch %s',
+                                     task['id'], gc['branch_moved'], git_branch)
                     # Restore real project-relative paths for git-abbreviated (`.../`) diffstat
                     # lines, resolved from the filesystem, so both the stored row and the F10
                     # linkify below point at files that actually exist on disk.
@@ -3680,8 +3707,11 @@ def run_task(task_id=None, resume=None):
                             task_id=task.get('id'), extra_candidates=_fix_cands)
                     except Exception as _fix_err:
                         _log.warning('diffstat path fixup failed for task %s: %s', task['id'], _fix_err)
+                    # Resumed runs reuse the same exec row, so a run that was
+                    # previously blocked by a rejecting hook must not keep
+                    # rendering "Commit blocked" once a commit succeeds.
                     db.update_execution_git(exec_id, commit=gc['commit'], diffstat=gc['diffstat'],
-                                            project_path=project_path)
+                                            commit_error='', project_path=project_path)
                     git_info = {'git_branch': git_branch, 'git_commit': gc['commit'],
                                 'git_diffstat': gc['diffstat'], 'git_changed': True}
                     if gc.get('tombstone_note'):
@@ -3713,8 +3743,13 @@ def run_task(task_id=None, resume=None):
                     # Commit failed — do NOT discard; keep the branch so the user can recover.
                     _log.warning('git commit failed for task %s, branch %s preserved: %s',
                                  task['id'], git_branch, gc.get('error'))
+                    # Persist the failure (and the staged-files diffstat) so the
+                    # Exec Log links the deliverables even without a commit.
+                    db.update_execution_git(exec_id, diffstat=gc.get('diffstat') or '',
+                                            commit_error=gc.get('error') or 'commit failed',
+                                            project_path=project_path)
                     git_info = {
-                        'git_branch': git_branch, 'git_commit': '', 'git_diffstat': '',
+                        'git_branch': git_branch, 'git_commit': '', 'git_diffstat': gc.get('diffstat') or '',
                         'git_changed': False,
                         'git_commit_error': gc.get('error') or 'commit failed',
                     }
@@ -3782,6 +3817,48 @@ def run_task(task_id=None, resume=None):
                             _f.write(f"\n\n> ⚠ **Tombstone gate:** {git_info['tombstone_note']}\n")
                 except Exception:
                     pass
+
+            # Auto-generate a 2-3 sentence brief (fire-and-forget, does not block result)
+            # Phase 7.2: pass referenced/caught/self-serve file lists so H3 can verify
+            # that referenced files were actually read by the task agent.
+            #
+            # Started AFTER the git commit/merge block on purpose: H3 must read the
+            # run's `git_diffstat` (stored by db.update_execution_git above) so it
+            # can spot a destructive overwrite. On exec 20001366 a run replaced a
+            # 1,040-line document with 70 lines; H3, started before the diffstat
+            # existed and shown only the model's "appended" summary, approved it.
+            # git_active=False is fine — H3 runs either way, just without a diffstat.
+            import threading as _threading
+            # Free-tier brief gate
+            _briefs_ok = True
+            try:
+                import agent_quotas
+                _owner = agent_quotas.resolve_owner_id(task, proj)
+                if _owner and not agent_quotas.can_use_briefs(_owner):
+                    _briefs_ok = False
+            except Exception:
+                pass
+            if _briefs_ok:
+                try:
+                    import agent_overseer as _overseer
+                    h3_referenced = _overseer._extract_referenced_files(
+                        task.get('description') or '', _overseer.context_ref_names(task))
+                except Exception:
+                    h3_referenced = []
+                h3_caught = caught_files
+                h3_self_serve = (h2.get('self_serve') if isinstance(h2, dict) else []) or []
+                h3_agentic = not _task_uses_direct_text_route(task)
+                _threading.Thread(target=_generate_brief_async,
+                                  args=(exec_id, task, project_path),
+                                  kwargs={
+                                      'referenced_files': h3_referenced,
+                                      'caught_files': h3_caught,
+                                      'self_serve_files': h3_self_serve,
+                                      'route_agentic': h3_agentic,
+                                      'rag_label': rag_label,
+                                      'rag_provenance': rag_provenance,
+                                  },
+                                  daemon=True).start()
 
             result = {
                 'task_id':    task['id'],
@@ -4887,7 +4964,13 @@ def _chat_turn(chat_id, user_message, model=None, tools_enabled=None,
                         if gc.get('changed') and gc.get('commit'):
                             db.update_execution_git(exec_id, commit=gc['commit'],
                                                     diffstat=gc.get('diffstat', ''),
+                                                    commit_error='',
                                                     project_path=project_path)
+                        elif not gc.get('ok') and gc.get('error'):
+                            # 'changed': False just means a clean tree — only
+                            # ok is False is a real failure.
+                            _log.warning('chat %s: git commit failed: %s',
+                                         chat_id, gc.get('error'))
                         # Lock is held: also drain chat commits deferred while
                         # a task run was in progress.
                         _flush_pending_chat_commits(project_path)

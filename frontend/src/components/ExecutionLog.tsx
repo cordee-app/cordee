@@ -17,7 +17,7 @@ import { execChip, taskChip } from '../utils/taskCode';
 const LOG_HEIGHT_KEY = 'log_panel_height';
 const COL_WIDTHS_KEY = 'superagent_exec_col_widths';
 
-const DEFAULT_COL_WIDTHS: number[] = [130, 50, 60, 260, 100, 80, 70, 120, 280];
+const DEFAULT_COL_WIDTHS: number[] = [130, 50, 60, 60, 260, 100, 80, 70, 120, 280];
 
 const fmtTimeFull = (iso?: string): string => {
   if (!iso) return '—';
@@ -29,6 +29,14 @@ const fmtTimeFull = (iso?: string): string => {
 const truncate = (s: string | undefined, n: number): string => {
   if (!s) return '';
   return s.length > n ? s.slice(0, n) + '\u2026' : s;
+};
+
+// The log only shows the phase number ("Phase 3"), not the full phase name —
+// 'Phase 3 - Architecture' → 'Phase 3'. Non-numbered phases (Notebook,
+// Unphased, …) return null and render as '—'.
+const phaseNumber = (name?: string): string | null => {
+  const m = /^phase\s+(\d+)/i.exec((name || '').trim());
+  return m ? `Phase ${m[1]}` : null;
 };
 
 const getModelColor = (model: string): string => {
@@ -73,6 +81,16 @@ const gitExecutionState = (e: Execution) => {
   const gitBranch = (e.git_branch || '').trim();
   const gitCommit = (e.git_commit || '').trim();
   const gitMerge = (e.git_merge_commit || '').trim();
+  // Commit blocked (e.g. pre-commit hook rejected the commit) — checked FIRST:
+  // commit/merge refs are empty in this state, but the blocked state must win
+  // regardless so the row cannot read as a healthy "ready" branch.
+  if ((e.git_commit_error || '').trim()) {
+    return {
+      label: 'Commit blocked',
+      title: `Git commit was rejected — the run's files are on disk but uncommitted.\n${(e.git_commit_error || '').trim()}${gitBranch ? `\nBranch: ${gitBranch}` : ''}`,
+      kind: 'error',
+    };
+  }
   if (gitMerge) {
     return {
       label: `Merged${gitCommit ? ` \u00b7 ${gitCommit}` : ''}`,
@@ -169,8 +187,10 @@ export const ExecutionLog = () => {
   }, [activeProject, perms.canEdit, user, projects]);
   const [height, setHeight] = useState(() => {
     const saved = localStorage.getItem(LOG_HEIGHT_KEY);
-    return saved ? parseInt(saved, 10) : 200;
+    const n = saved ? parseInt(saved, 10) : NaN;
+    return Number.isFinite(n) ? n : 200;
   });
+  const [instructionQuery, setInstructionQuery] = useState('');
   const [rejectFormId, setRejectFormId] = useState<number | null>(null);
   const [rejectFeedback, setRejectFeedback] = useState('');
   const [forkFormId, setForkFormId] = useState<number | null>(null);
@@ -189,7 +209,11 @@ export const ExecutionLog = () => {
   const [colWidths, setColWidths] = useState<number[]>(() => {
     try {
       const saved = localStorage.getItem(COL_WIDTHS_KEY);
-      if (saved) return JSON.parse(saved) as number[];
+      if (saved) {
+        const parsed = JSON.parse(saved) as number[];
+        // Ignore stale layouts from before the Phase column was added.
+        if (Array.isArray(parsed) && parsed.length === DEFAULT_COL_WIDTHS.length) return parsed;
+      }
     } catch { /* ignore */ }
     return DEFAULT_COL_WIDTHS;
   });
@@ -214,7 +238,8 @@ export const ExecutionLog = () => {
     } catch { /* ignore */ }
   }, [setExecutions]);
 
-  const clampedHeight = Math.min(Math.max(height, 100), window.innerHeight * 0.7);
+  // Max 300px (was effectively 200px via CSS) — 50% more headroom on top.
+  const clampedHeight = Math.min(Math.max(height, 100), 300);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     dragging.current = true;
@@ -279,9 +304,14 @@ export const ExecutionLog = () => {
     };
   }, []);
 
+  const instructionFilter = instructionQuery.trim().toLowerCase();
   const filtered = executions.filter((e) => {
-    if (!activeProject) return true;
-    return e.project_id === activeProject;
+    if (activeProject && e.project_id !== activeProject) return false;
+    if (instructionFilter) {
+      const text = (e.instructions || e.task_title || '').toLowerCase();
+      if (!text.includes(instructionFilter)) return false;
+    }
+    return true;
   });
 
   const handleApprove = async (execId: number, level: MemoryLevel) => {
@@ -466,11 +496,6 @@ export const ExecutionLog = () => {
           }}
           onMouseDown={handleMouseDown}
         />
-        <div className="log-header flex justify-between items-center px-4 py-1.5 text-sm+ text-soft border-b border-default dark:text-text-dark-soft dark:border-border-dark-muted">
-          <h4 className="m-0 text-sm">Execution Log</h4>
-          <span id="log-count">({filtered.length})</span>
-          <span id="log-project-label" className="ml-2 text-sm+ opacity-70" />
-        </div>
         <div className={cn('log-table', isMobile && 'hidden')}>
           <table className="w-full border-collapse text-sm+">
             <thead>
@@ -478,12 +503,37 @@ export const ExecutionLog = () => {
                 <th className={thBase} style={{ width: colWidths[0] || DEFAULT_COL_WIDTHS[0] }}>Time<div onMouseDown={(e) => handleColResizeStart(e, 0)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
                 <th className={cn(thBase, 'text-center')} style={{ width: colWidths[1] || DEFAULT_COL_WIDTHS[1] }}>Chat<div onMouseDown={(e) => handleColResizeStart(e, 1)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
                 <th className={thBase} style={{ width: colWidths[2] || DEFAULT_COL_WIDTHS[2] }}>Task<div onMouseDown={(e) => handleColResizeStart(e, 2)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
-                <th className={thBase} style={{ width: colWidths[3] || DEFAULT_COL_WIDTHS[3] }}>Instructions<div onMouseDown={(e) => handleColResizeStart(e, 3)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
-                <th className={thBase} style={{ width: colWidths[4] || DEFAULT_COL_WIDTHS[4] }}>Model<div onMouseDown={(e) => handleColResizeStart(e, 4)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
-                <th className={thBase} style={{ width: colWidths[5] || DEFAULT_COL_WIDTHS[5] }}>Status<div onMouseDown={(e) => handleColResizeStart(e, 5)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
-                <th className={thBase} style={{ width: colWidths[6] || DEFAULT_COL_WIDTHS[6] }}>Cost<div onMouseDown={(e) => handleColResizeStart(e, 6)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
-                <th className={thBase} style={{ width: colWidths[7] || DEFAULT_COL_WIDTHS[7] }}>File<div onMouseDown={(e) => handleColResizeStart(e, 7)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
-                <th className={thBase} style={{ width: colWidths[8] || DEFAULT_COL_WIDTHS[8], background: '#eee7db' }}>Actions</th>
+                <th className={thBase} style={{ width: colWidths[3] || DEFAULT_COL_WIDTHS[3] }}>Phase<div onMouseDown={(e) => handleColResizeStart(e, 3)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
+                <th className={thBase} style={{ width: colWidths[4] || DEFAULT_COL_WIDTHS[4] }}>
+                  <div className="relative flex items-center">
+                    <input
+                      type="text"
+                      aria-label="Search instructions"
+                      placeholder="Instructions (search...)"
+                      value={instructionQuery}
+                      onChange={(e) => setInstructionQuery(e.target.value)}
+                      className="w-full min-w-0 bg-transparent border-0 outline-none p-0 pr-[18px] text-inherit font-medium placeholder:text-faint"
+                    />
+                    {instructionQuery ? (
+                      <button
+                        type="button"
+                        aria-label="Clear instructions search"
+                        title="Clear search"
+                        onClick={() => setInstructionQuery('')}
+                        className="absolute right-[10px] top-1/2 -translate-y-1/2 leading-none text-faint hover:text-ink dark:hover:text-text-dark-DEFAULT"
+                        style={{ background: 'transparent', border: 0, padding: 0, cursor: 'pointer' }}
+                      >
+                        &times;
+                      </button>
+                    ) : null}
+                  </div>
+                  <div onMouseDown={(e) => handleColResizeStart(e, 4)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent z-10" />
+                </th>
+                <th className={thBase} style={{ width: colWidths[5] || DEFAULT_COL_WIDTHS[5] }}>Model<div onMouseDown={(e) => handleColResizeStart(e, 5)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
+                <th className={thBase} style={{ width: colWidths[6] || DEFAULT_COL_WIDTHS[6] }}>Status<div onMouseDown={(e) => handleColResizeStart(e, 6)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
+                <th className={thBase} style={{ width: colWidths[7] || DEFAULT_COL_WIDTHS[7] }}>Cost<div onMouseDown={(e) => handleColResizeStart(e, 7)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
+                <th className={thBase} style={{ width: colWidths[8] || DEFAULT_COL_WIDTHS[8] }}>File<div onMouseDown={(e) => handleColResizeStart(e, 8)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
+                <th className={thBase} style={{ width: colWidths[9] || DEFAULT_COL_WIDTHS[9], background: '#eee7db' }}>Actions</th>
               </tr>
             </thead>
             <tbody id="exec-log-tbody">
@@ -537,6 +587,9 @@ export const ExecutionLog = () => {
                       </td>
                       <td className={cn(tdBase, 'text-faint font-semibold')} style={{ fontVariantNumeric: 'tabular-nums' }}>
                         {execChip(e)}
+                      </td>
+                      <td className={cn(tdBase, 'text-faint whitespace-nowrap')} title={e.phase_name || ''}>
+                        {phaseNumber(e.phase_name) ?? '\u2014'}
                       </td>
                       <td className={tdBase} title={e.instructions || e.task_title || ''}>
                         {instructions}
@@ -656,10 +709,17 @@ export const ExecutionLog = () => {
                             <button data-tip="View the error details" className="btn-xs text-danger border-danger" onClick={() => handleError(e)}>Error</button>
                           ) : null}
                           {e.status === 'done' && memStatus === 'pending' && gitState && gitState.kind !== 'branch' && hasOutput ? (
-                            <span className="text-xs text-status-done inline-flex items-center gap-0.5 dark:text-status-done-dark" title={gitState.title}>
-                              {gitState.kind === 'merged' ? <GitMerge size={11} className="shrink-0" /> : <GitCommitHorizontal size={11} className="shrink-0" />}
-                              {gitState.label}
-                            </span>
+                            gitState.kind === 'error' ? (
+                              <span className="text-xs text-status-failed font-semibold inline-flex items-center gap-0.5 dark:text-status-failed-dark-DEFAULT" title={gitState.title}>
+                                <GitBranch size={11} className="shrink-0" />
+                                {gitState.label}
+                              </span>
+                            ) : (
+                              <span className="text-xs text-status-done inline-flex items-center gap-0.5 dark:text-status-done-dark" title={gitState.title}>
+                                {gitState.kind === 'merged' ? <GitMerge size={11} className="shrink-0" /> : <GitCommitHorizontal size={11} className="shrink-0" />}
+                                {gitState.label}
+                              </span>
+                            )
                           ) : e.status === 'done' && memStatus === 'pending' ? (
                             <>
                               {e.git_commit ? (
@@ -741,6 +801,12 @@ export const ExecutionLog = () => {
                               ) : null}
                             </>
                           ) : null}
+                          {e.status === 'done' && memStatus !== 'pending' && gitState && gitState.kind === 'error' ? (
+                            <span className="text-xs text-status-failed font-semibold inline-flex items-center gap-0.5 dark:text-status-failed-dark-DEFAULT" title={gitState.title}>
+                              <GitBranch size={11} className="shrink-0" />
+                              {gitState.label}
+                            </span>
+                          ) : null}
                           {(e.status === 'failed' || e.status === 'rejected') && canEditExec(e.project_id) ? (
                             <>
                               {forkFormId === e.id ? (
@@ -814,6 +880,9 @@ export const ExecutionLog = () => {
                     </div>
                     <div className="text-sm+ text-ink dark:text-text-dark-DEFAULT mb-1">{truncate(e.instructions || e.task_title || '', 120)}</div>
                     <div className="flex items-center gap-2 flex-wrap text-xs text-text-muted dark:text-text-dark-muted mb-1.5">
+                      {phaseNumber(e.phase_name) ? (
+                        <span className="text-faint font-semibold" title={e.phase_name}>{phaseNumber(e.phase_name)}</span>
+                      ) : null}
                       <span className="rounded-[10px]" style={{ background: `${modelColor}22`, color: modelColor, padding: '1px 6px' }}>{getModelLabel(e)}</span>
                       <RagBadge exec={e} />
                       <FilesBadge exec={e} />
@@ -838,7 +907,11 @@ export const ExecutionLog = () => {
                         <button data-tip="View the error details" className="btn-xs text-danger border-danger" onClick={() => handleError(e)}>Error</button>
                       ) : null}
                       {e.status === 'done' && memStatus === 'pending' && gitState && gitState.kind !== 'branch' && hasOutput ? (
-                        <span className="text-xs text-status-done inline-flex items-center gap-0.5">{gitState.kind === 'merged' ? <GitMerge size={11} /> : <GitCommitHorizontal size={11} />}{gitState.label}</span>
+                        gitState.kind === 'error' ? (
+                          <span className="text-xs text-status-failed font-semibold inline-flex items-center gap-0.5" title={gitState.title}><GitBranch size={11} />{gitState.label}</span>
+                        ) : (
+                          <span className="text-xs text-status-done inline-flex items-center gap-0.5">{gitState.kind === 'merged' ? <GitMerge size={11} /> : <GitCommitHorizontal size={11} />}{gitState.label}</span>
+                        )
                       ) : e.status === 'done' && memStatus === 'pending' ? (
                         <>
                           {canEditExec(e.project_id) && (
@@ -868,6 +941,9 @@ export const ExecutionLog = () => {
                           </span>
                           {memStatus.startsWith('approved') && canEditExec(e.project_id) ? <button data-tip="Revert this approval" className="btn-xs text-faint" onClick={() => handleRevert(e.id)}>Revert</button> : null}
                         </>
+                      ) : null}
+                      {e.status === 'done' && memStatus !== 'pending' && gitState && gitState.kind === 'error' ? (
+                        <span className="text-xs text-status-failed font-semibold inline-flex items-center gap-0.5" title={gitState.title}><GitBranch size={11} />{gitState.label}</span>
                       ) : null}
                       {(e.status === 'failed' || e.status === 'rejected') && canEditExec(e.project_id) ? (
                         <button data-tip="Fork this execution" className="btn-xs" style={{ color: '#7a5aa6' }} onClick={() => setForkFormId(e.id)}>Fork</button>
@@ -1080,7 +1156,11 @@ const ExecFileCell = ({ exec }: { exec: Execution }) => {
   // disk, so a /files/ link 404s (RP-094: a GUIDE.md merge conflict left its
   // deliverable on the branch). Show them as text with the reason instead.
   const branch = (exec.git_branch || '').trim();
-  const unmerged = !!branch && !(exec.git_merge_commit || '').trim()
+  // Commit blocked (pre-commit hook rejected): the files ARE on disk (they were
+  // never committed/merged and no checkout moved away), so they must render as
+  // normal links, not as the unmerged "not on disk" text-with-branch-icon form.
+  const blocked = (exec.git_commit_error || '').trim().length > 0;
+  const unmerged = !blocked && !!branch && !(exec.git_merge_commit || '').trim()
     && exec.status !== 'running' && exec.status !== 'paused';
   return (
     <div className="flex flex-col gap-0.5">
@@ -1108,7 +1188,8 @@ const ExecFileCell = ({ exec }: { exec: Execution }) => {
         if (!url) return <span key={f.name} className="text-xs text-faint truncate" title={f.name}>{basename}</span>;
         return (
           <a key={f.name} href={url} target="_blank" rel="noopener noreferrer"
-             className="text-xs text-link hover:underline truncate" title={f.name}
+             className="text-xs text-link hover:underline truncate"
+             title={(blocked ? 'Commit blocked — file is on disk but NOT committed (unmerged work survives only in the working tree).\n' : '') + f.name}
              style={{ maxWidth: 110 }}>
             {basename}
           </a>

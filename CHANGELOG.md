@@ -11,12 +11,22 @@ All notable changes to this project will be documented in this file. The format 
 - Creating a confidential project now provisions its EU Scaleway session inside `POST /api/projects`, before scaffolding starts: a provisioning failure rolls the project back and returns a readable error instead of leaving a half-provisioned project that continues to scaffold.
 
 ### Fixed
+- A commit rejected by a repository hook no longer looks like success: the Execution Log shows a red **Commit blocked** badge with the failure, keeps the run's file links, and the badge persists until the commit succeeds.
+- Pre-run reviewers see answered clarifications and no longer re-ask questions the user has already answered.
+- Task prompts are never truncated on the Vibe route, and the H3 post-run analysis now receives the run's diffstat.
+- A task is held through every pre-run review round instead of being released (and claimed elsewhere) mid-review.
+- Kanban column-busy refusals name the task and project currently holding the column.
+- Batch deliverables whose filename is the first line of the output are extracted correctly.
+- Exec Log file links survive when a run leaves its task branch.
+- The Vibe byte gate is skipped on batch runs, so large batch inputs are no longer rejected before processing.
 - Regenerated `GUIDE.md` no longer repeats the phase prefix (`## Phase 1 — Phase 1 — …`, present in every project), and the first phase heading is no longer glued to the generated-file comment.
 - Scaleway project names are transliterated to ASCII (`Cordée - Example Client` → `Cordee - Example Client`). The accented brand prefix violated Scaleway's `^[a-zA-Z0-9._\- ]+$` name rule and made every session creation fail with HTTP 400.
 - Scaleway bucket and KMS key names are length-capped so long project names stay inside the 63-character S3 limit.
 - The "Create Project" modal keeps the typed name and pitch on a failed create and shows the server's error inline, instead of dismissing and continuing to scaffolding.
 
 ### Added
+- Task runs on the Vibe and Claude CLI routes pause at the turn or time limit, with Continue/Stop controls in the Execution Log (Claude resumes its session; Vibe replays a capped continuation block of the steps already taken).
+- Execution Log gains a phase column, instruction search, and a taller panel.
 - Initial public release of Cordée — an AI-guided project management system with EU data sovereignty.
 - **Plan, run, and close projects** with AI assistance at every stage (task drafting, execution, review, memory).
 - **Per-project LLM selection** — run different projects on different models (Claude, Mistral, Scaleway-hosted open models) depending on scope, budget, and sensitivity.

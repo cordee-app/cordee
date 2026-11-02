@@ -190,6 +190,28 @@ class BatchAndPromptTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(p, out, 'summary.md')))
             self.assertFalse(os.path.exists(os.path.join(p, 'Working Documents')))
 
+    def test_batch_extraction_accepts_filename_on_first_line(self):
+        """Regression task 10001275 (RP-108): model led with the filename."""
+        with tempfile.TemporaryDirectory() as p:
+            out = os.path.join('Artifacts', 'outputs', 't')
+            text = ('transport_plan_kpis_2030_2034.md\n\n```markdown\n'
+                    '| KPI | 2030 |\n|---|---|\n| Trips | 1200 |\n```\n\n'
+                    'Closing paragraph.')
+            written = agent_executor._extract_batch_writes(text, p, out)
+            self.assertEqual([w[0] for w in written],
+                             ['transport_plan_kpis_2030_2034.md'])
+            self.assertTrue(os.path.isfile(
+                os.path.join(p, out, 'transport_plan_kpis_2030_2034.md')))
+
+    def test_batch_extraction_ignores_bare_fence_at_start(self):
+        """A fence with no preceding filename must extract nothing."""
+        with tempfile.TemporaryDirectory() as p:
+            out = os.path.join('Artifacts', 'outputs', 't')
+            text = '```markdown\n# x\n```'
+            written = agent_executor._extract_batch_writes(text, p, out)
+            self.assertEqual(written, [])
+            self.assertFalse(os.path.exists(os.path.join(p, out)))
+
     def test_task_output_dir_is_numbered_by_task(self):
         self.assertEqual(
             agent_executor.task_output_dir({'id': 10001149, 'title': 'Get list of Arguments!'}),

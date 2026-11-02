@@ -32,6 +32,93 @@ _log = logging.getLogger(__name__)
 # The remainder is headroom for tool schemas, role/context blocks, and output tokens.
 _INLINE_BUDGET_FRACTION = 0.50
 
+# ── Vibe (Mistral CLI) argv byte budget ──────────────────────────────────────
+# The vibe CLI has no --prompt-file flag and its stdin is unusable, so the whole
+# prompt goes on the argv and is hard-capped at agent_router.VIBE_PROMPT_MAX_BYTES
+# (~120 KB). The context-window-derived token budget is far larger (mistral-
+# large-latest: 262k tokens → ~131k inline tokens), so a large document gets
+# inlined into a prompt the CLI cannot carry. Bytes are reserved here for what
+# must never be dropped: the task description (front of the prompt), the
+# constraints/output-format block, RAG blocks and header overhead.
+_VIBE_PROMPT_RESERVE_BYTES = 45_000
+
+
+def _vibe_inline_byte_budget(model_id, slot=None):
+    """Max bytes of inlined file content when the model runs through vibe.
+
+    Returns None when the model is not routed through the vibe CLI (API mode,
+    other providers, unknown model), so the token-based gate stays authoritative
+    for everyone else. Never raises: any import/attribute failure disables the
+    extra gate rather than breaking prompt building.
+
+    ``slot`` is the task's work-session slot. Slots 2 (Mistral Pro) and 3
+    (PAYG) make the executor force ``force_mistral_mode='vibe'`` regardless of
+    the global ``MISTRAL_MODE``, so those runs must be budgeted for the vibe
+    argv too — otherwise they would hit the loud truncation failure instead of
+    the (better) path-note demotion.
+    """
+    try:
+        import agent_config
+        from agent_router import VIBE_PROMPT_MAX_BYTES
+        vibe_models = getattr(agent_config, 'VIBE_MODELS', set()) or set()
+        if model_id not in vibe_models:
+            return None
+        try:
+            slot = int(slot) if slot is not None else None
+        except (TypeError, ValueError):
+            slot = None
+        forced_by_slot = slot in (2, 3)
+        if str(getattr(agent_config, 'MISTRAL_MODE', 'api')).lower() != 'vibe' \
+                and not forced_by_slot:
+            return None
+        return max(20_000, int(VIBE_PROMPT_MAX_BYTES) - _VIBE_PROMPT_RESERVE_BYTES)
+    except Exception:
+        return None
+
+
+def _too_large_note(name):
+    """Path note for a file that must not be inlined (model reads it with tools)."""
+    return (
+        f"\n\n[Large file `{name}` is available at its project path and "
+        f"is too large to inline — read it with your file tools "
+        f"(read_file / bash) in chunks.]\n")
+
+
+def _demote_inline_to_batch(inline, batch, byte_budget, model_id):
+    """Move inline files that overflow the vibe argv byte budget into ``batch``.
+
+    A demoted file is no longer inlined: it reaches the model as an oversized-
+    file note / chunk payload instead of being silently tail-truncated away by
+    the CLI layer (regression: RP-114-E1 — ~230 KB of extracted PDF text (two
+    referenced PDFs, each capped at 200,000 chars by ``_extract_pdf_text`` —
+    just under the single-file token gate, far over the argv cap) was inlined
+    and pushed the task description off the argv; the model invented a
+    different task and destroyed an unrelated document).
+    Binary notes (``content is None``) are kept — they carry no bytes.
+
+    Returns ``(kept_inline, batch, demoted)`` where ``demoted`` lists the
+    ``(name, content)`` entries moved out of the inline set.
+    """
+    if byte_budget is None or not inline:
+        return inline, batch, []
+    kept, demoted, used = [], [], 0
+    for name, content in inline:
+        if content is None:
+            kept.append((name, content))
+            continue
+        size = len(content.encode('utf-8'))
+        if used + size > byte_budget:
+            _log.info(
+                'vibe byte budget: demoting %s (%d bytes) to batch '
+                '(budget %d bytes, model %s)', name, size, byte_budget, model_id)
+            batch.append((name, content))
+            demoted.append((name, content))
+            continue
+        used += size
+        kept.append((name, content))
+    return kept, batch, demoted
+
+
 # Extensions whose bytes are not meaningful as UTF-8 text — never inline these.
 _BINARY_EXTS = {
     '.pdf', '.db', '.sqlite', '.xlsx', '.xls', '.doc', '.docx', '.pptx',
@@ -467,6 +554,8 @@ def build(task, project_path, project=None) -> Dict:
     from agent_executor import _build_prompt, DEFAULT_MODEL
 
     model_id = (task.get('model') or DEFAULT_MODEL).strip()
+    vibe_byte_budget = _vibe_inline_byte_budget(model_id,
+                                                task.get('work_session_slot'))
 
     try:
         from model_caps import model_capabilities
@@ -669,11 +758,35 @@ def build(task, project_path, project=None) -> Dict:
         context_review_needed = False
         # additions will be built below from inline_files/batch_files
         additions = ''
+        # RP-099 gate, computed once before the vibe byte gate: the binary-edit
+        # override below is the only case where a non-empty batch_files still
+        # ends up running inline.
+        _binary_edit_task = _binary_document_edit_task(
+            (task or {}).get('description'), inline_files + batch_files)
+        # Vibe argv byte gate — ONLY when the run stays inline. The token gate
+        # above is sized from the model's context window, which is far larger
+        # than what the CLI can carry, but a batch run routes Mistral through
+        # the toolless API (run_large_file_batch forces force_mistral_mode=
+        # 'api'), where there is no argv cap, and a file demoted there would be
+        # a path note a toolless model cannot act on: its content would never
+        # reach the model. So skip the byte gate whenever the token gate
+        # already sent a file to batch mode and the binary-edit override will
+        # not clear it back to inline.
+        vibe_demoted = []
+        if not (batch_files and not _binary_edit_task):
+            inline_files, batch_files, vibe_demoted = _demote_inline_to_batch(
+                inline_files, batch_files, vibe_byte_budget, model_id)
+            if vibe_demoted:
+                # Keep mode='inline': vibe has read_file/list_files, so the file is
+                # better handed over as a project path than routed through the
+                # toolless batch (map/reduce) path.
+                _demoted_names = {name for name, _ in vibe_demoted}
+                batch_files = [(n, c) for n, c in batch_files
+                               if n not in _demoted_names]
         # RP-099: batch mode is text-only (map/reduce, no tools), so a task
         # that must MODIFY a referenced binary document cannot run there.
         # Keep the oversized files in the prompt as path notes instead.
-        if batch_files and _binary_document_edit_task(
-                (task or {}).get('description'), inline_files + batch_files):
+        if batch_files and _binary_edit_task:
             _log.info('batch mode disabled: task edits a referenced binary document')
             for name, content in batch_files:
                 if os.path.splitext(str(name))[1].lower() in _BINARY_EXTS or content is None:
@@ -695,6 +808,8 @@ def build(task, project_path, project=None) -> Dict:
                 additions += f"\n\n**File: {name}**\n```\n{content}\n```\n"
         for name, _content in batch_files:
             additions += f"\n\n[Large file `{name}` is supplied in chunks below.]\n"
+        for name, _content in vibe_demoted:
+            additions += _too_large_note(name)
         # no forced_agentic listing needed; explicit refs already injected
     else:
         # ── Fallback mode: capped index of Working Docs (≤5k tokens) ─────────
@@ -778,10 +893,30 @@ def build(task, project_path, project=None) -> Dict:
         # catchall path mass-extracts every file: task #10001117 — 54 PDFs, 28-min hang).
         fallback_inline, fallback_batch = _resolve_referenced_files(
             task, project_path, inline_budget, single_file_max, catchall_disabled=True)
+        # RP-099 gate, computed once before the vibe byte gate: the binary-edit
+        # override below is the only case where a non-empty fallback_batch
+        # still ends up running inline.
+        _binary_edit_task = _binary_document_edit_task(
+            (task or {}).get('description'), fallback_inline + fallback_batch)
+        # Same vibe argv byte gate as the explicit-refs path above — ONLY when
+        # the run stays inline. A batch run routes Mistral through the
+        # toolless API (run_large_file_batch forces force_mistral_mode='api'),
+        # where there is no argv cap, and a file demoted there would be a path
+        # note a toolless model cannot act on: its content would never reach
+        # the model. So skip the byte gate whenever the token gate already
+        # sent a file to batch mode and the binary-edit override will not
+        # clear it back to inline.
+        _vibe_demoted = []
+        if not (fallback_batch and not _binary_edit_task):
+            fallback_inline, fallback_batch, _vibe_demoted = _demote_inline_to_batch(
+                fallback_inline, fallback_batch, vibe_byte_budget, model_id)
+            if _vibe_demoted:
+                _demoted_names = {name for name, _ in _vibe_demoted}
+                fallback_batch = [(n, c) for n, c in fallback_batch
+                                  if n not in _demoted_names]
         # RP-099 guard (fallback path): same rule as explicit refs — a task that
         # must modify a referenced binary document cannot run in text-only batch.
-        if fallback_batch and _binary_document_edit_task(
-                (task or {}).get('description'), fallback_inline + fallback_batch):
+        if fallback_batch and _binary_edit_task:
             _log.info('batch mode disabled: task edits a referenced binary document')
             for name, content in fallback_batch:
                 if os.path.splitext(str(name))[1].lower() in _BINARY_EXTS or content is None:
@@ -803,9 +938,12 @@ def build(task, project_path, project=None) -> Dict:
                 additions += f"\n\n**File: {name}**\n```\n{content}\n```\n"
         for name, _content in fallback_batch:
             additions += f"\n\n[Large file `{name}` is supplied in chunks below.]\n"
+        for name, _content in _vibe_demoted:
+            additions += _too_large_note(name)
         fallback_caught = ([name for name, _ in fallback_inline]
                            + [name for name, _ in fallback_batch]
-                           + disabled_batch_names)
+                           + disabled_batch_names
+                           + [name for name, _ in _vibe_demoted])
         used_context_refs.extend(fallback_caught)
         inline_files.extend(fallback_inline)
         batch_files.extend(fallback_batch)

@@ -21,9 +21,12 @@ Design rules:
   • Concurrency caveat: a git working tree is shared, so two tasks in the SAME
     project must not run simultaneously. Different projects are independent.
 """
+import logging
 import os
 import re
 import subprocess
+
+_log = logging.getLogger(__name__)
 
 DEFAULT_BRANCH = 'main'
 GIT_TIMEOUT = 120  # seconds
@@ -319,8 +322,11 @@ def start_task_branch(project_path, task_id, title, project_name=''):
     dirty state onto it (so nothing is lost and the baseline is clean) →
     create/checkout task/<id>-<slug>.
 
-    Returns {'ok', 'active', 'branch', 'base', 'error'}.
-    'active' is True only when the task branch is checked out and ready.
+    Returns {'ok', 'active', 'branch', 'base', 'error'} — plus
+    'checkpoint_error' when the checkpoint commit of pre-existing dirty state
+    failed (e.g. a pre-commit hook rejection). The branch is still created and
+    'active' stays True — the uncommitted changes simply travel onto the task
+    branch where the run's own commit handles them.
     """
     setup = ensure_repo(project_path, project_name)
     if not setup.get('ok'):
@@ -336,12 +342,19 @@ def start_task_branch(project_path, task_id, title, project_name=''):
     _untrack_runtime_files(project_path)
 
     # Checkpoint pre-existing manual/uncommitted edits so the task baseline is clean.
+    checkpoint_error = ''
     if not is_clean(project_path):
         _run(project_path, 'add', '-A')
         # Tombstone gate: strip resurrected (deleted-then-re-added) files that
         # arrived between runs (bisync/bucket sync) before they land on base.
         gate_tombstones(project_path, scope='staged')
-        _run(project_path, 'commit', '-m', f'Checkpoint before task #{task_id}')
+        cp_ok, cp_out, cp_err = _run(project_path, 'commit', '-m', f'Checkpoint before task #{task_id}')
+        if not cp_ok:
+            # Surface, don't abort: a rejecting pre-commit hook leaves the tree
+            # dirty; the changes follow onto the task branch uncommitted.
+            checkpoint_error = 'git commit failed: ' + (cp_err or cp_out)
+            _log.warning('task #%s: %s — pre-existing changes travel onto the task branch',
+                         task_id, checkpoint_error)
 
     branch = branch_name(task_id, title)
     # Recreate the branch fresh if a stale one with this name exists.
@@ -352,14 +365,22 @@ def start_task_branch(project_path, task_id, title, project_name=''):
         _run(project_path, 'checkout', base)
         return {'ok': False, 'active': False, 'branch': branch, 'base': base, 'error': err}
 
-    return {'ok': True, 'active': True, 'branch': branch, 'base': base}
+    result = {'ok': True, 'active': True, 'branch': branch, 'base': base}
+    if checkpoint_error:
+        result['checkpoint_error'] = checkpoint_error
+    return result
 
 
 def commit_task(project_path, task_id, title):
     """
     Commit the AI's edits on the current task branch.
 
-    Returns {'ok', 'changed', 'commit', 'diffstat', 'branch', 'error'}.
+    Returns {'ok', 'changed', 'commit', 'diffstat', 'branch', 'error'} — plus
+    'branch_moved' when the run switched branches under us (see below).
+    When the commit itself fails (e.g. a pre-commit hook rejects), the result
+    carries 'diffstat' too (diffstat of the still-staged files at the moment of
+    the attempt — no commit exists) so callers can store it and keep the
+    deliverable links alive in the Exec Log.
     'changed' is False when the AI produced no tracked file changes (e.g. a
     text-only/research task) — that is the natural software-vs-generic boundary,
     and no commit is made.
@@ -407,11 +428,29 @@ def commit_task(project_path, task_id, title):
 
     ok, _, err = _run(project_path, 'commit', '-m', f'Task #{task_id}: {title}')
     if not ok:
-        return {'ok': False, 'changed': False, 'branch': branch, 'error': f'git commit failed: {err}'}
+        # The commit was rejected (pre-commit hook, identity missing, …) — the
+        # staged files still exist in the index. Capture their diffstat so the
+        # Exec Log can link the deliverables even though nothing was committed.
+        _, staged_diffstat, _ = _run(project_path, 'diff', _DIFFSTAT_FLAG, '--cached')
+        return {'ok': False, 'changed': False, 'branch': branch,
+                'error': f'git commit failed: {err}', 'diffstat': staged_diffstat}
 
     _, sha, _ = _run(project_path, 'rev-parse', '--short', 'HEAD')
-    _, diffstat, _ = _run(project_path, 'diff', _DIFFSTAT_FLAG, f'{base}...HEAD')
+    # The agentic CLI has shell access and can switch branches mid-run
+    # (`git checkout main`), so the commit above may land off the task branch.
+    # There HEAD == base, `{base}...HEAD` is empty and the Exec Log's "File"
+    # column goes blank (regression: exec 20001389, commit 54d6dc3 on main).
+    # Fall back to the commit we just made. 'branch' stays the branch captured
+    # at entry — that is the one callers merge/reject.
+    cur = current_branch(project_path)
+    branch_moved = cur if (cur and cur != branch) else ''
+    if branch_moved:
+        _, diffstat, _ = _run(project_path, 'diff', _DIFFSTAT_FLAG, 'HEAD~1..HEAD')
+    else:
+        _, diffstat, _ = _run(project_path, 'diff', _DIFFSTAT_FLAG, f'{base}...HEAD')
     result = {'ok': True, 'changed': True, 'commit': sha, 'diffstat': diffstat, 'branch': branch}
+    if branch_moved:
+        result['branch_moved'] = branch_moved
     if gate.get('trashed'):
         result['tombstone_note'] = gate.get('note', '')
     return result

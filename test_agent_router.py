@@ -1839,6 +1839,273 @@ class RouteExceptionMeteringTests(unittest.TestCase):
         spend.assert_not_called()
 
 
+class CliPauseResumeTests(unittest.TestCase):
+    """Item 16 Phase 3: the Vibe and Claude CLI routes pause at their turn
+    (and, for Claude, time) limit instead of ending the run. Claude resumes the
+    CLI's own session; Vibe has no headless resume, so it replays the task
+    prompt with a continuation block."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.proj = os.path.realpath(self.td.name)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    # ── Vibe ────────────────────────────────────────────────────────────────
+
+    def test_vibe_turn_limit_pauses_with_session_checkpoint(self):
+        usage = {'calls': agent_router.VIBE_MAX_TURNS, 'input': 120, 'output': 30,
+                 'cached': 0, 'last_has_text': False, 'sessions': ['sid-1']}
+
+        class _P(_FakePopen):
+            def __init__(inner, cmd, *a, **k):
+                super().__init__(returncode=0, stdout=json.dumps([
+                    {'role': 'assistant', 'content': 'Wrote the first table.'}]),
+                    stderr='')
+
+        with patch('shutil.which', return_value='/usr/bin/vibe'), \
+             patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'test-key'), \
+             patch.object(agent_router, '_vibe_session_usage', return_value=usage), \
+             patch.object(agent_router, '_vibe_journal_transcript',
+                          return_value=(['Splitting the deck.', '→ `bash` `ls`'], 4)), \
+             patch('subprocess.Popen', side_effect=_P):
+            with agent_router.pause_scope():
+                with self.assertRaises(agent_router.LimitReached) as cm:
+                    agent_router._call_vibe_cli('mistral-medium-latest', 'Translate the deck.',
+                                                project_path=self.proj)
+
+        exc = cm.exception
+        self.assertEqual(exc.reason, 'turns')
+        cp = exc.checkpoint
+        self.assertEqual(cp['cli_session'], {'kind': 'vibe', 'session_id': 'sid-1'})
+        self.assertEqual(cp['turns'], agent_router.VIBE_MAX_TURNS)
+        self.assertEqual(cp['status_text'], 'Wrote the first table.')
+        self.assertEqual(cp['transcript'], ['Splitting the deck.', '→ `bash` `ls`'])
+        # A CLI checkpoint is never resumed by the in-process tool loop.
+        self.assertEqual(cp['messages'], [])
+        # Paused segments are metered like the tool loop's.
+        self.assertEqual((exc.tokens_input, exc.tokens_output), (120, 30))
+
+    def test_vibe_turn_limit_without_a_session_keeps_the_marker(self):
+        # No identifiable session id -> not resumable -> today's behaviour.
+        usage = {'calls': agent_router.VIBE_MAX_TURNS, 'input': 120, 'output': 30,
+                 'cached': 0, 'last_has_text': False, 'sessions': []}
+
+        class _P(_FakePopen):
+            def __init__(inner, cmd, *a, **k):
+                super().__init__(returncode=0, stdout=json.dumps([
+                    {'role': 'assistant', 'content': 'Half done.'}]), stderr='')
+
+        with patch('shutil.which', return_value='/usr/bin/vibe'), \
+             patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'test-key'), \
+             patch.object(agent_router, '_vibe_session_usage', return_value=usage), \
+             patch('subprocess.Popen', side_effect=_P):
+            with agent_router.pause_scope():
+                text, _i, _o, _c = agent_router._call_vibe_cli(
+                    'mistral-medium-latest', 'Translate the deck.', project_path=self.proj)
+
+        self.assertIn(agent_router.VIBE_TURN_LIMIT_MARKER, text)
+
+    def test_vibe_resume_replays_the_task_with_the_previous_steps(self):
+        # The Vibe CLI rejects --resume together with --prompt (headless), so a
+        # continued block is a fresh session with the task prompt re-sent plus
+        # a continuation block: no --resume flag, no context to rely on.
+        checkpoint = {
+            'cli_session': {'kind': 'vibe', 'session_id': 'sid-1'},
+            'transcript': ['Wrote the first table.', '→ `bash` `ls`'],
+            'segments': 1, 'note': 'finish the table',
+        }
+        seen = {}
+
+        class _P(_FakePopen):
+            def __init__(inner, cmd, *a, **k):
+                seen['cmd'] = cmd
+                super().__init__(returncode=0, stdout=json.dumps([
+                    {'role': 'assistant', 'content': 'Done.'}]), stderr='')
+
+        usage = {'calls': 12, 'input': 140, 'output': 25, 'cached': 0,
+                 'last_has_text': True, 'sessions': ['sid-2']}
+
+        with patch('shutil.which', return_value='/usr/bin/vibe'), \
+             patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'test-key'), \
+             patch.object(agent_router, '_vibe_session_usage', return_value=usage), \
+             patch('subprocess.Popen', side_effect=_P):
+            with agent_router.pause_scope(resume=checkpoint):
+                text, tok_in, tok_out, _cost = agent_router._call_vibe_cli(
+                    'mistral-medium-latest', 'THE ORIGINAL TASK PROMPT', project_path=self.proj)
+
+        self.assertEqual(text, 'Done.')
+        cmd = seen['cmd']
+        self.assertNotIn('--resume', cmd)
+        prompt_arg = cmd[cmd.index('--prompt') + 1]
+        self.assertIn('THE ORIGINAL TASK PROMPT', prompt_arg)
+        self.assertIn('CONTINUATION — part 2', prompt_arg)
+        self.assertIn('Wrote the first table.', prompt_arg)
+        self.assertIn('Note from the user: finish the table', prompt_arg)
+        self.assertEqual((tok_in, tok_out), (140, 25))
+
+    def test_vibe_continuation_block_is_capped(self):
+        block = agent_router._vibe_continuation_block(
+            {'transcript': ['x' * 5000, 'LAST STEP'], 'segments': 2}, room=200)
+        self.assertIn('part 3', block)
+        self.assertIn('LAST STEP', block)
+        self.assertLess(len(block), 600)
+        self.assertIn('…', block)
+
+    def test_vibe_usage_reads_this_runs_journal(self):
+        sid = 'run-1'
+        d = os.path.join(self.proj, sid)
+        os.makedirs(os.path.join(d, 'journal'))
+        with open(os.path.join(d, 'meta.json'), 'w', encoding='utf-8') as f:
+            json.dump({'session_id': sid, 'start_time': '2026-01-01T00:00:00+00:00',
+                       'origin_directory': self.proj}, f)
+        rec = {'type': 'action_result', 'payload': {'result': {'result': {
+            'usage': {'input_tokens': 11, 'output_tokens': 7, 'cached_input_tokens': 3},
+            'finish_reason': 'tool_call',
+            'parts': [{'type': 'text', 'text': 'hi'}]}}}}
+        with open(os.path.join(d, 'journal', '0000000000000001.jsonl'), 'w',
+                  encoding='utf-8') as f:
+            f.write(json.dumps(rec) + '\n')
+
+        u = agent_router._vibe_session_usage(self.proj, 'hi', 0, 2_000_000_000, root=self.proj)
+        self.assertEqual((u['calls'], u['input'], u['output'], u['cached']), (1, 11, 7, 3))
+        self.assertFalse(u['last_has_text'])
+        self.assertEqual(u['sessions'], [sid])
+
+    # ── Claude ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _claude_popen(seen, payload, returncode=0):
+        class _P(_FakePopen):
+            def __init__(inner, cmd, *a, **k):
+                seen['cmd'] = cmd
+                super().__init__(returncode=returncode, stdout=json.dumps(payload),
+                                 stderr='')
+        return _P
+
+    def test_claude_task_run_pins_a_session_and_turn_cap(self):
+        seen = {}
+        payload = {'type': 'result', 'subtype': 'success', 'is_error': False,
+                   'result': 'Done.', 'usage': {'input_tokens': 5, 'output_tokens': 2}}
+        with patch('shutil.which', return_value='/usr/bin/claude'), \
+             patch('subprocess.Popen', side_effect=self._claude_popen(seen, payload)):
+            with agent_router.pause_scope():
+                text, _i, _o, _c = agent_router._call_claude_cli(
+                    'claude-sonnet-5-5', 'do it', project_path=self.proj)
+
+        self.assertEqual(text, 'Done.')
+        cmd = seen['cmd']
+        self.assertIn('--session-id', cmd)
+        self.assertEqual(cmd[cmd.index('--max-turns') + 1], str(agent_router.CLAUDE_MAX_TURNS))
+        self.assertNotIn('--no-session-persistence', cmd)
+        self.assertTrue(cmd[cmd.index('--session-id') + 1])
+
+    def test_claude_chat_run_keeps_no_session_persistence(self):
+        # Chats / H3 / guide / autopilot never set the scope: unchanged flags.
+        seen = {}
+        payload = {'type': 'result', 'subtype': 'success', 'is_error': False,
+                   'result': 'Hi.', 'usage': {'input_tokens': 1, 'output_tokens': 1}}
+        with patch('shutil.which', return_value='/usr/bin/claude'), \
+             patch('subprocess.Popen', side_effect=self._claude_popen(seen, payload)):
+            agent_router._call_claude_cli('claude-sonnet-5-5', 'hi', project_path=self.proj)
+
+        cmd = seen['cmd']
+        self.assertIn('--no-session-persistence', cmd)
+        self.assertNotIn('--session-id', cmd)
+        self.assertNotIn('--max-turns', cmd)
+
+    def _assert_claude_max_turns_pause(self, returncode):
+        seen = {}
+        # The real CLI marks a turn-limit stop as is_error and exits non-zero;
+        # both must pause instead of failing the run.
+        payload = {'type': 'result', 'subtype': 'error_max_turns', 'is_error': True,
+                   'result': 'Halfway through.', 'num_turns': 60,
+                   'usage': {'input_tokens': 40, 'output_tokens': 9}}
+        with patch('shutil.which', return_value='/usr/bin/claude'), \
+             patch('subprocess.Popen',
+                   side_effect=self._claude_popen(seen, payload, returncode)):
+            with agent_router.pause_scope():
+                with self.assertRaises(agent_router.LimitReached) as cm:
+                    agent_router._call_claude_cli('claude-sonnet-5-5', 'do it',
+                                                  project_path=self.proj)
+
+        exc = cm.exception
+        self.assertEqual(exc.reason, 'turns')
+        cp = exc.checkpoint
+        self.assertEqual(cp['cli_session']['kind'], 'claude')
+        self.assertEqual(cp['cli_session']['session_id'],
+                         seen['cmd'][seen['cmd'].index('--session-id') + 1])
+        self.assertEqual(cp['turns'], 60)
+        self.assertEqual(cp['status_text'], 'Halfway through.')
+        self.assertEqual((exc.tokens_input, exc.tokens_output), (40, 9))
+
+    def test_claude_max_turns_pauses_on_nonzero_exit(self):
+        self._assert_claude_max_turns_pause(returncode=1)
+
+    def test_claude_max_turns_pauses_on_zero_exit(self):
+        self._assert_claude_max_turns_pause(returncode=0)
+
+    def test_claude_error_outside_pause_scope_still_fails(self):
+        # Chats/H3 have no scope and no --max-turns: an error stays an error.
+        seen = {}
+        payload = {'type': 'result', 'subtype': 'success', 'is_error': True,
+                   'result': 'boom', 'num_turns': 1}
+        with patch('shutil.which', return_value='/usr/bin/claude'), \
+             patch('subprocess.Popen',
+                   side_effect=self._claude_popen(seen, payload, returncode=1)):
+            with self.assertRaisesRegex(RuntimeError, 'claude CLI error'):
+                agent_router._call_claude_cli('claude-sonnet-5-5', 'hi',
+                                              project_path=self.proj)
+
+    def test_claude_resume_sends_the_continue_note(self):
+        checkpoint = {
+            'cli_session': {'kind': 'claude',
+                            'session_id': '11111111-2222-3333-4444-555555555555'},
+            'transcript': ['part one'], 'segments': 1, 'note': 'keep going',
+        }
+        seen, sent = {}, {}
+        payload = {'type': 'result', 'subtype': 'success', 'is_error': False,
+                   'result': 'All done.', 'usage': {'input_tokens': 3, 'output_tokens': 4}}
+
+        class _P(_FakePopen):
+            def __init__(inner, cmd, *a, **k):
+                seen['cmd'] = cmd
+                super().__init__(returncode=0, stdout=json.dumps(payload), stderr='')
+
+            def communicate(inner, input=None, timeout=None):
+                sent['input'] = input
+                return inner._stdout, inner._stderr
+
+        with patch('shutil.which', return_value='/usr/bin/claude'), \
+             patch('subprocess.Popen', side_effect=_P):
+            with agent_router.pause_scope(resume=checkpoint):
+                text, _i, _o, _c = agent_router._call_claude_cli(
+                    'claude-sonnet-5-5', 'THE ORIGINAL TASK PROMPT', project_path=self.proj)
+
+        self.assertEqual(text, 'All done.')
+        cmd = seen['cmd']
+        self.assertEqual(cmd[cmd.index('--resume') + 1], checkpoint['cli_session']['session_id'])
+        self.assertNotIn('--session-id', cmd)
+        self.assertNotIn('--max-turns', cmd)
+        self.assertEqual(sent['input'], agent_router.continue_message('keep going'))
+
+    def test_claude_session_cleanup_only_for_claude(self):
+        import glob
+        projects = os.path.join(self.proj, '.claude', 'projects', '-tmp-proj')
+        os.makedirs(projects)
+        sid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        path = os.path.join(projects, f'{sid}.jsonl')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('{}\n')
+        with patch('os.path.expanduser', return_value=self.proj):
+            agent_router.cleanup_cli_session('vibe', sid)   # telemetry store: kept
+            self.assertTrue(os.path.exists(path))
+            agent_router.cleanup_cli_session('claude', sid)
+            self.assertFalse(os.path.exists(path))
+            self.assertFalse(glob.glob(os.path.join(projects, '*.jsonl')))
+
+
 if __name__ == '__main__':
     unittest.main()
 
@@ -2091,3 +2358,71 @@ class MistralApiTruncationTests(unittest.TestCase):
         self.assertEqual(text, 'complete answer')
         self.assertNotIn(agent_router.TRUNCATION_MARKER, text)
         self.assertEqual(complete.call_count, 1)
+
+
+class FitVibePromptTests(unittest.TestCase):
+    """Regression (RP-114-E1): the vibe prompt cap must never silently amputate
+    a task run's instructions. Tail truncation stays for chats/guides only."""
+
+    def test_small_prompt_is_unchanged(self):
+        prompt, truncated = agent_router._fit_vibe_prompt(
+            'a short prompt', caller='chat:1')
+        self.assertEqual(prompt, 'a short prompt')
+        self.assertFalse(truncated)
+
+    def test_chat_oversized_keeps_tail_with_header(self):
+        with patch.object(agent_router, 'VIBE_PROMPT_MAX_BYTES', 200):
+            prompt, truncated = agent_router._fit_vibe_prompt(
+                'A' * 500, caller='chat:1')
+        self.assertTrue(truncated)
+        self.assertTrue(prompt.startswith('## Context truncated'))
+        self.assertTrue(prompt.endswith('A' * 200))
+
+    def test_task_run_oversized_raises_with_sizes(self):
+        with patch.object(agent_router, 'VIBE_PROMPT_MAX_BYTES', 200):
+            with self.assertRaises(agent_router.VibePromptTooLargeError) as ctx:
+                agent_router._fit_vibe_prompt('B' * 500, caller='run_task:123')
+        msg = str(ctx.exception)
+        self.assertIn('500', msg)   # original prompt size
+        self.assertIn('200', msg)   # cap
+        self.assertIn('Scaleway/Ollama/Claude', msg)  # actionable remedy
+
+    def test_task_run_phase_suffix_also_raises(self):
+        with patch.object(agent_router, 'VIBE_PROMPT_MAX_BYTES', 10):
+            with self.assertRaises(agent_router.VibePromptTooLargeError):
+                agent_router._fit_vibe_prompt(
+                    'C' * 50, caller='run_task:123:deliverable-nudge')
+
+    def test_unknown_caller_still_truncates(self):
+        with patch.object(agent_router, 'VIBE_PROMPT_MAX_BYTES', 10):
+            prompt, truncated = agent_router._fit_vibe_prompt('D' * 50)
+        self.assertTrue(truncated)
+        self.assertTrue(prompt.startswith('## Context truncated'))
+
+    def test_call_mistral_forwards_caller_to_vibe_cli(self):
+        seen = {}
+
+        def _fake_vibe(model_id, prompt, max_tokens, *, project_path=None,
+                       exec_id=None, caller=''):
+            seen['caller'] = caller
+            return ('ok', 1, 1, 0.0)
+
+        with patch('shutil.which', return_value='/usr/bin/vibe'), \
+             patch.object(agent_router, '_call_vibe_cli', side_effect=_fake_vibe):
+            agent_router.call_mistral(
+                'mistral-large-latest', 'prompt', force_mistral_mode='vibe',
+                caller='run_task:123')
+        self.assertEqual(seen['caller'], 'run_task:123')
+
+    def test_route_forwards_caller_to_provider(self):
+        seen = []
+
+        def _fake(model_id, prompt, max_tokens, **kwargs):
+            seen.append(kwargs.get('caller'))
+            return ('ok', 1, 1, 0.0)
+
+        with patch.dict(agent_router.PROVIDER_DISPATCH, {'mistral': _fake}), \
+             patch.object(agent_router, '_enforce_eu_boundary'), \
+             patch('agent_quotas.resolve_owner_for_call', return_value=None):
+            agent_router.route('mistral-large-latest', 'prompt', caller='run_task:123')
+        self.assertEqual(seen, ['run_task:123'])

@@ -129,11 +129,14 @@ export interface Execution {
   git_commit?: string;
   git_branch?: string;
   git_merge_commit?: string;
+  /** Populated when the commit step failed (e.g. pre-commit hook rejected it) — work stays on disk, uncommitted. */
+  git_commit_error?: string;
   git_diffstat?: string;
   aingel_review?: string;
   project_id?: number;
   project_name?: string;
   task_title?: string;
+  phase_name?: string;
   task_ext_id?: string;
   error_message?: string;
   output_summary?: string;
