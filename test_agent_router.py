@@ -2140,7 +2140,11 @@ class GuideModeRouterTests(unittest.TestCase):
             seen['env'] = dict(k.get('env') or {})
             raise _StopCLI()
 
-        with patch.object(agent_router.subprocess, 'Popen', side_effect=fake_popen):
+        # The routers refuse to run when the CLI binary is absent (GitHub
+        # runners have neither claude nor vibe); the Popen fake below is what
+        # is actually exercised, so a throwaway path is enough.
+        with patch('shutil.which', return_value='/usr/bin/agent-cli'), \
+             patch.object(agent_router.subprocess, 'Popen', side_effect=fake_popen):
             with self.assertRaises(_StopCLI):
                 call()
         return seen
