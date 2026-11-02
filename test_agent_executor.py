@@ -1234,12 +1234,13 @@ class OrphanCliStopTests(unittest.TestCase):
         self.td.cleanup()
 
     def _spawn(self, name, cwd):
-        import shutil, subprocess
-        bindir = os.path.join(self.td.name, 'bin')
-        os.makedirs(bindir, exist_ok=True)
-        exe = os.path.join(bindir, name)
-        shutil.copy('/bin/sleep', exe)
-        p = subprocess.Popen([exe, '30'], cwd=cwd, start_new_session=True)
+        import subprocess, sys
+        # argv[0] carries the fake CLI name while the interpreter is this
+        # test's Python. Copying /bin/sleep under the CLI name used to work,
+        # but Ubuntu's multi-call coreutils refuses it ("unknown program").
+        p = subprocess.Popen([name, '-c', 'import time; time.sleep(30)'],
+                             executable=sys.executable, cwd=cwd,
+                             start_new_session=True)
         self.addCleanup(lambda: (p.kill(), p.wait()))
         # Wait until the child has exec'd: right after fork its cmdline is
         # still the test runner's, which the sweep rightly refuses to stop.
