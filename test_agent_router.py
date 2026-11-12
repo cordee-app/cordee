@@ -2892,10 +2892,13 @@ class ProviderHealthTests(unittest.TestCase):
         self._stack = ExitStack()
         self.mock_set_setting = self._stack.enter_context(
             patch('agent_db.set_app_setting'))
-        # Credentials are a property of the host, not of the logic under test:
-        # treat every provider as configured so only the degraded flag decides.
+        # Credentials and installed binaries are properties of the host, not of
+        # the logic under test: treat every provider as configured so only the
+        # degraded flag decides.
         self._stack.enter_context(
             patch('agent_config.has_real_secret', return_value=True))
+        self._stack.enter_context(
+            patch('shutil.which', return_value='/usr/bin/claude'))
         self.addCleanup(self._stack.close)
         self.addCleanup(agent_config.clear_provider_degraded, 'anthropic')
 
