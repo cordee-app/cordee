@@ -673,7 +673,7 @@ export const SettingsModal = () => {
                   <select data-tip="Set the chat & brief model" className={cn('w-full py-[7px] px-2.5 border border-default rounded text-base', roClass)} value={aingelModel} onChange={e => { setAingelModel(e.target.value); setDirty(); }} disabled={ro}>
                     <option value="">{euOnly ? '— Default (EU) —' : '— Default (Sonnet) —'}</option>
                     {aingelModelChoices.map(m => (
-                      <option key={m.id} value={m.id} disabled={isFreeUser && m.free_allowed === false}>{m.label}{isFreeUser && m.free_allowed === false ? ' (Upgrade)' : ''}</option>
+                      <option key={m.id} value={m.id} disabled={(isFreeUser && m.free_allowed === false) || m.available === false}>{m.label}{m.available === false ? ' (unavailable)' : (isFreeUser && m.free_allowed === false ? ' (Upgrade)' : '')}</option>
                     ))}
                   </select>
                 </div>

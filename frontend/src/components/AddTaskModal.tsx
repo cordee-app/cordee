@@ -1,9 +1,10 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import type { ReactElement } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 import { useStore } from '../store';
-import { api } from '../api';
+import { api, isTimeoutError } from '../api';
 import { cn } from '../utils/cn';
 import { fmtUsd } from '../utils/currency';
+import { computePayloadSpans, computeMentionSpans, computeUrlSpans } from '../utils/payloadSpans';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
 import { taskChip, taskChipById, isTaskCode } from '../utils/taskCode';
 import { addDependencyWithGate, confirmUnmetNative } from '../utils/deps';
@@ -45,6 +46,7 @@ export const AddTaskModal = () => {
   const projects = useStore((s) => s.projects);
   const activeProject = useStore((s) => s.activeProject);
   const models = useStore((s) => s.models);
+  const setModels = useStore((s) => s.setModels);
   const roles = useStore((s) => s.roles);
   const phasesData = useStore((s) => s.phasesData);
   const tasks = useStore((s) => s.tasks);
@@ -84,6 +86,7 @@ export const AddTaskModal = () => {
 
   const [improvedTextLocal, setImprovedTextLocal] = useState('');
   const [improveLoading, setImproveLoading] = useState(false);
+  const [restoring, setRestoring] = useState(false);
   const [editDescWasEmpty, setEditDescWasEmpty] = useState(false);
   // The user's own text before the first "Guide my prompt" was accepted —
   // saved as original_description so added steps can be traced.
@@ -122,6 +125,7 @@ export const AddTaskModal = () => {
   const [mentionIndex, setMentionIndex] = useState(0);
   const [mentionAt, setMentionAt] = useState(-1);
   const descRef = useRef<HTMLTextAreaElement>(null);
+  const highlightRef = useRef<HTMLPreElement>(null);
   const mentionCaretRef = useRef<number | null>(null);
 
   // RAG: per-task opt-in + corpus override (library is shared across projects).
@@ -196,7 +200,7 @@ export const AddTaskModal = () => {
       setTitle('');
       setDescription('');
       setEditDescWasEmpty(false);
-      const defaultModel = state.models.find((m) => m.default)?.id || state.models[0]?.id || 'claude-sonnet-5-5';
+      const defaultModel = state.models.find((m) => m.default && m.available !== false)?.id || state.models.find((m) => m.available !== false)?.id || state.models[0]?.id || 'claude-sonnet-5-5';
       setModel(defaultModel);
       setRoleId('');
       setPhase('');
@@ -223,6 +227,7 @@ export const AddTaskModal = () => {
 
     setImprovedTextLocal('');
     setImproveLoading(false);
+    setRestoring(false);
     setSuggestResults(null);
     setHfCandidates([]);
     setSuggestTaskType('');
@@ -263,6 +268,27 @@ export const AddTaskModal = () => {
       .catch(() => { if (!cancelled) setRagCorpora(null); });
     return () => { cancelled = true; };
   }, [isOpen]);
+
+  // Refresh the model list each time the modal opens so per-model availability
+  // is fresh (this also triggers the backend's recovery probe for degraded
+  // providers). The component stays mounted, so gate on isOpen.
+  useEffect(() => {
+    if (!isOpen) return;
+    api.models.list().then(setModels).catch(() => {});
+  }, [isOpen, setModels]);
+
+  // In create mode the default model is chosen before the refresh lands. If it
+  // turns out to be unavailable (e.g. Claude out of credit), move to the first
+  // available model instead of leaving a disabled option selected. Edit mode is
+  // left alone: the user's explicit choice stays visible with "(unavailable)".
+  useEffect(() => {
+    if (isEdit || !model) return;
+    const current = models.find((m) => m.id === model);
+    if (current && current.available === false) {
+      const first = models.find((m) => m.available !== false);
+      if (first) setModel(first.id);
+    }
+  }, [isEdit, models, model]);
 
   // Lane B: load file catalog for context_refs picker when project changes
   useEffect(() => {
@@ -328,7 +354,11 @@ export const AddTaskModal = () => {
       });
       setImprovedTextLocal(result.improved);
     } catch (e: unknown) {
-      alert('Error: ' + (e as Error).message);
+      if (isTimeoutError(e)) {
+        alert('The guide took too long to answer. Try again in a moment, or keep your own wording.');
+      } else {
+        alert('Error: ' + (e as Error).message);
+      }
     } finally {
       setImproveLoading(false);
     }
@@ -343,6 +373,24 @@ export const AddTaskModal = () => {
 
   const cancelImprove = () => {
     setImprovedTextLocal('');
+  };
+
+  // Swap the description back to the text saved before "Guide my prompt" was
+  // accepted. The backend refuses while the task is running / under review.
+  const handleRestoreOriginal = async () => {
+    if (modModalTaskId === null) return;
+    if (!window.confirm("Replace the current prompt with the original one saved before 'Guide my prompt'?")) return;
+    setRestoring(true);
+    try {
+      const r = await api.tasks.restoreOriginalPrompt(modModalTaskId);
+      setDescription(r.description);
+      setImprovedTextLocal('');
+      await refreshData();
+    } catch (e: unknown) {
+      alert('Error restoring prompt: ' + (e as Error).message);
+    } finally {
+      setRestoring(false);
+    }
   };
 
   const handleSuggestModel = async () => {
@@ -680,9 +728,23 @@ export const AddTaskModal = () => {
     const q = mentionQuery.toLowerCase();
     return catalogFiles
       .filter((f) => !f.hidden && f.category !== 'system')
-      .filter((f) => !q || f.rel.toLowerCase().includes(q) || f.name.toLowerCase().includes(q))
+      .filter(
+        (f) =>
+          !q ||
+          f.name.toLowerCase().startsWith(q) ||
+          f.name.toLowerCase().includes(q) ||
+          f.rel.toLowerCase().includes(q),
+      )
       .slice(0, 10);
   }, [catalogFiles, mentionQuery]);
+
+  // Live recognition mirroring the backend payload/mention extraction.
+  const { spans: payloadSpans, unpaired } = useMemo(() => computePayloadSpans(description), [description]);
+  const mentionSpans = useMemo(
+    () => computeMentionSpans(description, catalogFiles, payloadSpans),
+    [description, catalogFiles, payloadSpans],
+  );
+  const urlSpans = useMemo(() => computeUrlSpans(description, payloadSpans), [description, payloadSpans]);
 
   // After a mention is inserted, restore focus/caret to just after it.
   useEffect(() => {
@@ -758,19 +820,32 @@ export const AddTaskModal = () => {
   );
 
   const recomputeMention = (value: string, caret: number) => {
-    const m = value.slice(0, caret).match(/(^|\s)@([^\s@]*)$/);
-    if (!m) {
+    // A mention query may contain spaces (catalog names often do), so look for
+    // the LAST `@` at the start of the text or after whitespace, with no other
+    // `@` between it and the caret.
+    const before = value.slice(0, caret);
+    const at = before.lastIndexOf('@');
+    const startsMention =
+      at >= 0 && (at === 0 || /\s/.test(before[at - 1])) && !before.slice(at + 1).includes('@');
+    const query = startsMention ? before.slice(at + 1) : null;
+    const lower = (query ?? '').toLowerCase();
+    const matches =
+      query !== null &&
+      (query === '' ||
+        catalogFiles.some(
+          (f) => !f.hidden && f.category !== 'system' && f.name.toLowerCase().startsWith(lower),
+        ));
+    if (!matches) {
       setMentionOpen(false);
       setMentionQuery('');
       setMentionIndex(0);
       setMentionAt(-1);
       return;
     }
-    const query = m[2];
     setMentionOpen(true);
-    setMentionQuery(query);
+    setMentionQuery(query as string);
     setMentionIndex(0);
-    setMentionAt(caret - query.length - 1);
+    setMentionAt(at);
   };
 
   const selectMention = (file: FileEntry) => {
@@ -789,8 +864,77 @@ export const AddTaskModal = () => {
     setMentionAt(-1);
   };
 
+  // Overlay segments: payloads win over everything (mentions and URLs inside
+  // payloads are already excluded by their scanners); unpaired markers win
+  // over mentions/URLs at the same offset.
+  type HighlightSeg = { start: number; end: number; kind: 'payload' | 'marker' | 'url' | 'file' | 'file-unknown' };
+  const segRank: Record<HighlightSeg['kind'], number> = {
+    payload: 0,
+    url: 1,
+    marker: 2,
+    file: 3,
+    'file-unknown': 3,
+  };
+  const segClass: Record<HighlightSeg['kind'], string> = {
+    payload: 'hl-payload',
+    url: 'hl-url',
+    marker: 'hl-marker-unpaired',
+    file: 'hl-file',
+    'file-unknown': 'hl-file-unknown',
+  };
+  const segs: HighlightSeg[] = [
+    ...payloadSpans.map((s) => ({ start: s.start, end: s.end, kind: 'payload' as const })),
+    ...unpaired.map((start) => ({ start, end: start + 3, kind: 'marker' as const })),
+    ...urlSpans.map((s) => ({ start: s.start, end: s.end, kind: 'url' as const })),
+    ...mentionSpans.map((m) => ({
+      start: m.start,
+      end: m.end,
+      kind: m.known ? ('file' as const) : ('file-unknown' as const),
+    })),
+  ].sort((a, b) => a.start - b.start || segRank[a.kind] - segRank[b.kind]);
+  const highlightNodes: ReactNode[] = [];
+  {
+    let pos = 0;
+    for (const seg of segs) {
+      if (seg.start < pos) continue; // overlapping lower-priority segment
+      if (seg.start > pos) highlightNodes.push(description.slice(pos, seg.start));
+      highlightNodes.push(
+        <span key={`${seg.kind}-${seg.start}`} className={segClass[seg.kind]}>
+          {description.slice(seg.start, seg.end)}
+        </span>,
+      );
+      pos = seg.end;
+    }
+    if (pos < description.length) highlightNodes.push(description.slice(pos));
+  }
+
+  const knownMentionCount = mentionSpans.filter((m) => m.known).length;
+  const unknownMentionCount = mentionSpans.length - knownMentionCount;
+  const highlightParts: string[] = [];
+  if (payloadSpans.length > 0) {
+    highlightParts.push(`${payloadSpans.length} verbatim block${payloadSpans.length === 1 ? '' : 's'}`);
+  }
+  if (knownMentionCount > 0) {
+    highlightParts.push(`${knownMentionCount} file${knownMentionCount === 1 ? '' : 's'}`);
+  }
+  if (unknownMentionCount > 0) {
+    highlightParts.push(`${unknownMentionCount} unknown`);
+  }
+  if (urlSpans.length > 0) {
+    highlightParts.push(`${urlSpans.length} link${urlSpans.length === 1 ? '' : 's'}`);
+  }
+
   return (
-    <div className="modal-backdrop fixed inset-0 bg-black/40 dark:bg-black/75 flex items-center justify-center z-modal" onClick={(e) => { if (e.target === e.currentTarget) closeModal(); }}>
+    <div
+      className="modal-backdrop fixed inset-0 bg-black/40 dark:bg-black/75 flex items-center justify-center z-modal"
+      onClick={(e) => {
+        if (e.target !== e.currentTarget) return;
+        if (isSubmitting) return;
+        const hasDraft = title.trim() !== '' || description.trim() !== '';
+        if (hasDraft && !window.confirm('Discard this unsaved task? Your draft will be lost.')) return;
+        closeModal();
+      }}
+    >
       <div
         className="modal-content bg-surface-raised dark:bg-surface-dark-raised rounded-lg p-6 min-w-[420px] max-w-[90vw] max-h-[85vh] overflow-y-auto shadow-strong"
         style={{ minWidth: 520, maxHeight: '90vh' }}
@@ -842,8 +986,28 @@ export const AddTaskModal = () => {
         {/* Description */}
         <div className="form-group mb-3">
           <div className="flex justify-between items-center mb-1.5">
-            <label className="block text-sm font-semibold text-text-soft mb-[3px] m-0">Prompt / Description</label>
+            <div className="flex items-center gap-2">
+              <label className="block text-sm font-semibold text-text-soft mb-[3px] m-0">Prompt / Description</label>
+              {(payloadSpans.length + mentionSpans.length + urlSpans.length > 0) && (
+                <span
+                  className="text-xs text-text-faint"
+                  data-tip="Text between ''' … ''' is sent verbatim; @file mentions are injected as file content; links are fetched from the web (routes without web access are held)"
+                >
+                  {highlightParts.join(' · ')}
+                </span>
+              )}
+            </div>
             <div className="flex gap-1.5">
+              {isEdit && perms.canEdit && task?.original_description && task.original_description !== task.description && task.status !== 'running' && (
+                <button
+                  data-tip="Replace the description with the version saved before 'Guide my prompt'"
+                  className="btn px-3 py-1 border border-default rounded cursor-pointer text-md-"
+                  onClick={handleRestoreOriginal}
+                  disabled={restoring}
+                >
+                  {restoring ? 'Restoring…' : 'Restore original'}
+                </button>
+              )}
               {perms.canEdit && (
                 <div className="header-btn header-btn-primary overflow-hidden" style={{ padding: 0, gap: 0 }}>
                   <button
@@ -869,15 +1033,26 @@ export const AddTaskModal = () => {
             </div>
           </div>
           <div className="relative">
+            <pre ref={highlightRef} aria-hidden="true" className="desc-highlight-layer">
+              {highlightNodes}
+              {description.endsWith('\n') ? '\u200b' : null}
+            </pre>
             <textarea
               ref={descRef}
               data-tip="Describe what this task should do"
-              className="w-full py-[7px] px-2.5 border border-default rounded text-base"
+              className="w-full py-[7px] px-2.5 border border-default rounded text-base desc-input"
               value={description}
               onChange={(e) => {
                 const value = e.target.value.slice(0, DESC_LIMIT);
                 setDescription(value);
                 recomputeMention(value, e.target.selectionStart ?? value.length);
+              }}
+              onScroll={(e) => {
+                const el = highlightRef.current;
+                if (el) {
+                  el.scrollTop = e.currentTarget.scrollTop;
+                  el.scrollLeft = e.currentTarget.scrollLeft;
+                }
               }}
               onKeyDown={(e) => {
                 if (!mentionOpen || mentionCandidates.length === 0) return;
@@ -1038,17 +1213,17 @@ export const AddTaskModal = () => {
                 const out: ReactElement[] = [];
                 if (dedicated.length) {
                   out.push(<optgroup key="ded" label="Dedicated (this project)">
-                    {dedicated.map((m) => <option key={m.id} value={m.id} disabled={isFreeUser && m.free_allowed === false}>{m.label} (GPU){isFreeUser && m.free_allowed === false ? ' (Upgrade)' : ''}</option>)}
+                    {dedicated.map((m) => <option key={m.id} value={m.id} disabled={(isFreeUser && m.free_allowed === false) || m.available === false}>{m.label} (GPU){m.available === false ? ' (unavailable)' : (isFreeUser && m.free_allowed === false ? ' (Upgrade)' : '')}</option>)}
                   </optgroup>);
                 }
                 if (serverless.length) {
                   out.push(<optgroup key="sl" label="Serverless EU">
-                    {serverless.map((m) => <option key={m.id} value={m.id} disabled={isFreeUser && m.free_allowed === false}>{m.label}{isFreeUser && m.free_allowed === false ? ' (Upgrade)' : ''}</option>)}
+                    {serverless.map((m) => <option key={m.id} value={m.id} disabled={(isFreeUser && m.free_allowed === false) || m.available === false}>{m.label}{m.available === false ? ' (unavailable)' : (isFreeUser && m.free_allowed === false ? ' (Upgrade)' : '')}</option>)}
                   </optgroup>);
                 }
                 if (rest.length) {
                   out.push(<optgroup key="rest" label="Models">
-                    {rest.map((m) => <option key={m.id} value={m.id} disabled={isFreeUser && m.free_allowed === false}>{m.label}{isFreeUser && m.free_allowed === false ? ' (Upgrade)' : ''}</option>)}
+                    {rest.map((m) => <option key={m.id} value={m.id} disabled={(isFreeUser && m.free_allowed === false) || m.available === false}>{m.label}{m.available === false ? ' (unavailable)' : (isFreeUser && m.free_allowed === false ? ' (Upgrade)' : '')}</option>)}
                   </optgroup>);
                 }
                 return out;

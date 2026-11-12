@@ -174,7 +174,7 @@ const FilesBadge = ({ exec }: { exec: Execution }) => {
 };
 
 export const ExecutionLog = () => {
-  const { executions, setExecutions, activeProject, tasks } = useStore();
+  const { executions, setExecutions, activeProject, tasks, selectedTaskId, setSelectedTaskId } = useStore();
   const isMobile = useIsMobile();
   const perms = useProjectPermissions(activeProject);
   const user = useStore((s) => s.user);
@@ -237,6 +237,23 @@ export const ExecutionLog = () => {
       setExecutions(list);
     } catch { /* ignore */ }
   }, [setExecutions]);
+
+  // Task-scoped executions: the global store list is capped at the last 100
+  // runs across all projects, so a selected task's older runs must be fetched
+  // on demand (the log then shows that task's executions only).
+  const [taskExecs, setTaskExecs] = useState<{ taskId: number; list: Execution[] } | null>(null);
+  useEffect(() => {
+    if (selectedTaskId == null) {
+      setTaskExecs(null);
+      return;
+    }
+    let cancelled = false;
+    api.executions
+      .list(100, selectedTaskId)
+      .then((list) => { if (!cancelled) setTaskExecs({ taskId: selectedTaskId, list }); })
+      .catch(() => { if (!cancelled) setTaskExecs(null); });
+    return () => { cancelled = true; };
+  }, [selectedTaskId]);
 
   // Max 300px (was effectively 200px via CSS) — 50% more headroom on top.
   const clampedHeight = Math.min(Math.max(height, 100), 300);
@@ -305,7 +322,17 @@ export const ExecutionLog = () => {
   }, []);
 
   const instructionFilter = instructionQuery.trim().toLowerCase();
-  const filtered = executions.filter((e) => {
+  // When a task is selected the log shows only its executions. Until the
+  // task-scoped fetch lands, narrow the already-loaded global list so the
+  // switch is instant; once it lands that list wins (it also covers runs older
+  // than the global 100-row window). A list fetched for a previous selection is
+  // ignored via the taskId check.
+  const taskScoped = selectedTaskId != null && taskExecs?.taskId === selectedTaskId
+    ? taskExecs.list
+    : null;
+  const source = selectedTaskId != null ? (taskScoped ?? executions) : executions;
+  const filtered = source.filter((e) => {
+    if (selectedTaskId != null && e.task_id !== selectedTaskId) return false;
     if (activeProject && e.project_id !== activeProject) return false;
     if (instructionFilter) {
       const text = (e.instructions || e.task_title || '').toLowerCase();
@@ -313,6 +340,8 @@ export const ExecutionLog = () => {
     }
     return true;
   });
+  const selectedTask = selectedTaskId != null ? tasks.find((t) => t.id === selectedTaskId) : undefined;
+  const selectedTaskLabel = selectedTaskId != null ? taskChip(selectedTask ?? { id: selectedTaskId }) : '';
 
   const handleApprove = async (execId: number, level: MemoryLevel) => {
     try {
@@ -390,8 +419,11 @@ export const ExecutionLog = () => {
     }
   };
 
-  const pausedLabel = (e: Execution) =>
-    `${e.pause_reason === 'time' ? 'time' : 'turn'} limit${(e.segments || 1) > 1 ? ` · part ${e.segments}` : ''}`;
+  const pausedLabel = (e: Execution) => {
+    // 'provider_error' = the provider hard-failed mid-run → its provider limit.
+    const limit = e.pause_reason === 'provider_error' ? 'provider' : e.pause_reason === 'time' ? 'time' : 'turn';
+    return `${limit} limit${(e.segments || 1) > 1 ? ` · part ${e.segments}` : ''}`;
+  };
 
   const [reportExecId, setReportExecId] = useState<number | null>(null);
 
@@ -502,7 +534,24 @@ export const ExecutionLog = () => {
               <tr>
                 <th className={thBase} style={{ width: colWidths[0] || DEFAULT_COL_WIDTHS[0] }}>Time<div onMouseDown={(e) => handleColResizeStart(e, 0)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
                 <th className={cn(thBase, 'text-center')} style={{ width: colWidths[1] || DEFAULT_COL_WIDTHS[1] }}>Chat<div onMouseDown={(e) => handleColResizeStart(e, 1)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
-                <th className={thBase} style={{ width: colWidths[2] || DEFAULT_COL_WIDTHS[2] }}>Task<div onMouseDown={(e) => handleColResizeStart(e, 2)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
+                <th className={thBase} style={{ width: colWidths[2] || DEFAULT_COL_WIDTHS[2] }}>
+                  {selectedTaskId != null ? (
+                    <span className="inline-flex items-center gap-1 max-w-full min-w-0">
+                      <span className="truncate text-accent-deep dark:text-accent-dark" title="Executions filtered to this task">{selectedTaskLabel}</span>
+                      <button
+                        type="button"
+                        aria-label="Clear the task filter"
+                        title="Show executions from all tasks"
+                        onClick={() => setSelectedTaskId(null)}
+                        className="leading-none shrink-0 text-faint hover:text-ink dark:hover:text-text-dark-DEFAULT"
+                        style={{ background: 'transparent', border: 0, padding: 0, cursor: 'pointer' }}
+                      >
+                        &times;
+                      </button>
+                    </span>
+                  ) : 'Task'}
+                  <div onMouseDown={(e) => handleColResizeStart(e, 2)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" />
+                </th>
                 <th className={thBase} style={{ width: colWidths[3] || DEFAULT_COL_WIDTHS[3] }}>Phase<div onMouseDown={(e) => handleColResizeStart(e, 3)} className="absolute right-0 top-0 bottom-0 w-[5px] cursor-col-resize bg-transparent" /></th>
                 <th className={thBase} style={{ width: colWidths[4] || DEFAULT_COL_WIDTHS[4] }}>
                   <div className="relative flex items-center">
@@ -540,7 +589,9 @@ export const ExecutionLog = () => {
               {!filtered.length ? (
                 <tr>
                   <td colSpan={10} className="text-center p-3.5 text-faint">
-                    No executions yet — confirm a task and run it.
+                    {selectedTaskId != null
+                      ? `No executions for ${selectedTaskLabel} yet — run it to generate output files.`
+                      : 'No executions yet — confirm a task and run it.'}
                   </td>
                 </tr>
               ) : (
@@ -846,8 +897,27 @@ export const ExecutionLog = () => {
 
         {isMobile && (
           <div className="log-cards flex flex-col gap-2 p-2">
+            {selectedTaskId != null && (
+              <div className="flex items-center gap-1 text-xs text-accent-deep dark:text-accent-dark">
+                <span>Showing executions of {selectedTaskLabel}</span>
+                <button
+                  type="button"
+                  aria-label="Clear the task filter"
+                  title="Show executions from all tasks"
+                  onClick={() => setSelectedTaskId(null)}
+                  className="leading-none text-faint hover:text-ink dark:hover:text-text-dark-DEFAULT"
+                  style={{ background: 'transparent', border: 0, padding: 0, cursor: 'pointer' }}
+                >
+                  &times;
+                </button>
+              </div>
+            )}
             {!filtered.length ? (
-              <div className="text-center p-3.5 text-faint">No executions yet — confirm a task and run it.</div>
+              <div className="text-center p-3.5 text-faint">
+                {selectedTaskId != null
+                  ? `No executions for ${selectedTaskLabel} yet — run it to generate output files.`
+                  : 'No executions yet — confirm a task and run it.'}
+              </div>
             ) : (
               filtered.map((e) => {
                 const st = statusStyle(e.status, e.memory_status);

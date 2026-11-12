@@ -429,7 +429,7 @@ class SimulationGapRegressionTests(unittest.TestCase):
         self._patches = [
             patch.object(agent_config, 'MISTRAL_MODE', 'vibe'),
             patch.object(agent_config, 'VIBE_MODELS',
-                         ['mistral-large-latest', 'mistral-glm-5-3']),
+                         ['mistral-large-4', 'mistral-glm-5-3']),
             # The Vibe CLI is not installed on CI runners; pretend it is.
             patch('shutil.which', return_value='/usr/local/bin/vibe'),
         ]
@@ -450,8 +450,15 @@ class SimulationGapRegressionTests(unittest.TestCase):
         self.assertTrue(agent_executor._task_uses_direct_text_route(task))
 
     def test_mistral_large_in_allowlist_is_agentic(self):
-        task = {'model': 'mistral-large-latest', 'work_session_slot': None}
+        task = {'model': 'mistral-large-4', 'work_session_slot': None}
         self.assertFalse(agent_executor._task_uses_direct_text_route(task))
+
+    def test_retired_large3_outside_allowlist_is_text_only(self):
+        # Large 3 and Medium 3.5 were retired from MODELS on 2026-11-10 (task
+        # rows migrated to mistral-large-4). A stale row naming one still
+        # routes, but via the API fallback — so it must not advertise tools.
+        task = {'model': 'mistral-large-latest', 'work_session_slot': None}
+        self.assertTrue(agent_executor._task_uses_direct_text_route(task))
 
     def test_scaleway_tool_model_is_agentic(self):
         task = {'model': 'scw-qwen3.6-35b', 'work_session_slot': None}
@@ -483,6 +490,16 @@ class SimulationGapRegressionTests(unittest.TestCase):
             {'title': 'Save results.csv', 'description': ''}))
         self.assertTrue(agent_executor._task_requests_file_creation(
             {'title': 'Export data', 'description': 'save as results.csv'}))
+
+    def test_outputs_path_component_is_not_creation_intent(self):
+        # Regression: exec 20001443 (task 10001301) — 'Artifacts/outputs/<id>/'
+        # in a resume note read as the verb 'outputs', flipping the auto-switch
+        # heuristic on a read-only task.
+        task = {'title': 'Resume the extraction',
+                'description': ('Resume from `Artifacts/outputs/10001301-…/_work/` — '
+                                '`contract_full.txt` and `extract.py` already contain '
+                                'the extracted contract. Read them and answer here.')}
+        self.assertFalse(agent_executor._task_requests_file_creation(task))
 
     # ── Fix C: detector knows the emitted dialect ──────────────────────────
     def test_pseudo_json_bash_block_detected(self):
@@ -670,6 +687,21 @@ class ChatAutoreplyContainmentTests(unittest.TestCase):
         self.assertEqual(self._chat_execution_count(), 1)
         self.assertIn('hello', self._chat_file_content())
         self.assertIn('reply', self._chat_file_content())
+
+    def test_guide_chat_ignores_a_stale_chat_row_model(self):
+        # 2026-11-10: the SuperAgent Guide chat row still carried
+        # claude-sonnet-4-6 while the project setting said
+        # mistral-glm-5-3-flash — the turn went to the claude CLI and failed
+        # on a workspace the CLI does not trust. The project setting must win,
+        # even when an older UI sends the stale id in the request body.
+        agent_db.update_chat(self.chat_id, model='claude-sonnet-4-6')
+        with patch.object(agent_executor, 'route',
+                          return_value=('reply', 10, 5, 0.0)) as r, \
+             patch.object(agent_executor, '_chat_tools_enabled', return_value=False), \
+             patch.object(agent_executor, '_start_heartbeat', return_value=lambda: None):
+            agent_executor.chat_reply(self.chat_id, 'hello',
+                                      model='claude-sonnet-4-6')
+        self.assertEqual(r.call_args.args[0], 'mistral-medium-latest')
 
     # ── the H3 notification honors the mode ────────────────────────────────
     def _h3_with_mode(self, settings):
@@ -987,6 +1019,40 @@ class PauseAtLimitTests(unittest.TestCase):
         self.assertIn('🔔 Notice', notice)
         self.assertIn('paused at its turn limit', notice)
         self.assertIn('Done 1-4, left 5-8.', notice)
+
+    def test_provider_error_pauses_like_a_limit(self):
+        """A provider hard-failure mid-run (LimitReached('provider_error'), e.g.
+        a ReadTimeout on an oversized request — RP-140) pauses the run like a
+        limit does: rows keep the reason verbatim, the report facts say
+        'provider', and the notice explains it."""
+        cp = self._cp()
+        cp.update({'reason': 'provider_error', 'status_text': '',
+                   'segment_tokens_input': 900, 'segment_tokens_output': 90,
+                   'model_id': 'scw-qwen3.6-35b', 'max_turns': 60})
+
+        def fake_route(model, prompt, *a, **k):
+            if not str(k.get('caller', '')).startswith('run_task'):
+                return ('brief', 0, 0, 0.0)
+            e = agent_router.LimitReached('provider_error', cp)
+            e.tokens_input, e.tokens_output = 1000, 100
+            raise e
+
+        built = {'mode': 'inline', 'prompt': 'do it', 'max_tokens': 1000}
+        with patch('agent_scw_session.sync_bucket_to_working_docs', return_value=None), \
+             patch('prompt_builder.build', return_value=built), \
+             patch.object(agent_executor, 'route', side_effect=fake_route):
+            res = agent_executor.run_task(self.task_id)
+        self.assertEqual(res['status'], 'paused', res)
+        self.assertEqual(res['pause_reason'], 'provider_error')
+        row = agent_db.get_execution(res['exec_id'], project_path=self.path)
+        self.assertEqual((row['status'], row['pause_reason']), ('paused', 'provider_error'))
+        report = json.loads(row['pause_report_json'])
+        self.assertEqual(report['facts']['limit'], 'provider')
+        chat = agent_db.get_chat(self.guide['id'])
+        with open(chat['file_path']) as f:
+            notice = f.read()
+        self.assertIn('paused after a provider failure', notice)
+        self.assertIn('You can Continue from where it stopped', notice)
 
     def test_continue_resumes_same_row_and_branch(self):
         eid = self._pause()

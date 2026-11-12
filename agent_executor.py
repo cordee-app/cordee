@@ -1302,10 +1302,13 @@ _ARTIFACT_EXTS = (
     r'pptx?|log|py|js|ts|sh|sql|ini|toml|cfg|conf|rtf|tex'
 )
 _CREATION_INTENT_RE = _re.compile(
-    rf'\b(?:{_CREATION_VERBS})\b[^.\n]{{0,60}}?'
+    rf'(?<!/)\b(?:{_CREATION_VERBS})\b(?![/\\])[^.\n]{{0,60}}?'
     rf'(?:\b(?:{_ARTIFACT_NOUNS})\b|\.(?:{_ARTIFACT_EXTS})\b)',
     _re.I | _re.S,
 )
+# Same path guard as the overseer's _OUTPUT_VERB_RE: 'Artifacts/outputs/<id>/…'
+# must not read as the verb 'outputs' (a resume note naming a pre-existing
+# .txt must not flip the auto-switch heuristic to a tool-capable model).
 # Imperative one-liners with no explicit noun ("Write it to disk", "Save as
 # notes.md") — the second alternative catches a bare "save to <name>.<ext>".
 _CREATION_INTENT_AUX_RE = _re.compile(
@@ -1462,7 +1465,7 @@ Phase memory excerpt:
 """
 
         text, tok_in, tok_out, cost = route(
-            'mistral-medium-latest',
+            'mistral-glm-5-3-flash',
             prompt,
             HANDOFF_MAX_TOKENS,
             project_path=next_project_path,
@@ -2549,6 +2552,206 @@ def _pausable_route(model_id, force_anthropic_mode=None, force_mistral_mode=None
     return False
 
 
+# ── Verified-impossibility pre-flight: what the route can actually do ────────
+# Task 10001296 (RP-129-E1) failed because the prompt auto-catch matched the
+# wrong files, one oversized file forced mode='batch' (a toolless
+# chunk-and-aggregate API call: no file tools, no web), and the description
+# cited a URL plus two source folders that contributed ZERO caught files. The
+# H2 Guide was never told the route and returned gate='run' — correctly, but
+# blindly. These facts feed the deterministic guards and the reviewer prompts.
+_MISTRAL_PREFIXES = ('mistral-', 'open-mistral', 'codestral-', 'devstral-')
+_ANTHROPIC_PREFIXES = ('claude-',)
+# Explicit folder citations only ("folder 'Example Client'", "directory “x”").
+_FOLDER_CITATION_RE = _re.compile(
+    r'(?:folder|directory|dir)\s*["\u201c\']([^"\u201d\']{2,60})["\u201d\']',
+    _re.I)
+_URL_RE = _re.compile(r'https?://[^\s<>"\')\]]+', _re.I)
+# NOTE: frontend/src/utils/payloadSpans.ts `computeUrlSpans` mirrors this
+# pattern for the live editor highlighting — keep both sides in lockstep.
+
+
+def _task_route_facts(task, mode):
+    """What the dispatched route can actually do, for guards and reviewer prompts.
+
+    Returns {'mode': 'batch'|'inline', 'route': str, 'file_tools': bool,
+             'web': bool, 'description': str}. Never raises.
+    """
+    task = task or {}
+    description = task.get('description') or ''
+    try:
+        model_id = (task.get('model') or '').strip()
+        slot = task.get('work_session_slot')
+        mode = 'batch' if mode == 'batch' else 'inline'
+        facts = {'mode': mode, 'route': '', 'file_tools': False,
+                 'web': False, 'image_inputs': False,
+                 'description': description}
+        # Batch forces force_mistral_mode='api' and passes project_path=None:
+        # no tools at all, whatever the model.
+        if mode == 'batch':
+            facts['route'] = 'batch (toolless chunk-and-aggregate)'
+            return facts
+        # Forced modes mirror run_task's Kanban column → provider mode mapping.
+        force_anthropic = 'claude-code' if slot in (1, 3) else None
+        force_mistral = 'vibe' if slot in (2, 3) else None
+        provider = (MODELS.get(model_id) or {}).get('provider') or ''
+        if not provider:
+            if model_id.startswith(_MISTRAL_PREFIXES):
+                provider = 'mistral'
+            elif model_id.startswith(_ANTHROPIC_PREFIXES):
+                provider = 'anthropic'
+        if provider == 'mistral':
+            from agent_config import VIBE_MODELS
+            effective = force_mistral or agent_config.MISTRAL_MODE
+            if effective == 'vibe' and model_id in VIBE_MODELS:
+                facts['route'] = 'vibe CLI (file tools + web)'
+                facts['file_tools'] = True
+                facts['web'] = True
+            else:
+                facts['route'] = 'Mistral API (text-only)'
+                # Web only when the project's network permission allows it —
+                # the same check run_task makes before route(..., web_search=).
+                web = False
+                try:
+                    pid = task.get('project_id')
+                    if pid:
+                        perms = db.get_project_permissions(pid) or {}
+                        for item in (perms.get('F_network') or []):
+                            if item.get('enabled'):
+                                web = True
+                                break
+                except Exception:
+                    web = False
+                facts['web'] = web
+        elif provider == 'anthropic':
+            if force_anthropic == 'claude-code':
+                facts['route'] = 'claude CLI (file tools + web)'
+                facts['file_tools'] = True
+                facts['web'] = True
+            else:
+                facts['route'] = 'Anthropic API (text-only)'
+        elif provider:
+            # Scaleway / Ollama / OpenAI tool loops: in-process tool calling,
+            # including web_fetch from agent_tools' catalog.
+            facts['route'] = f'{provider} tool loop (file tools + web)'
+            facts['file_tools'] = True
+            facts['web'] = True
+        else:
+            # No model id / unknown provider: we cannot prove the route has
+            # tools, so report the conservative answer. The guards are
+            # fail-open by design (a guard bug must never block a run), and a
+            # false "no web" here would block a legitimate run — so the
+            # unknown case is reported as text-only for the PROMPT (accurate:
+            # nothing is known) while `_preflight_guards` skips the
+            # impossibility holds for it (see `known_route`).
+            facts['route'] = 'unknown route (assumed text-only)'
+            facts['known_route'] = False
+        # Image delivery is route-specific, not just a vision cap: the Mistral
+        # route (Vibe's read_file returns bytes; the API fallback has no
+        # tools) and batch runs cannot hand the model a photo. Fail-open for
+        # anything else so a working route keeps its "view it" promise
+        # (regression: CTIH task 10001302, execs 20001465/20001466).
+        try:
+            from model_caps import route_delivers_images
+            facts['image_inputs'] = route_delivers_images(model_id, slot, mode)
+        except Exception:
+            facts['image_inputs'] = True
+        return facts
+    except Exception as _rf_err:
+        _log.warning('[preflight] route facts failed: %s', _rf_err)
+        return {'mode': 'batch' if mode == 'batch' else 'inline',
+                'route': 'unknown route (assumed text-only)',
+                'file_tools': False, 'web': False, 'image_inputs': True,
+                'description': description}
+
+
+def _preflight_guards(task, proj, project_path, mode, caught_files):
+    """Deterministic verified-impossibility guards for a run about to dispatch.
+
+    Returns ``(holds, warnings)``: lists of ``{'code', 'message'}``. A hold is
+    an impossibility the route cannot work around (no web access for a cited
+    URL, no file tools for a cited folder) and blocks regardless of
+    advisory/strict mode; a warning rides along in the H2 report. FAIL-OPEN:
+    any error returns ``([], [])`` — a guard bug must never block a run.
+    """
+    try:
+        task = task or {}
+        if task.get('source') == 'cron' or str(task.get('title') or '').startswith('[CRON]'):
+            return [], []   # CRON tasks are advisory by spec
+        facts = _task_route_facts(task, mode)
+        desc = facts.get('description') or ''
+        route = facts.get('route') or 'this route'
+        holds, warnings = [], []
+        # Fail-open: if the route could not be classified (no model id, unknown
+        # provider) we cannot prove an impossibility, so only the advisory
+        # warning below may fire. A hold on a guess would block good runs —
+        # exactly the over-holding regression (#10001148) this must avoid.
+        _known_route = facts.get('known_route', True)
+
+        # G1 — a URL needs web access.
+        if _known_route and facts.get('web') is False:
+            m = _URL_RE.search(desc)
+            if m:
+                url = m.group(0)[:80]
+                holds.append({'code': 'web', 'message': (
+                    f"The description asks to read a web page ({url}) but this run's "
+                    f"route ({route}) has no web access. Every web-sourced fact would be "
+                    "unavailable. Use an agentic route (Claude/Mistral vibe or a "
+                    "tool-loop model) or remove the URL.")})
+
+        # G2 — a cited folder needs file tools (and must actually be caught).
+        if _known_route and facts.get('file_tools') is False:
+            try:
+                from agent_tools import _WORKING_DOC_FOLDERS
+            except Exception:
+                _WORKING_DOC_FOLDERS = ('My Docs', 'Working Docs', 'Working Documents',
+                                        'working-docs', 'docs')
+            caught = [str(c).replace(os.sep, '/') for c in (caught_files or [])]
+            seen = set()
+            for fm in _FOLDER_CITATION_RE.finditer(desc):
+                folder = fm.group(1).strip()
+                if not folder or folder.lower() in seen:
+                    continue
+                seen.add(folder.lower())
+                exists = False
+                for base in [project_path or ''] + list(_WORKING_DOC_FOLDERS):
+                    if not base:
+                        continue
+                    try:
+                        if os.path.isdir(os.path.join(project_path or '', base, folder)):
+                            exists = True
+                            break
+                    except Exception:
+                        continue
+                if not exists:
+                    continue
+                fname = folder.replace(os.sep, '/').strip('/')
+                hit = False
+                for c in caught:
+                    if (c.startswith(fname) or ('/' + fname + '/') in ('/' + c)
+                            or ('/' + fname + '/') in ('/' + c + '/')):
+                        hit = True
+                        break
+                if hit:
+                    continue
+                holds.append({'code': 'folder', 'message': (
+                    f"The description asks to read files from folder \"{folder}\", but this "
+                    f"run's route ({route}) has no file tools and none of that folder's "
+                    "files were caught into the prompt. Use an agentic route or add the "
+                    "files as context refs.")})
+
+        # G3 — a batch run cannot deliver a file (text only).
+        if facts.get('mode') == 'batch' and _task_requests_file_creation(task):
+            warnings.append({'code': 'deliverable', 'message': (
+                'batch runs return text only; the deliverable must survive as a single '
+                'inline block and per-call output is capped (~8k tokens) — an agentic '
+                'route is safer for file deliverables.')})
+        return holds, warnings
+    except Exception as _pf_err:
+        _log.warning('[preflight] guards failed for task %s: %s',
+                     (task or {}).get('id'), _pf_err)
+        return [], []
+
+
 def checkpoint_path(project_path, exec_id):
     return os.path.join(project_path, 'Artifacts', 'checkpoints', f'exec-{exec_id}.json')
 
@@ -2590,13 +2793,22 @@ def _drop_checkpoint(project_path, exec_id):
         pass
 
 
+def _pause_limit_label(reason):
+    """Pause reason → the human-facing limit label: 'turns' → 'turn',
+    'time' → 'time', 'provider_error' → 'provider' (a Scaleway/Ollama call
+    hard-failed mid-run, e.g. a ReadTimeout on an oversized request)."""
+    if reason == 'provider_error':
+        return 'provider'
+    return 'turn' if reason == 'turns' else 'time'
+
+
 def _pause_facts(task, project_path, exec_row, cp, part, tot_in, tot_out, tot_cost, seg_cost):
     """Facts for the pause report, gathered by code while the task branch is
     still checked out (the run's files are on disk). The Guide only reads them."""
     import collections
     import agent_overseer as overseer
     facts = {
-        'limit': 'turn' if cp.get('reason') == 'turns' else 'time',
+        'limit': _pause_limit_label(cp.get('reason')),
         'turns_this_part': cp.get('turns'),
         'minutes_this_part': int((cp.get('elapsed_s') or 0) // 60),
         'part': part,
@@ -2651,9 +2863,14 @@ def _pause_notice_text(task, report):
     f = report.get('facts') or {}
     g = report.get('guide') or {}
     code = task.get('display_code') or f"#{task.get('id')}"
-    lines = [f"⏸ Task {code} paused at its {f.get('limit', 'turn')} limit — part {f.get('part', 1)}, "
-             f"{f.get('turns_this_part')} turns, {f.get('minutes_this_part')} min in this part.",
-             '', f"**Task:** {task.get('title', '')}",
+    if f.get('limit') == 'provider':
+        head = (f"⏸ Task {code} paused after a provider failure — part {f.get('part', 1)}, "
+               f"{f.get('turns_this_part')} turns, {f.get('minutes_this_part')} min in this part. "
+               "You can Continue from where it stopped.")
+    else:
+        head = (f"⏸ Task {code} paused at its {f.get('limit', 'turn')} limit — part {f.get('part', 1)}, "
+                f"{f.get('turns_this_part')} turns, {f.get('minutes_this_part')} min in this part.")
+    lines = [head, '', f"**Task:** {task.get('title', '')}",
              f"**So far:** {f.get('tokens_input', 0):,} tokens in · {f.get('tokens_output', 0):,} out · "
              f"${f.get('cost_usd_so_far', 0):.2f}; another block ≈ ${f.get('next_block_cost_usd_estimate', 0):.2f}"]
     if f.get('deliverables_missing') or f.get('deliverables_written'):
@@ -2793,6 +3010,38 @@ def _dep_blocked_notice(task, unmet):
             "Run the dependency first, or remove the dependency.")
 
 
+def _prefilter_wait_before_lock(task, project_path):
+    """Bounded wait for an in-flight local pre-filter, before the project lock.
+
+    Plan v1.2 §5.4 (decision a): the pre-filter is computed asynchronously; the
+    run entry gives the worker at most 20 s to land, but ONLY when the feature
+    is enabled for this project and the task is not dependency-blocked
+    (dep-blocked runs must never pay local inference). This never computes and
+    never raises — any failure leaves the run exactly as it was before.
+
+    The wait belongs BEFORE ``_project_lock`` so a run queued behind another
+    run's lock can still pick up a pre-filter that lands while it waits.
+    """
+    try:
+        import agent_decision
+    except Exception:
+        # Feature not deployed (module absent/old): stay inert, no log noise
+        # on every run.
+        return
+    try:
+        if not agent_decision.prefilter_enabled(project_path):
+            return
+        if (agent_contract.check(task).get('unmet') or []):
+            return
+        agent_decision.wait_for_prefilter((task or {}).get('id'), max_s=20)
+    except Exception as _err:
+        try:
+            _log.warning('[exec] task %s: prefilter wait skipped: %s',
+                         (task or {}).get('id'), _err)
+        except Exception:
+            pass
+
+
 def run_task(task_id=None, resume=None):
     """Execute a task with a real AI call. Returns result dict.
 
@@ -2811,6 +3060,30 @@ def run_task(task_id=None, resume=None):
     task = db.get_task(task_id)
     if not task:
         return {'error': f'Task {task_id} not found'}
+
+    # ── User-override latch — capture and consume FIRST ─────────────────────
+    # /gate action=override stamps gate_source='user-override' so the
+    # verified-impossibility pre-flight guards (below) bypass ONCE. It must be
+    # read here, at entry, and held in a local: every later gate write clobbers
+    # the column — the H2 transient review marker (`gate_source='H2a'`,
+    # ~line 3363) and then update_task_h2_gate (`gate_source='H2'`) both fire
+    # before the guards run, so a DB re-read there would always miss the latch
+    # and the override would never work on an autopilot project.
+    # Consuming it immediately also makes the one-shot rule unconditional: a
+    # bypass can never leak into a later run of the same task.
+    _pf_user_override = False
+    if not resume:
+        try:
+            if (task.get('gate_source') or '') == 'user-override':
+                _pf_user_override = True
+                db.update_task(task['id'], project_path=task.get('path'),
+                               gate_source='', gate_reason='')
+                _log.warning('preflight: task %s: user override consumed — '
+                             'impossibility guards bypassed for this run only',
+                             task['id'])
+        except Exception as _ov_err:
+            _log.warning('preflight: task %s: override latch read failed: %s',
+                         task['id'], _ov_err)
 
     if resume:
         if task['status'] != 'paused':
@@ -2982,6 +3255,9 @@ def run_task(task_id=None, resume=None):
     # task is claimed: while we wait, the task is still pending/confirmed, so a
     # restart during the wait cannot leave it 'running' with no execution row.
     # Released in the finally below (and on the early-exit paths).
+    # Local pre-filter: bounded wait (≤20 s) for an in-flight async compute.
+    # Before the lock by design; no-op when the flag is off or deps are unmet.
+    _prefilter_wait_before_lock(task, project_path)
     _plock = _project_lock(project_path)
     if not _plock.acquire(timeout=1800):
         return {'task_id': task['id'], 'status': 'failed',
@@ -3177,6 +3453,7 @@ def run_task(task_id=None, resume=None):
                                gate_reason='Guide is reviewing this task…',
                                gate_decided_at=datetime.utcnow().isoformat(),
                                gate_report_h2_json=None)
+                _h2_route_facts = _task_route_facts(task, mode)
                 h2 = overseer.pre_run_check(
                     task=task,
                     project=proj,
@@ -3188,6 +3465,7 @@ def run_task(task_id=None, resume=None):
                     dep_outcomes=dep_outcomes,
                     rag_provenance=rag_provenance,
                     dep_unmet=dep_unmet,
+                    route_facts=_h2_route_facts,
                 )
                 gate = (h2.get('gate') or 'run').lower()
                 gate_state_db = 'hold' if gate in ('hold', 'skip') else 'open'
@@ -3413,6 +3691,57 @@ def run_task(task_id=None, resume=None):
                     h2['reason'] = reason
         except Exception as _lb_err:
             _log.warning('[Lane B] validation failed for task %s: %s', task.get('id'), _lb_err)
+
+        # ── Verified-impossibility pre-flight (regression: task 10001296) ─────────
+        # Deterministic guards on facts the route cannot work around: a cited URL
+        # with no web access, a cited folder with no file tools and zero caught
+        # files. Unlike the H2 advisory gate these BLOCK — advisory or strict —
+        # because the run provably cannot do what the description asks (same
+        # class as the free-tier batch gate below). One-shot user override:
+        # gate_source 'user-override' (stamped by /gate action=override) bypasses
+        # ONCE and is consumed here.
+        try:
+            _pf_holds, _pf_warnings = _preflight_guards(
+                task, proj, project_path, mode, locals().get('caught_files') or [])
+            for _pw in _pf_warnings:
+                _log.warning('preflight:%s task %s: %s', _pw.get('code'), task['id'],
+                             _pw.get('message'))
+                try:
+                    if not h2:
+                        h2 = {}
+                    h2.setdefault('capability_warnings', []).append(_pw.get('message'))
+                except Exception:
+                    pass
+            for _ph in _pf_holds:
+                _code = _ph.get('code')
+                _msg = _ph.get('message')
+                # The latch was captured at run_task entry (before the H2
+                # transient marker overwrote gate_source) — see _pf_user_override.
+                if _pf_user_override:
+                    _log.warning('preflight:%s task %s: hold bypassed by user override',
+                                 _code, task['id'])
+                    continue
+                _log.warning('preflight:%s task %s: HOLD — %s', _code, task['id'], _msg)
+                try:
+                    db.update_task(task['id'], project_path=project_path,
+                                   gate_state='hold', gate_source='H2',
+                                   gate_reason=_msg,
+                                   gate_decided_at=datetime.utcnow().isoformat())
+                    db.finish_execution(exec_id, 'failed',
+                                        error_message=f'preflight ({_code}): {_msg}',
+                                        project_path=project_path)
+                    db.update_task(task['id'], status='pending', project_path=project_path)
+                except Exception:
+                    pass
+                _hb_stop()
+                return {
+                    'task_id': task['id'], 'exec_id': exec_id,
+                    'status': 'gate_hold',
+                    'gate': {'gate': 'hold', 'reason': _msg, 'code': _code},
+                    'work_session_slot': task.get('work_session_slot'),
+                }
+        except Exception as _pf_err:
+            _log.warning('[preflight] task %s: guards skipped: %s', task.get('id'), _pf_err)
 
         # Kanban column → forced provider mode:
         #   slot 1 (Claude Pro)   → claude-code (Pro subscription, agentic)
@@ -3905,7 +4234,7 @@ def run_task(task_id=None, resume=None):
                                       tot_in, tot_out, tot_cost, seg_cost)
             except Exception as _pf_err:
                 _log.warning('paused exec %s: facts failed: %s', exec_id, _pf_err)
-                _facts = {'limit': 'turn' if e.reason == 'turns' else 'time', 'part': part,
+                _facts = {'limit': _pause_limit_label(e.reason), 'part': part,
                           'model_status': cp.get('status_text') or ''}
             transcript_text = '\n\n'.join(t for t in cp.get('transcript') or [] if t).strip()
             try:
@@ -4544,11 +4873,19 @@ def _chat_prompt_sections(chat, user_message, chosen_model=None, tools_enabled=N
                         # plain "content not inlined" once sent a vision model
                         # into a 2.4M-token OCR detour (RP-087 E3).
                         import agent_tools as _at
+                        from model_caps import route_delivers_images
                         _ext = os.path.splitext(fname)[1].lower()
-                        if caps.get('vision') and _ext in _at._IMAGE_EXTS:
+                        _can_see = (bool(caps.get('vision'))
+                                    and _ext in _at._IMAGE_EXTS
+                                    and route_delivers_images(chosen_model, None, 'inline'))
+                        if _can_see:
                             file_blocks.append(
                                 f'**File: {fname}** (binary image — call read_file on it '
                                 f'to view its content as an image)')
+                        elif caps.get('vision') and _ext in _at._IMAGE_EXTS:
+                            file_blocks.append(
+                                f'**File: {fname}** (binary image — this route cannot deliver '
+                                f'image content to you; do not re-encode or OCR it)')
                         else:
                             file_blocks.append(f'**File: {fname}** (binary file — content not inlined)')
                 if file_blocks:
@@ -4804,8 +5141,15 @@ def _chat_turn(chat_id, user_message, model=None, tools_enabled=None,
 
     project_path = chat.get('project_path') or ''
     chat_proj = _project_for(chat)
-    chosen_model = (model or chat.get('model') or chat.get('task_model')
-                    or agent_config.default_model_for(chat_proj))
+    # The Guide (AIngel) chat's model is fixed by the project setting: a stale
+    # chat-row model (e.g. an old claude id written before the 2026-07-20
+    # aingel_model→chat sync) must never override it. Enforcing it here keeps
+    # Guide turns off the claude CLI even when an older UI sends the stale id.
+    if _is_guide_chat(chat, chat_proj) and (chat_proj or {}).get('aingel_model'):
+        chosen_model = chat_proj['aingel_model']
+    else:
+        chosen_model = (model or chat.get('model') or chat.get('task_model')
+                        or agent_config.default_model_for(chat_proj))
 
     # EU boundary: chats reach here from several routes (project chat, task chat,
     # AIngel chat), not all of which pass through the API-level guard.

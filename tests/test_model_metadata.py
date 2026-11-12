@@ -112,6 +112,24 @@ def test_eu_models_are_consistently_classified():
     assert not wrong, 'EU classification disagrees with provider:\n  ' + '\n  '.join(wrong)
 
 
+def test_decision_models_unregistered():
+    """Local decision models must stay out of the selectable catalogue.
+
+    agent_decision talks to Ollama's /v1/systemone directly. Registering these
+    IDs would leak them into /api/models, the Counselor, quota allow-lists and
+    route() (which would then raise 'Unknown model' on a decision request).
+    """
+    decision_ids = ('tev1:0.8b', 'tev1:4b-q4_K_M')
+    dynamic = agent_config.dynamic_models()
+    for model_id in decision_ids:
+        assert model_id not in agent_config.MODELS, (
+            f'{model_id} must not be registered in agent_config.MODELS')
+        assert model_id not in agent_config.PRICING, (
+            f'{model_id} must not be priced in agent_config.PRICING')
+        assert model_id not in dynamic, (
+            f'{model_id} must not appear in dynamic_models()')
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(globals().items()):

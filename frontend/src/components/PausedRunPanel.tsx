@@ -3,9 +3,10 @@ import { api } from '../api';
 import { useStore } from '../store';
 import type { Execution } from '../types';
 
-// A run paused at its turn/time limit (TODO item 16): the report Cordée wrote
-// (facts from code + the Guide's read) and the user's three choices. Shown on
-// the task card; the execution log has the same buttons.
+// A run paused at its turn/time limit, or after a provider failure (TODO item
+// 16): the report Cordée wrote (facts from code + the Guide's read) and the
+// user's three choices. Shown on the task card; the execution log has the same
+// buttons.
 
 interface PauseFacts {
   limit?: string;
@@ -85,7 +86,8 @@ export const PausedRunPanel = ({ exec, canEdit }: { exec: Execution; canEdit: bo
     }
   };
 
-  const limit = facts.limit === 'time' ? 'time' : 'turn';
+  const limit = facts.limit === 'provider' ? 'provider' : facts.limit === 'time' ? 'time' : 'turn';
+  const providerPaused = facts.limit === 'provider';
   const prog = guide?.progress ? PROGRESS_STYLE[guide.progress] : undefined;
   const missing = facts.deliverables_missing || [];
   const written = facts.deliverables_written || [];
@@ -100,6 +102,11 @@ export const PausedRunPanel = ({ exec, canEdit }: { exec: Execution; canEdit: bo
       <div className="font-semibold mb-1" style={{ color: '#8a5a12' }}>
         ⏸ Paused at its {limit} limit{(facts.part || 1) > 1 ? ` · part ${facts.part}` : ''}
       </div>
+      {providerPaused && (
+        <div className="mb-1 text-soft">
+          The provider stopped responding mid-run; your work is preserved — Continue resumes it.
+        </div>
+      )}
       <div className="text-soft mb-1">
         {facts.turns_this_part ?? '?'} turns, {facts.minutes_this_part ?? '?'} min in this part ·
         ${(facts.cost_usd_so_far ?? exec.cost_usd ?? 0).toFixed(2)} so far · another block ≈

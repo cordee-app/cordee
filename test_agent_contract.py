@@ -554,5 +554,238 @@ class ColumnBusyMessageTests(_TempDbCase):
                 agent_api._running_slots.pop(4, None)
 
 
+class GateOverrideLatchTests(_TwoTenantApp, unittest.TestCase):
+    """POST /api/tasks/<tid>/gate — the one-shot 'user-override' latch.
+
+    The executor's verified-impossibility pre-flight guards bypass once on
+    gate_source == 'user-override' and then reset it to 'H2'. These tests pin
+    the API side: override stamps the latch, acknowledge stamps a source that
+    does NOT bypass, answer clears it, and a content PATCH clears a stale one.
+    """
+
+    def _gate(self, tid, **body):
+        self._login(self.user_a)
+        return self.client.post(f'/api/tasks/{tid}/gate', json=body)
+
+    def _latch_task(self, desc='do the thing'):
+        tid = agent_db.create_task(self.proj_a['id'], 'Gated', description=desc,
+                                   project_path=self.path_a)
+        agent_db.update_task(tid, project_path=self.path_a, gate_state='hold',
+                             gate_source='H2', gate_reason='missing context')
+        return tid
+
+    def test_override_stamps_consumable_latch(self):
+        tid = self._latch_task()
+        with patch.object(self.agent_api.db, 'update_task') as m:
+            resp = self._gate(tid, action='override')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertTrue(body['ok'])
+        self.assertEqual(body['gate_state'], 'open')
+        self.assertEqual(body['gate_source'], 'user-override')
+        _, kwargs = m.call_args
+        self.assertEqual(kwargs['gate_state'], 'open')
+        self.assertEqual(kwargs['gate_source'], 'user-override')
+        self.assertEqual(kwargs['gate_reason'], 'User overrode the pre-run gate')
+        self.assertIn('gate_decided_at', kwargs)
+
+    def test_acknowledge_closes_without_bypass_latch(self):
+        tid = self._latch_task()
+        with patch.object(self.agent_api.db, 'update_task') as m:
+            resp = self._gate(tid, action='acknowledge')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()['gate_state'], 'closed')
+        self.assertEqual(resp.get_json()['gate_source'], 'user-ack')
+        _, kwargs = m.call_args
+        self.assertEqual(kwargs['gate_state'], 'closed')
+        # Only 'user-override' bypasses pre-flight guards.
+        self.assertEqual(kwargs['gate_source'], 'user-ack')
+        self.assertEqual(kwargs['gate_reason'],
+                         'User acknowledged the pre-run warning')
+
+    def test_answer_clears_stale_latch(self):
+        tid = self._latch_task()
+        agent_db.update_task(tid, project_path=self.path_a,
+                             gate_source='user-override')
+        resp = self._gate(tid, action='answer',
+                          answers={'q1': 'use the second folder'})
+        self.assertEqual(resp.status_code, 200)
+        task = agent_db.get_task(tid, project_path=self.path_a)
+        self.assertEqual(task['gate_state'], 'open')
+        self.assertEqual(task['gate_source'], '')
+        self.assertIn('use the second folder', task['description'])
+
+    def test_discuss_does_not_touch_the_latch(self):
+        tid = self._latch_task()
+        resp = self._gate(tid, action='discuss')
+        self.assertEqual(resp.status_code, 200)
+        task = agent_db.get_task(tid, project_path=self.path_a)
+        self.assertEqual(task['gate_state'], 'hold')
+        self.assertEqual(task['gate_source'], 'H2')
+
+    def test_content_patch_clears_stale_override_latch(self):
+        tid = self._latch_task()
+        agent_db.update_task(tid, project_path=self.path_a, gate_state='open',
+                             gate_source='user-override',
+                             gate_reason='User overrode the pre-run gate')
+        self._login(self.user_a)
+        resp = self.client.patch(f'/api/tasks/{tid}',
+                                 json={'description': 'a new, clearer ask'})
+        self.assertEqual(resp.status_code, 200)
+        task = agent_db.get_task(tid, project_path=self.path_a)
+        self.assertEqual(task['gate_source'], '')
+        self.assertEqual(task['gate_reason'], '')
+        self.assertEqual(task['description'], 'a new, clearer ask')
+
+    def test_patch_that_sets_gate_columns_is_not_overridden(self):
+        tid = self._latch_task()
+        self._login(self.user_a)
+        resp = self.client.patch(f'/api/tasks/{tid}',
+                                 json={'gate_state': 'open',
+                                       'gate_source': 'user-override'})
+        self.assertEqual(resp.status_code, 200)
+        task = agent_db.get_task(tid, project_path=self.path_a)
+        self.assertEqual(task['gate_source'], 'user-override')
+
+    def test_h2a_review_patch_is_still_409(self):
+        # The latch-clearing must not disturb the H2a 409 guard.
+        tid = self._latch_task()
+        agent_db.update_task(tid, project_path=self.path_a, gate_state='hold',
+                             gate_source='H2a')
+        self._login(self.user_a)
+        resp = self.client.patch(f'/api/tasks/{tid}',
+                                 json={'description': 'sneaky edit'})
+        self.assertEqual(resp.status_code, 409)
+        task = agent_db.get_task(tid, project_path=self.path_a)
+        self.assertEqual(task['gate_source'], 'H2a')
+
+
+class H2aRouteQuestionTests(unittest.TestCase):
+    """_h2a_route_questions — deterministic route blindness check (10001296)."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.path = self.td.name
+        os.makedirs(os.path.join(self.path, 'Sources'), exist_ok=True)
+
+    def _ask(self, desc, facts, existing=None):
+        import agent_api
+        return agent_api._h2a_route_questions(desc, self.path, facts, existing)
+
+    def test_url_with_no_web_access_injects_question(self):
+        out = self._ask('Summarise https://example.com/report and cite it.',
+                        {'web': False, 'file_tools': True, 'route': 'batch'})
+        self.assertEqual(len(out), 1)
+        q = out[0]
+        self.assertEqual(q['id'], 'q1')
+        self.assertIn('https://example.com/report', q['question'])
+        self.assertIn('batch', q['question'])
+        self.assertIn('Switch to an agentic route', q['options'])
+        self.assertTrue(q['why'])
+
+    def test_existing_folder_with_no_file_tools_injects_question(self):
+        out = self._ask('Read every PDF in the folder "Sources" and summarise.',
+                        {'web': True, 'file_tools': False, 'route': 'batch'})
+        self.assertEqual(len(out), 1)
+        self.assertIn('folder "Sources"', out[0]['question'])
+
+    def test_absent_folder_is_ignored(self):
+        out = self._ask('Read the folder "Nowhere" and summarise.',
+                        {'web': False, 'file_tools': False})
+        self.assertEqual(out, [])
+
+    def test_capable_route_injects_nothing(self):
+        out = self._ask('Summarise https://example.com and the folder "Sources".',
+                        {'web': True, 'file_tools': True, 'route': 'inline'})
+        self.assertEqual(out, [])
+
+    def test_unknown_route_facts_inject_nothing(self):
+        self.assertEqual(self._ask('Summarise https://example.com', None), [])
+        self.assertEqual(self._ask('Summarise https://example.com', {}), [])
+
+    def test_existing_question_about_the_url_is_not_duplicated(self):
+        existing = [{'id': 'q1', 'question': 'Is https://example.com the right source?',
+                     'why': '', 'options': []}]
+        out = self._ask('Summarise https://example.com', {'web': False}, existing)
+        self.assertEqual(len(out), 1)
+
+    def test_respects_three_question_cap(self):
+        existing = [{'id': f'q{i}', 'question': f'q{i}?', 'why': '', 'options': []}
+                    for i in (1, 2, 3)]
+        out = self._ask('Summarise https://example.com', {'web': False}, existing)
+        self.assertEqual(len(out), 3)
+
+    def test_appends_after_existing_questions(self):
+        existing = [{'id': 'q1', 'question': 'Which section?', 'why': '', 'options': []}]
+        out = self._ask('Summarise https://example.com', {'web': False}, existing)
+        self.assertEqual([q['id'] for q in out], ['q1', 'q2'])
+
+    def test_already_answered_route_question_is_not_reasked(self):
+        desc = ('Summarise https://example.com\n\n'
+                '**User clarifications (Guide pre-run check):**\n'
+                '- q1: Switch to an agentic route')
+        out = self._ask(desc, {'web': False})
+        self.assertEqual(out, [])
+
+
+class H2aRouteFactsWiringTests(_TempDbCase):
+    """_run_h2a_precheck_async passes route facts to the overseer."""
+
+    def test_route_facts_passed_and_injected_question_holds(self):
+        import agent_api
+        import agent_executor
+        import agent_overseer
+        agent_db.set_project_field(self.proj_id, 'aingel_autopilot', 1)
+        tid = agent_db.create_task(
+            self.proj_id, 'Route test',
+            description='Summarise https://example.com/report',
+            project_path=self.path)
+        seen = {}
+
+        def fake_pre_check(task, project, file_names, **kwargs):
+            seen.update(kwargs)
+            return {'questions': [], 'gate_state': 'open', 'reason': 'clear'}
+
+        facts = {'web': False, 'file_tools': False, 'route': 'batch'}
+        with patch.object(agent_executor, '_task_route_facts',
+                          return_value=facts) as rf, \
+             patch.object(agent_overseer, 'pre_check_questions',
+                          side_effect=fake_pre_check):
+            agent_api._run_h2a_precheck_async(tid, self.path)
+
+        rf.assert_called_once()
+        self.assertEqual(rf.call_args[0][1], 'inline')
+        self.assertEqual(seen.get('route_facts'), facts)
+        task = agent_db.get_task(tid, project_path=self.path)
+        self.assertEqual(task['gate_state'], 'hold')
+        self.assertEqual(task['gate_source'], 'H2a')
+
+    def test_missing_route_facts_helper_is_tolerated(self):
+        import agent_api
+        import agent_executor
+        import agent_overseer
+        agent_db.set_project_field(self.proj_id, 'aingel_autopilot', 1)
+        tid = agent_db.create_task(self.proj_id, 'No facts',
+                                   description='plain work',
+                                   project_path=self.path)
+        seen = {}
+
+        def fake_pre_check(task, project, file_names, **kwargs):
+            seen.update(kwargs)
+            return {'questions': [], 'gate_state': 'open', 'reason': 'clear'}
+
+        with patch.object(agent_executor, '_task_route_facts',
+                          side_effect=ImportError('not yet')), \
+             patch.object(agent_overseer, 'pre_check_questions',
+                          side_effect=fake_pre_check):
+            agent_api._run_h2a_precheck_async(tid, self.path)
+
+        self.assertIn('route_facts', seen)
+        self.assertIsNone(seen['route_facts'])
+        task = agent_db.get_task(tid, project_path=self.path)
+        self.assertEqual(task['gate_state'], 'open')
+
+
 if __name__ == '__main__':
     unittest.main()

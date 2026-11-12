@@ -51,6 +51,11 @@ function computeBlockedBy(
 interface Store {
   user: User | null;
   quotas: QuotaStatus | null;
+  // Terms & Conditions gate: non-null while the current user must accept the
+  // published version. Set from /api/me (30s backstop) or the
+  // 'aingel:terms-required' event on any gated 403 (instant detection).
+  termsRequired: { version_id: number; tag: string } | null;
+  setTermsRequired: (t: { version_id: number; tag: string } | null) => void;
   projects: Project[];
   tasks: Task[];
   models: Model[];
@@ -313,6 +318,7 @@ export const useStore = create<Store>()(
     (set, get) => ({
       user: null,
       quotas: null,
+      termsRequired: null,
       projects: [],
       tasks: [],
       models: [],
@@ -435,6 +441,13 @@ export const useStore = create<Store>()(
       setWorkSessions: (workSessions) => set({ workSessions }),
       setUser: (user) => set({ user }),
       setQuotas: (quotas) => set({ quotas }),
+      // No-op on the same version: App subscribes to the whole store, so a
+      // fresh object from every 30s poll would re-render the entire tree.
+      setTermsRequired: (t) => {
+        const cur = get().termsRequired;
+        if (t && cur && cur.version_id === t.version_id) return;
+        set({ termsRequired: t });
+      },
       setConfig: (config) => set({ config }),
       setReadiness: (readiness) => set({ readiness }),
       setCostSummary: (costSummary) => set({ costSummary }),
@@ -726,6 +739,9 @@ export const useStore = create<Store>()(
     }),
     {
       name: 'superagent_store',
+      // `termsRequired` is deliberately NOT persisted: it is server state
+      // re-derived from /api/me on every load, and a stale flag in
+      // localStorage would blank the app before the first poll.
       partialize: (state) => ({
         activeProject: state.activeProject,
         activeMainTab: state.activeMainTab,

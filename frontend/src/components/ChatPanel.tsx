@@ -170,13 +170,15 @@ const ChatPanelInner = () => {
   const isAingelChat = aingelChatIds.has(chat.id);
   const isSending = sendingLocal || chatSending;
   const isTaskChat = !!chat.task_id;
-  const projectAingelModel = isTaskChat
+  // Guide and task chats are model-locked: the project's aingel_model is the one
+  // the panel displays, sends, and prices with. A stale chat.model (e.g. the old
+  // claude id on the SuperAgent Guide chat) must never win.
+  const projectAingelModel = (isTaskChat || isAingelChat)
     ? projects.find((p) => p.id === chat.project_id)?.aingel_model
     : undefined;
   const modelLocked = isAingelChat || (isTaskChat && !!projectAingelModel);
-  // The one model the panel displays, sends, and prices with. Task chats created
-  // before the lock existed can carry a different chat.model; the effect below
-  // converges the stored row so /api/estimate agrees with what actually runs.
+  // The effect below converges the stored row so /api/estimate agrees with
+  // what actually runs.
   const effectiveModel = modelLocked ? (projectAingelModel || chat.model) : chat.model;
 
   const isScaffoldChat = chat.name === 'Project scaffolding';
@@ -597,8 +599,8 @@ const ChatPanelInner = () => {
               className="w-full py-1 px-2 text-sm border border-default rounded dark:bg-surface-dark-base dark:border-border-dark-default dark:text-text-dark"
             >
               {models.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.label}
+                <option key={m.id} value={m.id} disabled={m.available === false}>
+                  {m.label}{m.available === false ? ' (unavailable)' : ''}
                 </option>
               ))}
             </select>

@@ -154,7 +154,7 @@ def _binary_document_edit_task(desc, files) -> bool:
     return False
 
 
-def binary_note(name, model_id=None):
+def binary_note(name, model_id=None, slot=None, mode='inline'):
     """Prompt note for a binary file that could not be inlined as text.
 
     Images are the exception: a vision-capable model can SEE them — the
@@ -165,19 +165,35 @@ def binary_note(name, model_id=None):
     RP-087 E3 — a vision model burned 2.4M tokens on a local OCR pipeline
     and never produced the deliverable). Non-image binaries keep the old
     advice: their read_file result is base64, not an image part.
+
+    The vision cap alone is not enough: the route must deliver the image.
+    On the Vibe route (Mistral models) its own read_file returns raw bytes
+    as text, and the API/batch routes have no tools, so promising "call
+    read_file to view it" sends the model into useless re-encodes and an
+    honest "I cannot see the photo" (regression: CTIH task 10001302,
+    execs 20001465/20001466). Those routes get an honest note instead.
     """
     ext = os.path.splitext(name)[1].lower()
     if model_id and ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'):
-        from model_caps import get_cap
+        from model_caps import get_cap, route_delivers_images
         try:
             vision = bool(get_cap(model_id).get('vision'))
         except Exception:
             vision = False
         if vision:
-            return (f"\n\n[Binary file `{name}` cannot be inlined as text, but you can "
-                    f"VIEW it: call the read_file tool on it and its content is "
-                    f"delivered to you as an image. Do not build OCR pipelines or use "
-                    f"code execution for this file.]\n")
+            try:
+                delivers = route_delivers_images(model_id, slot, mode)
+            except Exception:
+                delivers = True  # fail-open: keep today's promise
+            if delivers:
+                return (f"\n\n[Binary file `{name}` cannot be inlined as text, but you can "
+                        f"VIEW it: call the read_file tool on it and its content is "
+                        f"delivered to you as an image. Do not build OCR pipelines or use "
+                        f"code execution for this file.]\n")
+            return (f"\n\n[Binary file `{name}` cannot be inlined as text, and this run's "
+                    f"route cannot deliver image content to you. Do not attempt to read, "
+                    f"re-encode, or OCR it; state plainly what you cannot confirm from "
+                    f"it.]\n")
     return (f"\n\n[Binary file `{name}` is present in Working Docs but cannot be "
             f"inlined as text. Use a code-execution model to parse it.]\n")
 
@@ -415,6 +431,9 @@ def _resolve_referenced_files(task, project_path, inline_budget, single_file_max
         _lead_counts[_lead_key] = _lead_counts.get(_lead_key, 0) + 1
 
     def _referenced(fname):
+        # NOTE: frontend/src/utils/payloadSpans.ts mirrors these three rules (full
+        # name / stem / distinctive lead) for the live @file highlighting — keep
+        # both sides in lockstep when changing either.
         if _catchall:
             return True
         if fname in desc:
@@ -803,7 +822,9 @@ def build(task, project_path, project=None) -> Dict:
             batch_files = []
         for name, content in inline_files:
             if content is None:
-                additions += binary_note(name, (task or {}).get('model'))
+                additions += binary_note(name, (task or {}).get('model'),
+                                         slot=(task or {}).get('work_session_slot'),
+                                         mode=('batch' if batch_files else 'inline'))
             else:
                 additions += f"\n\n**File: {name}**\n```\n{content}\n```\n"
         for name, _content in batch_files:
@@ -933,7 +954,9 @@ def build(task, project_path, project=None) -> Dict:
             fallback_batch = []
         for name, content in fallback_inline:
             if content is None:
-                additions += binary_note(name, (task or {}).get('model'))
+                additions += binary_note(name, (task or {}).get('model'),
+                                         slot=(task or {}).get('work_session_slot'),
+                                         mode=('batch' if (batch_files or fallback_batch) else 'inline'))
             else:
                 additions += f"\n\n**File: {name}**\n```\n{content}\n```\n"
         for name, _content in fallback_batch:

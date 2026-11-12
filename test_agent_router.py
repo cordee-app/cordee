@@ -909,6 +909,254 @@ class AgentRouterCliTests(unittest.TestCase):
         self.assertEqual(cm.exception.tokens_input, 700)
         self.assertEqual(cm.exception.tokens_output, 30)
 
+    # ── Provider-failure pause + big-body fast-fail (RP-140, exec 20001493) ──
+
+    def _run_loop_with_post(self, fake_post, *, prompt='do the thing',
+                            max_turns=5, pause=None):
+        """Drive _run_openai_tool_loop with a custom fake requests.post — for
+        failure/timeout scenarios _run_loop_with_responses cannot script —
+        plus an optional pause_scope(...) entered around the call. The
+        tenacity backoff in _post (min 10 s between attempts) is patched to
+        zero so failure tests run instantly; attempt counts stay real.
+        Returns the loop's result; exceptions (LimitReached, ReadTimeout, …)
+        propagate to the test."""
+        import tempfile
+        import requests
+        import agent_tools
+        with tempfile.TemporaryDirectory() as d:
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(requests, 'post',
+                                                 side_effect=fake_post))
+                stack.enter_context(patch.object(
+                    agent_router, 'wait_exponential',
+                    lambda **k: (lambda retry_state: 0)))
+                stack.enter_context(patch.object(agent_tools, 'dispatch',
+                                                 return_value='{"ok": true}'))
+                if pause is not None:
+                    stack.enter_context(pause)
+                return agent_router._run_openai_tool_loop(
+                    provider_label='Scaleway',
+                    api_url='https://example/v1/chat/completions',
+                    api_key='k',
+                    wire_model='qwen3.6',
+                    model_id='scw-qwen3.6-35b',
+                    prompt=prompt,
+                    max_tokens=1024,
+                    max_turns=max_turns,
+                    project_path=d,
+                )
+
+    def test_pausable_run_pauses_on_provider_read_timeout(self):
+        # Regression: RP-140 (exec 20001493, task 10001311) — a ~200k-token
+        # conversation read-timed-out at 300 s and the ReadTimeout propagated
+        # as a hard failure that threw away the whole in-memory checkpoint
+        # (~$1.64 of paid work). In a pausable run with real work behind it,
+        # a provider failure must become LimitReached('provider_error') with
+        # a resumable checkpoint instead.
+        import requests
+
+        calls = {'i': 0}
+
+        def fake_post(url, headers=None, data=None, timeout=None):
+            calls['i'] += 1
+            if calls['i'] == 1:  # turn 0: normal tool call
+                class R:
+                    status_code = 200
+                    def json(self_inner):
+                        return self._TOOL_TURN
+                return R()
+            raise requests.exceptions.ReadTimeout(
+                "HTTPSConnectionPool(host='api.scaleway.ai', port=443): "
+                'Read timed out. (read timeout=300)')
+
+        with self.assertRaises(agent_router.LimitReached) as cm:
+            self._run_loop_with_post(fake_post, pause=agent_router.pause_scope())
+        e = cm.exception
+        self.assertEqual(e.reason, 'provider_error')
+        # Usage still rides out on the exception (outer handler attaches it).
+        self.assertEqual((e.tokens_input, e.tokens_output), (10, 4))
+        cp = e.checkpoint
+        # Checkpoint mirrors _pause_now's shape, minus any model status.
+        self.assertEqual(set(cp), {'messages', 'transcript', 'reason', 'turns',
+                                   'elapsed_s', 'status_text',
+                                   'segment_tokens_input',
+                                   'segment_tokens_output', 'model_id',
+                                   'max_turns'})
+        self.assertEqual(cp['reason'], 'provider_error')
+        self.assertEqual(cp['turns'], 1)
+        self.assertEqual(cp['status_text'], '')
+        self.assertEqual(cp['model_id'], 'scw-qwen3.6-35b')
+        self.assertEqual(cp['max_turns'], 5)
+        self.assertEqual((cp['segment_tokens_input'], cp['segment_tokens_output']),
+                         (10, 4))
+        # The work is NOT lost: the checkpointed messages carry the whole
+        # turn-0 exchange (prompt, tool call, tool result).
+        self.assertGreater(len(cp['messages']), 1)
+        self.assertEqual(cp['messages'][0]['role'], 'user')
+        self.assertEqual([m['role'] for m in cp['messages'][1:]],
+                         ['assistant', 'tool'])
+        # Transcript ends with the provider-failure banner.
+        self.assertIn('Paused after a provider failure', cp['transcript'][-1])
+        self.assertIn('Read timed out', cp['transcript'][-1])
+        # tenacity retried the ReadTimeout before the pause converted it (the
+        # wrapper catches the post-retry exception, it does not pre-empt it).
+        self.assertGreaterEqual(calls['i'], 2)
+
+    def test_provider_read_timeout_without_pause_scope_still_raises(self):
+        # Legacy behaviour is unchanged: without a pause scope (chats, H3 and
+        # batch never opt in) the ReadTimeout propagates as a hard failure,
+        # and the read timeout stays exactly 300 s.
+        import requests
+
+        calls = {'i': 0}
+        timeouts = []
+
+        def fake_post(url, headers=None, data=None, timeout=None):
+            calls['i'] += 1
+            timeouts.append(timeout)
+            if calls['i'] == 1:
+                class R:
+                    status_code = 200
+                    def json(self_inner):
+                        return self._TOOL_TURN
+                return R()
+            raise requests.exceptions.ReadTimeout('Read timed out. (read timeout=300)')
+
+        with self.assertRaises(requests.exceptions.ReadTimeout) as cm:
+            self._run_loop_with_post(fake_post)
+        # Usage still rides out even on the legacy hard-failure path.
+        self.assertEqual((cm.exception.tokens_input, cm.exception.tokens_output),
+                         (10, 4))
+        self.assertEqual(set(timeouts), {300})  # non-pausable: exactly 300
+
+    def test_big_body_read_timeout_is_not_retried(self):
+        # Regression: RP-140 (exec 20001493) — the 3x tenacity retry of the
+        # identical ~800 KB body wasted 15.5 min before the hard failure. A
+        # >400 KB body that just blew its read timeout must fail fast:
+        # exactly ONE post, raised as _NoRetryProviderError carrying the
+        # original error text.
+        import requests
+
+        calls = {'i': 0}
+
+        def fake_post(url, headers=None, data=None, timeout=None):
+            calls['i'] += 1
+            raise requests.exceptions.ReadTimeout('Read timed out. (read timeout=300)')
+
+        with self.assertRaises(agent_router._NoRetryProviderError) as cm:
+            self._run_loop_with_post(fake_post, prompt='x' * 500_000)
+        self.assertEqual(calls['i'], 1)  # no tenacity retry on a big body
+        self.assertIn('ReadTimeout', str(cm.exception))
+        self.assertIn('Read timed out', str(cm.exception))
+
+    def test_resume_compacts_huge_tool_history_before_first_request(self):
+        # Regression: RP-140 — a resumed checkpoint carries the huge tool
+        # history that killed the previous segment; the FIRST request of the
+        # new segment must already be sendable: old oversized tool results
+        # stubbed (first 300 chars kept), the last 8 verbatim.
+        big = 'y' * 20_000
+        n = 12
+        originals = [f'{big} ORIGINAL TOOL RESULT {i}' for i in range(n)]
+        cp = {'messages': [{'role': 'user', 'content': 'do the thing'},
+                           {'role': 'assistant', 'tool_calls': [
+                               {'id': f'call_{i}', 'type': 'function',
+                                'function': {'name': 'read_file',
+                                             'arguments': '{}'}}
+                               for i in range(n)]}]
+                          + [{'role': 'tool', 'tool_call_id': f'call_{i}',
+                              'content': originals[i]} for i in range(n)],
+              'transcript': ['part one work'], 'segments': 1}
+        final = {'choices': [{'finish_reason': 'stop',
+                              'message': {'content': 'done.'}}],
+                 'usage': {'prompt_tokens': 7, 'completion_tokens': 3}}
+        bodies = []
+
+        def fake_post(url, headers=None, data=None, timeout=None):
+            bodies.append(json.loads(data))
+            class R:
+                status_code = 200
+                def json(self_inner):
+                    return final
+            return R()
+
+        self._run_loop_with_post(fake_post,
+                                 pause=agent_router.pause_scope(resume=cp),
+                                 max_turns=10)
+        first = bodies[0]['messages']
+        self.assertEqual(first[0]['content'], 'do the thing')  # non-tool kept
+        tools = [m for m in first if m.get('role') == 'tool']
+        self.assertEqual(len(tools), n)
+        stubbed = [m for m in tools
+                   if m['content'].startswith(agent_router._TOOL_TEXT_ELIDED_MARK)]
+        self.assertEqual(len(stubbed), n - 8)  # only the oldest 4 elided
+        for m in stubbed:
+            self.assertIn('first 300 chars:', m['content'])
+            self.assertLess(len(m['content']), 10_000)
+        # The last 8 stay verbatim — the model's current evidence.
+        kept = [m['content'] for m in tools
+                if not m['content'].startswith(agent_router._TOOL_TEXT_ELIDED_MARK)]
+        self.assertEqual(kept, originals[4:])
+        # Structure preserved: role + tool_call_id intact on every message.
+        self.assertEqual([m['tool_call_id'] for m in tools],
+                         [f'call_{i}' for i in range(n)])
+        # Idempotent: a second pass over the same history changes nothing.
+        snapshot = [m['content'] for m in first if m.get('role') == 'tool']
+        agent_router._compact_text_history(first)
+        self.assertEqual([m['content'] for m in first if m.get('role') == 'tool'],
+                         snapshot)
+
+    def test_pausable_run_caps_read_timeout_to_remaining_budget(self):
+        # RP-140: a 300 s read timeout inside a time budget must not silently
+        # outlast the budget — the timeout kwarg is capped to the REMAINING
+        # budget, floored at 60 s so a nearly-spent budget doesn't turn every
+        # call into a fast connection failure. (The between-turn budget check
+        # only fires from turn 1, so turn 0's call is the one being capped.)
+        timeouts = []
+
+        def fake_post(url, headers=None, data=None, timeout=None):
+            timeouts.append(timeout)
+            class R:
+                status_code = 200
+                def json(self_inner):
+                    return {'choices': [{'finish_reason': 'stop',
+                                         'message': {'content': 'done.'}}],
+                            'usage': {'prompt_tokens': 1, 'completion_tokens': 1}}
+            return R()
+
+        self._run_loop_with_post(
+            fake_post, pause=agent_router.pause_scope(time_budget_s=1e-9))
+        self.assertEqual(timeouts, [60])  # 60 <= capped < 300
+        self.assertTrue(all(60 <= t < 300 for t in timeouts))
+
+    def test_compact_text_history_kill_switch_and_image_parts(self):
+        # The AINGEL_TOOL_LOOP_TEXT_COMPACT kill-switch disables compaction
+        # entirely; with it on, multi-part (image) tool content keeps its
+        # image_url parts and only oversized text parts are stubbed, small
+        # results stay verbatim, and role/tool_call_id are preserved.
+        big = 'y' * 20_000
+        img = {'type': 'image_url',
+               'image_url': {'url': 'data:image/png;base64,AAAA'}}
+        msgs = [
+            {'role': 'tool', 'tool_call_id': 'c1',
+             'content': [{'type': 'text', 'text': big}, img]},
+            {'role': 'tool', 'tool_call_id': 'c2', 'content': big + ' tail'},
+            {'role': 'tool', 'tool_call_id': 'c3', 'content': 'small result'},
+        ]
+        with patch.object(agent_router, 'TOOL_LOOP_TEXT_COMPACT', False):
+            agent_router._compact_text_history(msgs, keep_recent=0)
+        self.assertEqual(msgs[0]['content'][0]['text'], big)   # kill-switch: no-op
+        self.assertEqual(msgs[1]['content'], big + ' tail')
+        with patch.object(agent_router, 'TOOL_LOOP_TEXT_COMPACT', True):
+            agent_router._compact_text_history(msgs, keep_recent=0)
+        c1 = msgs[0]['content']
+        self.assertTrue(c1[0]['text'].startswith(agent_router._TOOL_TEXT_ELIDED_MARK))
+        self.assertEqual(c1[1], img)                          # image part untouched
+        self.assertTrue(msgs[1]['content'].startswith(agent_router._TOOL_TEXT_ELIDED_MARK))
+        self.assertIn('first 300 chars:', msgs[1]['content'])
+        self.assertEqual(msgs[2]['content'], 'small result')   # under the cap
+        self.assertEqual([m['role'] for m in msgs], ['tool'] * 3)
+        self.assertEqual([m['tool_call_id'] for m in msgs], ['c1', 'c2', 'c3'])
+
 
 class OverseerReferencedFilesTests(unittest.TestCase):
     """The H2 referenced-files extractor used to misclassify URLs, email
@@ -1491,6 +1739,29 @@ class OverseerOutputTargetTests(unittest.TestCase):
         got = agent_overseer._output_target_refs(desc, refs)
         self.assertEqual(got, {'Out_1.md', 'test2.txt'})
 
+    def test_outputs_path_component_is_not_an_output_verb(self):
+        # Regression: exec 20001443 (task 10001301) — 'Artifacts/outputs/<id>/'
+        # in a resume note matched the 'outputs' verb, so a pre-existing INPUT
+        # (contract_full.txt) was flagged 'Deliverable not written' by H3 and
+        # the executor's completion check.
+        desc = ('Resume from `Artifacts/outputs/10001301-…/_work/` — '
+                '`contract_full.txt` and `extract.py` already contain the '
+                'extracted contract. Do not re-read the docx; write the final '
+                'deliverable `PLK_RJP26-27_checklist.md`.')
+        refs = agent_overseer._extract_referenced_files(desc)
+        self.assertEqual(agent_overseer._output_target_refs(desc, refs),
+                         {'PLK_RJP26-27_checklist.md'})
+
+    def test_outputs_heading_still_marks_list_items(self):
+        # Nested list under an 'Outputs:' heading — exercises the `^outputs?\b`
+        # branch of _OUTPUT_PARENT_RE after the path-component guard. (A
+        # top-level list under a heading is NOT detected: `indent` counts
+        # leading whitespace, so the parent must be less indented — #10001186.)
+        desc = 'Outputs:\n  - `a.md`\n  - `b.md`'
+        refs = agent_overseer._extract_referenced_files(desc)
+        self.assertEqual(agent_overseer._output_target_refs(desc, refs),
+                         {'a.md', 'b.md'})
+
     def test_output_file_hold_is_overridden(self):
         r = self._h2("Save as `Out_1.md` in the project root.",
                      {'gate': 'hold', 'reason': 'Referenced file Out_1.md does not exist'})
@@ -1907,6 +2178,122 @@ class CliPauseResumeTests(unittest.TestCase):
 
         self.assertIn(agent_router.VIBE_TURN_LIMIT_MARKER, text)
 
+    # ── Vibe: run ended without a final answer (below the turn budget) ──────
+    # Regression: exec 20001441/20001442 (task 10001301) — the last model call
+    # carried only reasoning (finish_reason 'other', no text, no tool call),
+    # Vibe exited 0, and the parser fell back to an earlier assistant message,
+    # so an unfinished run was recorded 'done'.
+
+    def test_vibe_no_final_answer_pauses_below_turn_budget(self):
+        usage = {'calls': 13, 'input': 500, 'output': 90, 'cached': 0,
+                 'last_has_text': False, 'last_finish_reason': 'other',
+                 'sessions': ['sid-noanswer']}
+
+        class _P(_FakePopen):
+            def __init__(inner, cmd, *a, **k):
+                super().__init__(returncode=0, stdout=json.dumps([
+                    {'role': 'assistant', 'content': 'Now let me find the blanks.'}]),
+                    stderr='')
+
+        with patch('shutil.which', return_value='/usr/bin/vibe'), \
+             patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'test-key'), \
+             patch.object(agent_router, '_vibe_session_usage', return_value=usage), \
+             patch.object(agent_router, '_vibe_journal_transcript',
+                          return_value=(['Read the contract.', '→ `bash` `ls`'], 2)), \
+             patch('subprocess.Popen', side_effect=_P):
+            with agent_router.pause_scope():
+                with self.assertRaises(agent_router.LimitReached) as cm:
+                    agent_router._call_vibe_cli('mistral-medium-latest', 'Translate the deck.',
+                                                project_path=self.proj)
+
+        exc = cm.exception
+        cp = exc.checkpoint
+        self.assertEqual(cp['cli_session'], {'kind': 'vibe', 'session_id': 'sid-noanswer'})
+        self.assertEqual(cp['turns'], 13)
+        self.assertEqual((exc.tokens_input, exc.tokens_output), (500, 90))
+
+    def test_vibe_no_final_answer_marker_without_pause_scope(self):
+        usage = {'calls': 13, 'input': 500, 'output': 90, 'cached': 0,
+                 'last_has_text': False, 'last_finish_reason': 'other',
+                 'sessions': []}
+
+        class _P(_FakePopen):
+            def __init__(inner, cmd, *a, **k):
+                super().__init__(returncode=0, stdout=json.dumps([
+                    {'role': 'assistant', 'content': 'Now let me find the blanks.'}]),
+                    stderr='')
+
+        with patch('shutil.which', return_value='/usr/bin/vibe'), \
+             patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'test-key'), \
+             patch.object(agent_router, '_vibe_session_usage', return_value=usage), \
+             patch('subprocess.Popen', side_effect=_P):
+            text, _i, _o, _c = agent_router._call_vibe_cli(
+                'mistral-medium-latest', 'Translate the deck.', project_path=self.proj)
+
+        self.assertIn(agent_router.VIBE_TURN_LIMIT_MARKER, text)
+        self.assertIn('ended without a final answer', text)
+        self.assertNotIn(f'({agent_router.VIBE_MAX_TURNS} turns)', text)
+
+    def test_vibe_bare_tool_call_below_budget_is_not_marked(self):
+        # The documented turn-limit shape (last record = bare tool call) keeps
+        # today's behaviour below the budget: no marker, no pause.
+        usage = {'calls': 13, 'input': 500, 'output': 90, 'cached': 0,
+                 'last_has_text': False, 'last_finish_reason': 'tool_call',
+                 'sessions': []}
+
+        class _P(_FakePopen):
+            def __init__(inner, cmd, *a, **k):
+                super().__init__(returncode=0, stdout=json.dumps([
+                    {'role': 'assistant',
+                     'content': [{'type': 'tool_call', 'name': 'bash'}]}]), stderr='')
+
+        with patch('shutil.which', return_value='/usr/bin/vibe'), \
+             patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'test-key'), \
+             patch.object(agent_router, '_vibe_session_usage', return_value=usage), \
+             patch('subprocess.Popen', side_effect=_P):
+            with agent_router.pause_scope():
+                text, _i, _o, _c = agent_router._call_vibe_cli(
+                    'mistral-medium-latest', 'Translate the deck.', project_path=self.proj)
+
+        self.assertEqual(text, '')
+
+    def test_vibe_real_answer_below_budget_is_unchanged(self):
+        usage = {'calls': 13, 'input': 500, 'output': 90, 'cached': 0,
+                 'last_has_text': True, 'last_finish_reason': 'stop',
+                 'sessions': ['sid-ok']}
+
+        class _P(_FakePopen):
+            def __init__(inner, cmd, *a, **k):
+                super().__init__(returncode=0, stdout=json.dumps([
+                    {'role': 'assistant', 'content': 'Done: wrote the checklist.'}]),
+                    stderr='')
+
+        with patch('shutil.which', return_value='/usr/bin/vibe'), \
+             patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'test-key'), \
+             patch.object(agent_router, '_vibe_session_usage', return_value=usage), \
+             patch('subprocess.Popen', side_effect=_P):
+            text, _i, _o, _c = agent_router._call_vibe_cli(
+                'mistral-medium-latest', 'Translate the deck.', project_path=self.proj)
+
+        self.assertEqual(text, 'Done: wrote the checklist.')
+        self.assertNotIn(agent_router.VIBE_TURN_LIMIT_MARKER, text)
+
+    def test_vibe_usage_none_keeps_behaviour(self):
+        class _P(_FakePopen):
+            def __init__(inner, cmd, *a, **k):
+                super().__init__(returncode=0, stdout=json.dumps([
+                    {'role': 'assistant', 'content': 'Half done.'}]), stderr='')
+
+        with patch('shutil.which', return_value='/usr/bin/vibe'), \
+             patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'test-key'), \
+             patch.object(agent_router, '_vibe_session_usage', return_value=None), \
+             patch('subprocess.Popen', side_effect=_P):
+            text, _i, _o, _c = agent_router._call_vibe_cli(
+                'mistral-medium-latest', 'Translate the deck.', project_path=self.proj)
+
+        self.assertEqual(text, 'Half done.')
+        self.assertNotIn(agent_router.VIBE_TURN_LIMIT_MARKER, text)
+
     def test_vibe_resume_replays_the_task_with_the_previous_steps(self):
         # The Vibe CLI rejects --resume together with --prompt (headless), so a
         # continued block is a fresh session with the task prompt re-sent plus
@@ -2303,14 +2690,20 @@ class MistralApiTruncationTests(unittest.TestCase):
         )
 
     def _call(self, responses, max_tokens):
+        result, complete, _mistral = self._call_ex(responses, max_tokens)
+        return result, complete
+
+    def _call_ex(self, responses, max_tokens, mistral_cls=None, **extra):
         complete = Mock(side_effect=responses)
         client = SimpleNamespace(chat=SimpleNamespace(complete=complete))
-        with patch('mistralai.client.Mistral', return_value=client), \
+        if mistral_cls is None:
+            mistral_cls = Mock(return_value=client)
+        with patch('mistralai.client.Mistral', mistral_cls), \
              patch.object(agent_router, 'MISTRAL_VIBE_KEY', 'test-key'):
             result = agent_router.call_mistral(
                 'mistral-large-4', 'prompt', max_tokens=max_tokens,
-                force_mistral_mode='api')
-        return result, complete
+                force_mistral_mode='api', **extra)
+        return result, complete, mistral_cls
 
     def test_length_then_stop_adopts_retry_and_sums_usage(self):
         first = self._response('short', 'length',
@@ -2363,6 +2756,60 @@ class MistralApiTruncationTests(unittest.TestCase):
         self.assertNotIn(agent_router.TRUNCATION_MARKER, text)
         self.assertEqual(complete.call_count, 1)
 
+    def test_no_upscale_does_not_rerun_and_still_marks(self):
+        first = self._response('truncated at 2048', 'length')
+
+        (text, _tok_in, _tok_out, _cost), complete, _m = self._call_ex(
+            [first], max_tokens=2048, no_upscale=True)
+
+        self.assertEqual(complete.call_count, 1)
+        self.assertEqual(complete.call_args_list[0].kwargs['max_tokens'], 2048)
+        self.assertEqual(text, 'truncated at 2048' + agent_router.TRUNCATION_MARKER)
+        self.assertTrue(text.endswith(agent_router.TRUNCATION_MARKER))
+
+    def test_timeout_ms_propagates_to_mistral_client(self):
+        complete = Mock(side_effect=[self._response('ok', 'stop')])
+        client = SimpleNamespace(chat=SimpleNamespace(complete=complete))
+        mistral_cls = Mock(return_value=client)
+
+        self._call_ex([self._response('ok', 'stop')], max_tokens=2048,
+                      mistral_cls=mistral_cls, timeout_ms=90_000)
+
+        self.assertEqual(mistral_cls.call_args.kwargs['timeout_ms'], 90_000)
+
+    def test_no_upscale_stop_is_returned_untouched_in_one_call(self):
+        first = self._response('complete answer', 'stop')
+
+        (text, _tok_in, _tok_out, _cost), complete, _m = self._call_ex(
+            [first], max_tokens=2048, no_upscale=True)
+
+        self.assertEqual(text, 'complete answer')
+        self.assertNotIn(agent_router.TRUNCATION_MARKER, text)
+        self.assertEqual(complete.call_count, 1)
+
+    def test_reasoning_effort_is_forwarded_to_complete(self):
+        first = self._response('answer', 'stop')
+
+        _res, complete, _m = self._call_ex(
+            [first], max_tokens=2048, reasoning_effort='low')
+
+        self.assertEqual(complete.call_args.kwargs['reasoning_effort'], 'low')
+
+    def test_reasoning_effort_absent_when_not_passed(self):
+        first = self._response('answer', 'stop')
+
+        _res, complete, _m = self._call_ex([first], max_tokens=2048)
+
+        self.assertNotIn('reasoning_effort', complete.call_args.kwargs)
+
+    def test_mistral_large_4_is_marked_as_reasoning(self):
+        """`mistral-large-4` thinks before answering: the cap must say so, and
+        the output floor must be raised so it does not burn the whole budget
+        on ThinkChunks and return an empty answer."""
+        self.assertIs(agent_router.get_cap('mistral-large-4')['reasoning'], True)
+        self.assertEqual(
+            agent_router.effective_max_tokens('mistral-large-4', 512), 2048)
+
 
 class FitVibePromptTests(unittest.TestCase):
     """Regression (RP-114-E1): the vibe prompt cap must never silently amputate
@@ -2414,7 +2861,7 @@ class FitVibePromptTests(unittest.TestCase):
         with patch('shutil.which', return_value='/usr/bin/vibe'), \
              patch.object(agent_router, '_call_vibe_cli', side_effect=_fake_vibe):
             agent_router.call_mistral(
-                'mistral-large-latest', 'prompt', force_mistral_mode='vibe',
+                'mistral-glm-5-3-flash', 'prompt', force_mistral_mode='vibe',
                 caller='run_task:123')
         self.assertEqual(seen['caller'], 'run_task:123')
 
@@ -2430,3 +2877,62 @@ class FitVibePromptTests(unittest.TestCase):
              patch('agent_quotas.resolve_owner_for_call', return_value=None):
             agent_router.route('mistral-large-latest', 'prompt', caller='run_task:123')
         self.assertEqual(seen, ['run_task:123'])
+
+
+class ProviderHealthTests(unittest.TestCase):
+    """Failure-driven provider health: a degraded Claude (no credit / disabled
+    subscription) must fail fast with a clear, actionable message instead of
+    spawning the CLI, and the default-model resolution must substitute an
+    available model until the provider recovers."""
+
+    def setUp(self):
+        import agent_config
+        self.agent_config = agent_config
+        agent_config.clear_provider_degraded('anthropic')
+        self._stack = ExitStack()
+        self.mock_set_setting = self._stack.enter_context(
+            patch('agent_db.set_app_setting'))
+        # Credentials are a property of the host, not of the logic under test:
+        # treat every provider as configured so only the degraded flag decides.
+        self._stack.enter_context(
+            patch('agent_config.has_real_secret', return_value=True))
+        self.addCleanup(self._stack.close)
+        self.addCleanup(agent_config.clear_provider_degraded, 'anthropic')
+
+    def test_classify_auth_error(self):
+        self.assertEqual(
+            self.agent_config.classify_auth_error('Credit balance is too low'),
+            'out of credit')
+        reason = self.agent_config.classify_auth_error(
+            'Your organization has disabled Claude subscription access')
+        self.assertIn('subscription', reason)
+        self.assertIsNone(
+            self.agent_config.classify_auth_error('some generic task failure'))
+
+    def test_degraded_claude_fails_fast_with_clear_message(self):
+        self.agent_config.mark_provider_degraded('anthropic', 'out of credit')
+        # Popen must not be reached: the guard fires before any subprocess.
+        # which() is stubbed so the test is deterministic on hosts without the CLI.
+        with patch('shutil.which', return_value='/usr/bin/claude'), \
+             patch('subprocess.Popen', side_effect=AssertionError('no spawn')):
+            with self.assertRaises(RuntimeError) as ctx:
+                agent_router._call_claude_cli(
+                    'claude-sonnet-5-5', 'hi', project_path='.')
+        self.assertIn('currently unavailable', str(ctx.exception))
+        self.assertIn('out of credit', str(ctx.exception))
+
+    def test_default_model_substitutes_when_claude_degraded(self):
+        self.agent_config.mark_provider_degraded('anthropic', 'out of credit')
+        model = self.agent_config.default_model_for()
+        self.assertFalse(model.startswith('claude-'))
+        self.assertEqual(model, 'mistral-glm-5-3-flash')
+        self.agent_config.clear_provider_degraded('anthropic')
+        self.assertEqual(self.agent_config.default_model_for(),
+                         self.agent_config.DEFAULT_MODEL)
+
+    def test_models_endpoint_marks_unavailable(self):
+        self.agent_config.mark_provider_degraded('anthropic', 'out of credit')
+        self.assertFalse(self.agent_config.model_available('claude-sonnet-5-5'))
+        self.assertTrue(self.agent_config.model_available('mistral-glm-5-3-flash'))
+        self.assertEqual(
+            self.agent_config.model_provider('claude-sonnet-5-5'), 'anthropic')

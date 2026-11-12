@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "last_reviewed": "2026-10-07",
+    "last_reviewed": "2026-11-10",
     "review_after": "2027-01-07",
     "note": "Counselor knowledge base. 'tier_weight' ranks general capability bands; each model's 'tier' + 'strengths' drive recommendations. 'task_types' map task keywords to the strengths a good model should have. Any model NOT listed under 'models' falls back to 'provider_defaults' (then a neutral default), so newly-registered models still get ranked without editing this file. Refresh tiers/strengths/keywords when the model landscape shifts (target: quarterly, see review_after). Capabilities that are already declared elsewhere (context_window, vision, tools, cost, EU/provider) are read live from agent_config + model_caps.json and must NOT be duplicated here."
   },
@@ -79,9 +79,9 @@
     "claude-sonnet-4-6":          { "tier": "strong",   "strengths": ["coding", "agentic", "code_review", "reasoning", "writing", "vision", "analysis"] },
     "claude-haiku-4-5-20251001":  { "tier": "light",    "strengths": ["coding", "writing", "speed", "vision"] },
     "mistral-large-4":            { "tier": "frontier", "strengths": ["reasoning", "coding", "agentic", "writing", "multilingual", "analysis", "research", "financial", "vision", "long_context"] },
-    "mistral-large-latest":       { "tier": "strong",   "strengths": ["writing", "reasoning", "multilingual", "analysis", "research", "financial"] },
     "mistral-glm-5-3":            { "tier": "frontier", "strengths": ["coding", "agentic", "code_review", "reasoning", "multilingual", "long_context"] },
-    "mistral-medium-latest":      { "tier": "mid",      "strengths": ["writing", "multilingual", "analysis", "research", "coding", "agentic", "vision"] },
+    "mistral-glm-5-3-flash":      { "tier": "strong",   "strengths": ["coding", "agentic", "vision", "speed", "reasoning"] },
+    "mistral-deepseek-v4.1-flash": { "tier": "strong",  "strengths": ["coding", "agentic", "reasoning", "vision", "speed"] },
     "mistral-small-latest":       { "tier": "light",    "strengths": ["writing", "multilingual", "speed"] },
     "codex-chatgpt":              { "tier": "strong",   "strengths": ["coding", "agentic", "code_review"] },
     "scw-qwen3.5-397b":           { "tier": "frontier", "strengths": ["coding", "agentic", "reasoning", "long_context", "analysis", "vision"] },

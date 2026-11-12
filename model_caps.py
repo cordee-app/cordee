@@ -109,6 +109,48 @@ def get_cap(model_id: str) -> Dict[str, Any]:
     return merged
 
 
+def route_delivers_images(model_id: str, slot=None, mode: str = 'inline') -> bool:
+    """True when the dispatched route can actually hand the model an image.
+
+    Only two route families do:
+      * the in-process OpenAI tool loops (Scaleway / Ollama / OpenAI) — a
+        ``read_file`` result becomes an ``image_url`` part in
+        ``agent_router._tool_result_content``;
+      * the Claude CLI (its native Read returns image blocks — both auth
+        modes go through the CLI, see ``agent_router.call_anthropic``).
+
+    The Vibe CLI is file-capable but its own ``read_file`` returns the raw
+    bytes as text, so a vision-capable Mistral model cannot see the photo
+    (regression: CTIH task 10001302, execs 20001465/20001466 — the model
+    reported "file reader returned the JPEG as raw bytes"). The Mistral API
+    fallback and batch (chunk-and-aggregate) runs are toolless.
+
+    Deliberately fail-open: only the two cases proven broken (the Mistral
+    route and batch mode) return False. An unknown model or a lookup error
+    leaves today's "call read_file to view it" promise intact, so a working
+    route never loses its note (RP-087 E3 regression guard).
+    """
+    try:
+        if (mode or 'inline') == 'batch':
+            return False
+        model_id = (model_id or '').strip()
+        if not model_id:
+            return False
+        from agent_config import MODELS
+        provider = (MODELS.get(model_id) or {}).get('provider') or ''
+        if not provider:
+            if model_id.startswith(('mistral-', 'open-mistral',
+                                    'codestral-', 'devstral-')):
+                provider = 'mistral'
+            elif model_id.startswith('claude-'):
+                provider = 'anthropic'
+        # The Mistral route cannot deliver image content in any mode: Vibe's
+        # read_file returns bytes-as-text and the API fallback has no tools.
+        return provider != 'mistral'
+    except Exception:
+        return True
+
+
 # Smallest output budget that reliably leaves room for an answer after a
 # reasoning model has finished thinking. Derived from the measurements in the
 # module docstring: 1600 was clean 12/12 where 800 failed 9/12, and observed

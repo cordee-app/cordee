@@ -80,6 +80,10 @@ demo/
 Plans/
 opencode.json
 
+# Ollama model store — weights live in ~/.ollama; belt-and-braces
+# in case it is ever created inside the checkout. Never commit GGUFs.
+.ollama/
+
 # ── Per-machine local settings ──────────────────────────────────────────────
 .claude/settings.local.json
 

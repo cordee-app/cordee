@@ -121,7 +121,11 @@ class PatchFieldAllowListTests(_TwoTenantApp, unittest.TestCase):
         args, kwargs = m.call_args
         self.assertEqual(args[0], self.task_a)
         self.assertNotIn('project_path', kwargs)
-        self.assertEqual(kwargs, {'title': 'renamed'})
+        # A content edit also clears the one-shot 'user-override' gate latch
+        # (agent_api.update_task) — that is the only other key expected here.
+        self.assertEqual(kwargs.get('gate_source'), '')
+        self.assertEqual(set(kwargs) - {'gate_source'}, {'title'})
+        self.assertEqual(kwargs['title'], 'renamed')
 
 
 class CrossTenantIdTests(_TwoTenantApp, unittest.TestCase):
@@ -715,6 +719,79 @@ class TaskReviewGuardTests(_TwoTenantApp, unittest.TestCase):
         # And the task can now be edited again.
         resp = self.client.patch(f'/api/tasks/{tid}', json={'title': 'after review'})
         self.assertEqual(resp.status_code, 200)
+
+
+class RestoreOriginalPromptTests(_TwoTenantApp, unittest.TestCase):
+    """POST /api/tasks/<tid>/restore-original-prompt.
+
+    The endpoint reverts an AI-rewritten description to the stored
+    ``original_description`` while leaving that stored value intact, and refuses
+    when the restore would corrupt an in-flight run or review.
+    """
+
+    def _task(self, description='rewritten prompt', original='original prompt'):
+        tid = agent_db.create_task(
+            self.proj_a['id'], 'Restore me', description=description,
+            project_path=self.path_a)
+        if original is not None:
+            agent_db.update_task(tid, project_path=self.path_a,
+                                 original_description=original)
+        return tid
+
+    def test_restore_original_prompt_replaces_description(self):
+        tid = self._task()
+        self._login(self.user_a)
+        # Set both fields through the real PATCH endpoint.
+        resp = self.client.patch(f'/api/tasks/{tid}', json={
+            'description': 'rewritten by AI', 'original_description': 'my prompt'})
+        self.assertEqual(resp.status_code, 200)
+
+        resp = self.client.post(f'/api/tasks/{tid}/restore-original-prompt')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()['description'], 'my prompt')
+
+        task = agent_db.get_task(tid, self.path_a)
+        self.assertEqual(task['description'], 'my prompt')
+        self.assertEqual(task['original_description'], 'my prompt')
+
+        # Re-fetch through the API: description restored, original untouched.
+        resp = self.client.get(f'/api/tasks/{tid}')
+        self.assertEqual(resp.status_code, 200)
+        fetched = resp.get_json()
+        self.assertEqual(fetched['description'], 'my prompt')
+        self.assertEqual(fetched['original_description'], 'my prompt')
+
+    def test_restore_without_original_is_rejected(self):
+        tid = self._task(original=None)
+        self._login(self.user_a)
+        resp = self.client.post(f'/api/tasks/{tid}/restore-original-prompt')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('No original prompt', resp.get_json()['error'])
+        # Nothing was overwritten.
+        self.assertEqual(
+            agent_db.get_task(tid, self.path_a)['description'], 'rewritten prompt')
+
+    def test_restore_refuses_running_task(self):
+        tid = self._task()
+        agent_db.update_task(tid, project_path=self.path_a, status='running')
+        self._login(self.user_a)
+        resp = self.client.post(f'/api/tasks/{tid}/restore-original-prompt')
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn('running', resp.get_json()['error'])
+        self.assertEqual(
+            agent_db.get_task(tid, self.path_a)['description'], 'rewritten prompt')
+
+    def test_restore_is_project_scoped(self):
+        tid = agent_db.create_task(
+            self.proj_b['id'], 'B task', description='b desc',
+            project_path=self.path_b)
+        agent_db.update_task(tid, project_path=self.path_b,
+                             original_description='b original')
+        self._login(self.user_a)
+        resp = self.client.post(f'/api/tasks/{tid}/restore-original-prompt')
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(
+            agent_db.get_task(tid, self.path_b)['description'], 'b desc')
 
 
 if __name__ == '__main__':

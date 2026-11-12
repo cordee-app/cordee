@@ -582,7 +582,8 @@ def me():
     """Current user + this month's usage counters + quota status."""
     user = g.current_user
     if user is None:
-        return jsonify(user=None, usage=None, month=_current_month(), quotas=None)
+        return jsonify(user=None, usage=None, month=_current_month(),
+                       quotas=None, terms=None)
     month = _current_month()
     try:
         usage = db.get_usage(user['id'], month)
@@ -596,7 +597,17 @@ def me():
         quotas = agent_quotas.get_quota_status(user['id'])
     except Exception:
         pass
-    return jsonify(user=user, usage=usage, month=month, quotas=quotas)
+    # Terms & Conditions state (never raises; None on any failure). Function-
+    # level import: agent_terms imports agent_auth, so a module-level import
+    # here would be circular.
+    terms = None
+    try:
+        import agent_terms
+        terms = agent_terms.terms_state_for(user)
+    except Exception:
+        terms = None
+    return jsonify(user=user, usage=usage, month=month, quotas=quotas,
+                   terms=terms)
 
 
 @auth_bp.route('/api/admin/users', methods=['GET'])

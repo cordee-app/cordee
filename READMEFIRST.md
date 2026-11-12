@@ -37,6 +37,7 @@ AIngel/
 ├── agent_permissions.py  ← Per-project + global Claude Code permission management
 ├── agent_git.py          ← Git-validated execution helper (per-task branch/commit/merge/revert)
 ├── agent_overseer.py     ← Phase 7 AIngel Autopilot hooks (H2 pre-run check, H3 post-run analysis, H4 overview)
+├── agent_decision.py     ← Local decision-model pre-filter (loopback Ollama; advisory H2 signal block)
 ├── agent_config.py       ← Model registry, pricing, API keys, READMEFIRST.md resolver
 ├── agent_tools.py        ← Tool definitions (file I/O) used by Scaleway function-calling loop
 │                            Tools: list_files, list_working_docs, read_file (start_line/end_line),
@@ -209,12 +210,14 @@ Feedback loop: Approve (→ memory) / Reject + Feedback (→ new task) / Skip / 
 | Claude Opus 4.7 | `claude-opus-4-7` | Anthropic | $5.00 | $25.00 | 1/3 |
 | Claude Fable 5.1 | `claude-fable-5-1` | Anthropic | $10.00 | $50.00 | 1/3 |
 | Claude Haiku 4.5 | `claude-haiku-4-5-20251001` | Anthropic | $1.00 | $5.00 | 1/3 |
-| Mistral Large | `mistral-large-latest` | Mistral | $0.00 | $0.00 | 2/3 |
+| ~~Mistral Large~~ | ~~`mistral-large-latest`~~ | Mistral | — | — | retired 2026-11-10 |
 | Mistral Large 4 | `mistral-large-4` | Mistral | $0.00 | $0.00 | 2/3 |
 | Mistral Small | `mistral-small-latest` | Mistral | $0.00 | $0.00 | 2/3 |
-| Mistral Medium | `mistral-medium-latest` | Mistral | $0.00 | $0.00 | 2/3 |
-| Codestral | `codestral-latest` | Mistral | $0.00 | $0.00 | 2/3 |
+| ~~Mistral Medium~~ | ~~`mistral-medium-latest`~~ | Mistral | — | — | retired 2026-11-10 |
+| ~~Codestral~~ | ~~`codestral-latest`~~ | Mistral | — | — | retired 2026-11-03 |
 | GLM-5.3 (Mistral Pro) | `mistral-glm-5-3` | Mistral | $0.00 | $0.00 | 2 |
+| GLM-5.3 Flash (Mistral Pro) | `mistral-glm-5-3-flash` | Mistral | $0.00 | $0.00 | 2/3 |
+| DeepSeek V4.1 Flash (Mistral Pro) | `mistral-deepseek-v4.1-flash` | Mistral | $0.00 | $0.00 | 2/3 |
 | Mistral OCR | `mistral-ocr-latest` | Mistral | $0.00 | $0.00 | 2/3/4 |
 | Codex ChatGPT (gpt-6-luna) | `codex-chatgpt` | OpenAI | $0.00 | $0.00 | 3 |
 | SCW DeepSeek-V4 Flash | `scw-deepseek-v4-flash` | Scaleway | $0.43 | $0.86 | 4 |
@@ -249,6 +252,8 @@ Feedback loop: Approve (→ memory) / Reject + Feedback (→ new task) / Skip / 
 | OLL Nemotron-3 Ultra | `oll-nemotron-3-ultra` | Ollama | $0.00 | $0.00 | 5 |
 
 Mistral `-latest` models (and Mistral Large 4) are covered by the Le Chat Pro subscription via the Vibe CLI — flat, not per-token — so priced at $0.00. Scaleway prices in USD (EUR × 1.08). Ollama Cloud is subscription-metered by GPU-time, so also $0.00. For provider routing details see `agent_router.py` (`route()` and the EU guard).
+
+Mistral Medium 3.5 (`mistral-medium-latest`) and Mistral Large 3 (`mistral-large-latest`) were deprecated on 2026-10-31 and retire on 2027-04-30; Mistral's recommended replacement for both is Mistral Large 4 (`mistral-large-4`). They were dropped from the `VIBE_MODELS` allowlist on 2026-11-03 and retired from the catalogue on 2026-11-10: their task rows were migrated to `mistral-large-4` and the role defaults that named them to `mistral-glm-5-3-flash`. The API aliases stay valid until retirement, so an old row that still names one routes via the provider-prefix fallback (API mode) rather than failing. New tasks and chats should use `mistral-large-4`, `mistral-glm-5-3-flash` (default for Chats and the Guide) or `mistral-deepseek-v4.1-flash`.
 
 ## Work Sessions & Kanban Columns
 
@@ -393,6 +398,42 @@ Tasks carry an optional `role_id` that prepends a specialist system prompt. 8 gl
 
 REST: `GET/POST /api/roles`, `PUT/DELETE /api/roles/<rid>`, `GET/POST /api/projects/<pid>/roles`.
 
+## Terms and Conditions
+
+Versioned T&C with a **hard acceptance gate**. Publishing a new version forces every user to accept it again before using the app — automatic, no manual chasing. Decline = logout.
+
+**Where the text lives:** `legal/terms/<tag>.<lang>.md` in git (e.g. `legal/terms/2026-11.en.md`). The file must start with a single `# ` heading (the seeder takes the title from it) and use `## ` for sections. At boot the server seeds a frozen snapshot into `terms_versions`; once a version has any acceptance it is **immutable** (it is evidence of what the user agreed to).
+
+**Tables (central `aingel.db`):**
+
+| Table / key | Contents |
+|-------------|----------|
+| `terms_versions` | `id`, `version_tag`, `language`, `audience`, `title`, `content`, `content_hash`, `created_at` — `UNIQUE(version_tag, language, audience)` |
+| `terms_acceptances` | `id`, `user_id`, `version_id`, `language`, `accepted_at` — `UNIQUE(user_id, version_id)`; one row per user per version, first acceptance wins |
+| `app_meta.terms_current_version_id` | the live version (pointer) |
+| `app_meta.terms_gate_enabled` | kill-switch flag |
+
+**Runbook:**
+
+```bash
+# 1. add/edit the text, then restart so the seeder snapshots it
+sudo systemctl restart superagent-vault
+# 2. publish — the only go-live step (users are gated from this moment)
+python3 ops/publish_terms.py --tag 2026-11 --lang en
+# kill-switch (re-enable by publishing again)
+python3 ops/publish_terms.py --disable
+# status: current version, acceptances, gate flag
+python3 ops/publish_terms.py --status
+```
+
+**Behaviour:** unaccepted users get `403 terms_acceptance_required` on every gated API call and a full-screen blocking page. Exempt: `/api/me`, `/api/auth/*`, `/api/terms/*`, `/api/health`, the SPA shell and its assets. WebDAV (`/dav/*`) is **not** gated — it keeps its own edge auth.
+
+**Safety:** nothing is enforced until a version is published; a dangling pointer fails open; in `AINGEL_AUTH=off` mode the whole system is inert.
+
+**Genericity:** one global terms set today. The `audience` column and the `terms_state_for()` resolver are the extension points for future user types; `language` is there for translations (one live version at a time today).
+
+**Testing:** `python3 -m unittest test_agent_terms -v`.
+
 ## Project-Type Templates
 
 Project categories live in the `project_type_templates` table in `aingel.db`:
@@ -478,6 +519,8 @@ Set per task in Edit/Create Task ("Processing"), stored in `tasks.execution_type
 
 The task's `execution_type` is injected into the task dict as `task['_execution_type']` before `_build_prompt()` is called. Guide mode is set in Settings › Project under Guide autopilot.
 
+The local decision-model pre-filter is controlled by instance settings in `app_settings` (not per-project settings): `prefilter_enabled` (`0` off / `1` only `prefilter_project_ids` / `2` all projects; default `0`) and `prefilter_project_ids` (CSV of project ids).
+
 `aingel_name` (optional persona name, e.g. "Léa") is injected as the first line of the system prompt: `"You are Léa, AIngel for the Family project."` — followed by the role system prompt if a role is assigned (Phase 5, complete 2026-07-14).
 
 ## AIngel Autopilot — Phase 7
@@ -516,6 +559,8 @@ Single medium-AI call returning both strategic advice AND a prompt-completeness 
 - `gate=hold` (strict) → run aborted before `route()` is called; execution marked `failed` with gate reason, task reset to `pending`; user sees banner with Override & run / Discuss / Acknowledge buttons
 - `gate=skip` (strict) → same as hold (user decides whether to skip)
 - `gate=skip` (advisory) → banner shown, run proceeds
+
+**Local pre-filter (kill switch):** instance setting `prefilter_enabled` ∈ `{0,1,2}` — `0` = off everywhere (default), `1` = only projects listed in `prefilter_project_ids` (CSV of ids), `2` = all projects. It is checked at enqueue, in the worker, and when H2 injects the block; `0` therefore makes the H2 prompt byte-identical to the pre-feature prompt. The local decision model is triage only — H2 still makes the gate decision.
 
 ### H3 — post-run analysis (replaces the legacy Haiku brief)
 
@@ -601,6 +646,8 @@ Three fixes to Phase 7 based on real task runs (676/677) where AIngel was silent
 -- project.db tasks table
 ALTER TABLE tasks ADD COLUMN gate_report_h2_json TEXT;
 ```
+
+**Local pre-filter payload:** `tasks.prefilter_json` stores the async local decision-model result alongside `gate_report_h2_json`. It is advisory only: when the feature is enabled and the payload is fresh, H2 receives a compact signal block (flags / review lines / route mismatches, ≤800 chars); when the flag is off, the payload is missing, or the result is `unknown`, H2 receives nothing and the prompt is unchanged. P18 `risk_score` is stored for reporting but never rendered.
 
 New DB helpers:
 - `update_task_h2_gate(task_id, h2_json, gate_state, gate_reason, gate_decided_at, project_path)` — writes H2 to its own column

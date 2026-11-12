@@ -202,28 +202,50 @@ class _TransientHTTPError(Exception):
     retried because only ReadTimeout/ConnectionError were retryable.
     """
 
+
+class _NoRetryProviderError(Exception):
+    """Raised when a LARGE request body (>_BIG_BODY_NO_RETRY_BYTES) dies on a
+    transport error (ReadTimeout/ConnectionError). Deliberately NOT in the
+    tenacity retry_if_exception_type tuple in `_post`: a body that size that
+    just blew its read timeout will not succeed unchanged on the next attempt,
+    so retrying it is pure wall-clock waste. Regression: RP-140
+    (exec 20001493, task 10001311) — a ~200k-token conversation (~800 KB of
+    JSON) read-timed-out at 300 s and the 3x tenacity retry of the identical
+    oversized body burned 15.5 min before the hard failure threw away the
+    whole in-memory checkpoint (~$1.64 of paid work). Fails fast instead;
+    pausable runs convert it into a user-resumable pause via _post_pausable.
+    """
+
+# Bodies above this size are presumed to be the failure themselves (the
+# RP-140 body was ~800 KB for ~200k tokens): no retry, fail fast.
+_BIG_BODY_NO_RETRY_BYTES = 400_000
+
+
 # Vibe resolves VIBE_ACTIVE_MODEL strictly against the `alias` field of each
 # `[[models]]` block in ~/.vibe/config.toml — never against `name` (verified
 # in vibe/core/config/_settings.py:get_active_model). SuperAgent's canonical
 # IDs use the `-latest` API aliases; map each one to the Vibe alias here.
 # Update when new models are added to VIBE_MODELS.
 _VIBE_MODEL_ID_MAP = {
-    'mistral-large-latest':  'mistral-large',
     'mistral-large-4':       'mistral-large-4',
-    'mistral-medium-latest': 'mistral-medium-3.5',
     'mistral-small-latest':  'mistral-small',
-    'codestral-latest':      'codestral',
     'mistral-glm-5-3':       'zai-glm-5-3',
+    'mistral-glm-5-3-flash': 'zai-glm-5-3-flash',
+    'mistral-deepseek-v4.1-flash': 'deepseek-v4-1-flash-1017',
 }
 
 # Wire ID translation for the direct API paths (call_mistral API mode and
 # _call_mistral_web_search). SuperAgent's canonical IDs are stable aliases;
 # the Mistral API expects the real wire ID. For most models the two are
-# identical, but `mistral-glm-5-3` maps to `zai-glm-5-3` (Z.ai GLM-5.3 hosted
-# by Mistral). Keep in step with _VIBE_MODEL_ID_MAP — a model added to one
-# without the other silently 404s on the API path or fails Vibe resolution.
+# identical, but `mistral-glm-5-3` maps to `zai-glm-5-3`, `mistral-glm-5-3-flash`
+# to `zai-glm-5-3-flash` and `mistral-deepseek-v4.1-flash` to
+# `deepseek-v4-1-flash-1017` (third-party models hosted by Mistral). Keep in
+# step with _VIBE_MODEL_ID_MAP — a model added to one without the other
+# silently 404s on the API path or fails Vibe resolution.
 _MISTRAL_WIRE_ID_MAP = {
     'mistral-glm-5-3': 'zai-glm-5-3',
+    'mistral-glm-5-3-flash': 'zai-glm-5-3-flash',
+    'mistral-deepseek-v4.1-flash': 'deepseek-v4-1-flash-1017',
 }
 
 
@@ -452,6 +474,11 @@ class LimitReached(Exception):
 # behaviour (forced final answer + TOOL_TURN_LIMIT_MARKER).
 _PAUSE_SCOPE = contextvars.ContextVar('cordee_pause_scope', default=None)
 TOOL_LOOP_TIME_BUDGET_SECS = max(60, int(os.getenv('TOOL_LOOP_TIME_BUDGET_SECS', '2700')))
+# Kill-switch for tool-loop text-history compaction (RP-140): parsed once at
+# import like the budget above; '0'/'false'/'no'/'off' disables
+# _compact_text_history entirely. Default on.
+TOOL_LOOP_TEXT_COMPACT = (os.getenv('AINGEL_TOOL_LOOP_TEXT_COMPACT', '1')
+                          .strip().lower() not in ('0', 'false', 'no', 'off'))
 _STATUS_AT_LIMIT_PROMPT = (
     "Stop here: this run has reached its {what} limit. Do not call any tools. "
     "In at most 10 lines, tell the user: (1) what is done, naming the files you wrote; "
@@ -798,7 +825,8 @@ def _vibe_session_usage(project_path, prompt, t0, t1, root=None):
             return None   # ambiguous — never attribute another run's usage
         mine = candidates
     out = {'calls': 0, 'input': 0, 'cached': 0, 'output': 0,
-           'last_has_text': False, 'sessions': [os.path.basename(d) for d in mine]}
+           'last_has_text': False, 'last_finish_reason': '',
+           'sessions': [os.path.basename(d) for d in mine]}
     for d in mine:
         for rec in _records(d):
             if rec.get('type') != 'action_result':
@@ -811,6 +839,7 @@ def _vibe_session_usage(project_path, prompt, t0, t1, root=None):
             out['input'] += int(u.get('input_tokens') or 0)
             out['cached'] += int(u.get('cached_input_tokens') or 0)
             out['output'] += int(u.get('output_tokens') or 0)
+            out['last_finish_reason'] = str(res.get('finish_reason') or '')
             # A final answer: the call did not end on a tool call and carries
             # answer text (reasoning parts don't count).
             answer = [p for p in (res.get('parts') or [])
@@ -1023,8 +1052,19 @@ def _call_vibe_cli(model_id, prompt, max_tokens=4096, *, project_path=None,
         vibe_usage = None
     # Vibe 2.26 stops at --max-turns with exit 0, so the non-zero-exit check in
     # _run_vibe_cli no longer sees it: exec 20001220 hit 80 calls and came back
-    # with an empty reply and no marker.
-    if vibe_usage and vibe_usage['calls'] >= VIBE_MAX_TURNS and not vibe_usage['last_has_text']:
+    # with an empty reply and no marker. A run can ALSO end mid-work far below
+    # the budget: the last model call spends its whole output budget on
+    # reasoning (finish_reason 'other', no text part, no tool call), Vibe
+    # closes the session with exit 0, and the parser falls back to an earlier
+    # assistant message — so an unfinished run looks 'done' (regression: exec
+    # 20001441/20001442 on task 10001301, 13–16 of 80 calls, deliverable never
+    # written). Any last call that is neither a tool call nor a real answer is
+    # an incomplete run. A bare tool call as the very last record is the
+    # documented turn-limit shape and keeps its own handling (simulation-
+    # detector exemption), so below the budget it is NOT flagged here.
+    _exhausted = bool(vibe_usage and vibe_usage['calls'] >= VIBE_MAX_TURNS)
+    if (vibe_usage and not vibe_usage['last_has_text']
+            and (vibe_usage.get('last_finish_reason') != 'tool_call' or _exhausted)):
         vibe_turn_limit = True
 
     def _pause_or_mark(_text):
@@ -1047,9 +1087,15 @@ def _call_vibe_cli(model_id, prompt, max_tokens=4096, *, project_path=None,
         if vibe_turn_limit:
             _text = ((_text or '').rstrip()
                      or '_(The model left no final text: its last action was a tool call.)_')
+            if _exhausted:
+                _why = (f"{VIBE_TURN_LIMIT_MARKER} ({VIBE_MAX_TURNS} turns) before "
+                        "the model produced a final answer.")
+            else:
+                _why = (f"{VIBE_TURN_LIMIT_MARKER} — the run ended without a final "
+                        "answer: the last model response carried only reasoning "
+                        "(no text, no tool call).")
             _text += (
-                f"\n\n---\n⚠️ **{VIBE_TURN_LIMIT_MARKER} ({VIBE_MAX_TURNS} turns) before "
-                "the model produced a final answer.** The text above is the last "
+                f"\n\n---\n⚠️ **{_why}** The text above is the last "
                 "assistant message; files it wrote may be incomplete. The task is "
                 "likely too large for one run (split it into smaller tasks) or "
                 "needs tools the Vibe CLI doesn't provide (e.g. Proton MCP email "
@@ -1149,6 +1195,15 @@ def _call_claude_cli(model_id, prompt, max_tokens=4096, *, project_path=None, au
     import subprocess, json, shutil, os
     if not shutil.which('claude'):
         raise RuntimeError('claude CLI not found. Install Claude Code: https://claude.ai/code')
+    # Failure-driven health: never spawn the CLI for a provider we already know
+    # is unusable (no credit / subscription disabled). A probe run from Create
+    # Task or a model-list refresh clears this automatically when it recovers.
+    _degraded = agent_config.provider_degraded('anthropic')
+    if _degraded:
+        raise RuntimeError(
+            f'Claude is currently unavailable ({_degraded}). Switch this '
+            f'task/chat to an available model, or restore Anthropic billing. '
+            f'The model list re-checks Claude automatically when you open a task.')
     if not project_path:
         _log.warning('_call_claude_cli: project_path is empty; inheriting server cwd')
 
@@ -1253,6 +1308,13 @@ def _call_claude_cli(model_id, prompt, max_tokens=4096, *, project_path=None, au
                 or 'Reached max turns' in str(_env.get('result') or '')):
             _pause_on_max_turns(_env)
         err = result.stderr.strip() or result.stdout.strip()
+        _reason = agent_config.classify_auth_error(err)
+        if _reason:
+            agent_config.mark_provider_degraded('anthropic', _reason)
+            raise RuntimeError(
+                f'Claude is currently unavailable ({_reason}). Switch this '
+                f'task/chat to an available model, or restore Anthropic billing. '
+                f'Claude CLI said: {err[:400]}')
         raise RuntimeError(f'claude CLI error (exit {result.returncode}): {err}')
     try:
         data = _load_result_envelope(result.stdout)
@@ -1599,7 +1661,8 @@ def _call_mistral_ocr(model_id, prompt, max_tokens=4096, *, project_path=None, e
 
 def call_mistral(model_id, prompt, max_tokens=4096, *, project_path=None,
                  force_mistral_mode=None, web_search=False, exec_id=None,
-                 caller=None, **_):
+                 caller=None, no_upscale=False, max_attempts=None,
+                 timeout_ms=None, reasoning_effort=None, **_):
     """Route Mistral models. Two modes:
     - 'vibe' (CLI path): full tool support, bills to Le Chat Pro subscription
     - 'api'  (SDK path): text-only fallback, bills to API credits
@@ -1615,6 +1678,12 @@ def call_mistral(model_id, prompt, max_tokens=4096, *, project_path=None,
     `mistral-ocr-latest` is routed to `_call_mistral_ocr` (POST /v1/ocr),
     not to chat. It is EU-compliant and Pro-covered like other
     `mistral-*-latest` models.
+
+    `no_upscale` skips the cap re-run on `finish_reason='length'` (the
+    truncated text is still marked with TRUNCATION_MARKER); `max_attempts`
+    overrides the tenacity retry count; `timeout_ms` overrides the SDK read
+    timeout (both default to the configured values); `reasoning_effort`
+    ('low'|'medium'|'high') is forwarded to reasoning models on the API path.
     """
     if _is_mistral_ocr_model(model_id):
         return _call_mistral_ocr(model_id, prompt, max_tokens, project_path=project_path, exec_id=exec_id)
@@ -1649,19 +1718,22 @@ def call_mistral(model_id, prompt, max_tokens=4096, *, project_path=None,
             raise ValueError('MISTRAL_VIBE_KEY not set in .env')
         # 300s read timeout; SDK default falls through to httpx's 60s which
         # is too tight for longer Mistral completions.
-        client = Mistral(api_key=key, timeout_ms=300_000)
+        client = Mistral(api_key=key, timeout_ms=timeout_ms or 300_000)
 
         @retry(
-            stop=stop_after_attempt(getattr(agent_config, 'MISTRAL_API_RETRY_ATTEMPTS', 3)),
+            stop=stop_after_attempt(max_attempts or getattr(agent_config, 'MISTRAL_API_RETRY_ATTEMPTS', 3)),
             wait=wait_exponential(multiplier=1, min=10, max=30),
             reraise=True,
         )
         def _complete(limit=None):
-            return client.chat.complete(
-                model=_mistral_wire_id(model_id),
-                messages=[{'role': 'user', 'content': prompt}],
-                max_tokens=limit if limit is not None else max_tokens,
-            )
+            kwargs = {
+                'model': _mistral_wire_id(model_id),
+                'messages': [{'role': 'user', 'content': prompt}],
+                'max_tokens': limit if limit is not None else max_tokens,
+            }
+            if reasoning_effort:
+                kwargs['reasoning_effort'] = reasoning_effort
+            return client.chat.complete(**kwargs)
 
         r = _complete()
         raw = r.choices[0].message.content if r.choices else ''
@@ -1675,7 +1747,7 @@ def call_mistral(model_id, prompt, max_tokens=4096, *, project_path=None,
             # that is still truncated so the executor's deliverable guard fires.
             cap_max = int(get_cap(model_id).get('max_tokens') or max_tokens)
             effective_mt = effective_max_tokens(model_id, cap_max)
-            if effective_mt > max_tokens:
+            if effective_mt > max_tokens and not no_upscale:
                 _log.warning(
                     "Mistral API response truncated at max_tokens=%s — retrying at %s "
                     "(model=%s, completion_tokens=%s)",
@@ -2017,6 +2089,70 @@ def _compact_image_history(messages):
             total -= sz
 
 
+# Text-history compaction (RP-140, exec 20001493 / task 10001311): tool
+# results are the fastest-growing part of `messages` — a long loop that reads
+# files and runs commands grows the body until the request itself becomes the
+# failure (~200k tokens read-timed-out at 300 s on Scaleway). Elide the OLDEST
+# oversized tool-result texts; the most recent ones are the model's current
+# evidence and stay verbatim. Same philosophy as _compact_image_history
+# above: touch only what is genuinely too large, oldest-first, idempotent.
+_TOOL_TEXT_ELIDED_MARK = '[tool result elided'
+
+
+def _elide_tool_text(text):
+    """The stub _compact_text_history replaces an oversized tool result with —
+    keeps the first 300 chars so the model can still tell what it was."""
+    return (f'{_TOOL_TEXT_ELIDED_MARK} to keep the request small — '
+            f'first 300 chars: {text[:300]}…]')
+
+
+def _compact_text_history(messages, keep_recent=8, cap_chars=10_000):
+    """Stub the text of OLD oversized tool results so the request body stays
+    sendable. Regression: RP-140 (exec 20001493, task 10001311) — the run
+    burned $1.64 and 28 min, then died on a 300 s read timeout because the
+    ~200k-token conversation no longer fit the request, and the exception
+    propagated as a hard failure that threw the whole in-memory checkpoint
+    away.
+
+    Every turn re-sends the whole `messages` list. Tool results older than
+    the last `keep_recent` whose text exceeds `cap_chars` are replaced by a
+    stub carrying the first 300 chars — the model already consumed them; the
+    recent ones (its current evidence) stay verbatim. Multi-part content
+    (image tool results) keeps its `image_url` parts untouched and only
+    oversized `{'type': 'text'}` parts are stubbed; `role` and `tool_call_id`
+    are preserved. Idempotent: a stub is detected by its marker and never
+    re-stubbed. Env kill-switch: AINGEL_TOOL_LOOP_TEXT_COMPACT=0 (parsed at
+    import into TOOL_LOOP_TEXT_COMPACT above).
+    """
+    if not TOOL_LOOP_TEXT_COMPACT:
+        return
+    tool_idx = [i for i, m in enumerate(messages)
+                if isinstance(m, dict) and m.get('role') == 'tool']
+    # everything except the last `keep_recent` tool messages; keep_recent<=0
+    # means no protection at all ([:-0] would slice to empty, hence the guard)
+    old = tool_idx[:-keep_recent] if keep_recent > 0 else tool_idx
+    for i in old:
+        m = messages[i]
+        content = m.get('content')
+        if isinstance(content, str):
+            if len(content) > cap_chars and not content.startswith(_TOOL_TEXT_ELIDED_MARK):
+                m['content'] = _elide_tool_text(content)
+        elif isinstance(content, list):
+            # image tool results: stub only the oversized text parts, never
+            # the image_url parts (a re-read is the only way to re-deliver one)
+            new_parts = None
+            for j, part in enumerate(content):
+                if not (isinstance(part, dict) and part.get('type') == 'text'):
+                    continue
+                t = part.get('text') or ''
+                if len(t) > cap_chars and not t.startswith(_TOOL_TEXT_ELIDED_MARK):
+                    if new_parts is None:
+                        new_parts = list(content)
+                    new_parts[j] = {'type': 'text', 'text': _elide_tool_text(t)}
+            if new_parts is not None:
+                m['content'] = new_parts
+
+
 def _run_openai_tool_loop(*, provider_label, api_url, api_key, wire_model,
                           model_id, prompt, max_tokens, max_turns, project_path,
                           exec_id=None):
@@ -2055,7 +2191,43 @@ def _run_openai_tool_loop(*, provider_label, api_url, api_key, wire_model,
             reraise=True,
         )
         def _do_post():
-            resp = _requests.post(api_url, headers=headers, data=raw, timeout=300)
+            # Read-timeout cap for pausable runs (regression: RP-140,
+            # exec 20001493) — a 300 s read timeout inside a 2700 s time
+            # budget lets one stalled call silently eat the whole segment.
+            # Cap the read timeout to the REMAINING budget, floored at 60 s
+            # so a nearly-spent budget doesn't turn every call into a fast
+            # connection failure; never above the historical 300. Non-pausable
+            # callers keep exactly 300. _pause/_t_start are assigned after
+            # _post is defined (they live in the try: below), so guard the
+            # read with NameError — the wrapper is only ever invoked once
+            # they are bound, but stay safe anyway.
+            try:
+                _ps, _ts = _pause, _t_start
+            except NameError:
+                _ps, _ts = None, None
+            if _ps:
+                remaining = _ps['time_budget_s'] - (time.time() - _ts)
+                timeout = max(60, min(300, remaining))
+            else:
+                timeout = 300
+            try:
+                resp = _requests.post(api_url, headers=headers, data=raw, timeout=timeout)
+            except (_requests.exceptions.ReadTimeout,
+                    _requests.exceptions.ConnectionError) as e:
+                # Big-body fast-fail (regression: RP-140, exec 20001493): a
+                # >400 KB body that just blew its read timeout will not
+                # succeed unchanged on the next attempt — the 3x tenacity
+                # retry of the identical oversized body wasted 15.5 min
+                # before the hard failure. _NoRetryProviderError is NOT in
+                # the @retry tuple above, so this surfaces immediately
+                # (and the pausable wrapper converts it to a resumable
+                # pause instead of a total loss).
+                if len(raw) > _BIG_BODY_NO_RETRY_BYTES:
+                    raise _NoRetryProviderError(
+                        f"{type(e).__name__} on a {len(raw)}-byte request body "
+                        f"(no retry — the unchanged body just blew its read "
+                        f"timeout): {e}")
+                raise
             if resp.status_code != 200:
                 # 5xx and 429 are transient (LB/upstream hiccup, rate limit,
                 # reasoning-model stream timeout). 4xx are permanent and must
@@ -2108,6 +2280,11 @@ def _run_openai_tool_loop(*, provider_label, api_url, api_key, wire_model,
         _t_start = time.time()
         if _resume:
             messages = list(_resume['messages'])
+            # RP-140 (exec 20001493): a resumed checkpoint can already carry
+            # the huge tool-result history that killed the previous segment —
+            # elide the old oversized results BEFORE the first request of this
+            # segment repeats the same 300 s read timeout.
+            _compact_text_history(messages)
             note = (_resume.get('note') or '').strip()
             messages.append({'role': 'user', 'content': (
                 'The user chose to continue this run for another block of turns. '
@@ -2201,6 +2378,58 @@ def _run_openai_tool_loop(*, provider_label, api_url, api_key, wire_model,
                 'max_turns': max_turns,
             })
 
+        # Current turn number for the provider-failure pause checkpoint below.
+        # A one-slot cell: _force_final_text runs both mid-loop and from the
+        # post-loop else-branch, where the for-variable is not a reliable
+        # closure read.
+        _turn_now = [0]
+
+        def _post_pausable(body, turn_no):
+            """_post + convert a hard provider failure into a resumable pause.
+
+            Regression: RP-140 (exec 20001493, task 10001311) — the
+            conversation grew to ~200k tokens, api.scaleway.ai read-timed-out
+            at 300 s, and the ReadTimeout propagated as a hard failure: the
+            whole in-memory `messages` checkpoint (~$1.64 of paid work) was
+            thrown away, because the pause machinery only fired at turn/time
+            checkpoints between turns, never on provider errors. Now a
+            transport failure (read timeout, connection error, transient
+            5xx/429, or the big-body no-retry error) in a pausable run with
+            real work behind it becomes LimitReached('provider_error')
+            instead: the checkpoint mirrors _pause_now's shape (status_text
+            is '' — there is no status call to make here; all consumers do
+            `or ''`), and the outer except below attaches the segment's
+            usage to the exception. Turn 0 with an empty transcript has
+            nothing to lose, and non-pausable callers (chats, H3, batch)
+            keep the legacy hard-failure behaviour: re-raise unchanged.
+            """
+            try:
+                return _post(body)
+            except (_requests.exceptions.ReadTimeout,
+                    _requests.exceptions.ConnectionError,
+                    _TransientHTTPError,
+                    _NoRetryProviderError) as e:
+                if not current_pause_scope() or (turn_no <= 0 and not transcript):
+                    raise
+                # The oversized body was likely the failure itself (RP-140):
+                # shrink the old tool-result history so the checkpoint — and
+                # the resume's first request — is sendable again.
+                _compact_text_history(messages)
+                _err = ' '.join(str(e).split())[:160] or type(e).__name__
+                transcript.append(f'--- ⏸ Paused after a provider failure ({_err}) ---')
+                raise LimitReached('provider_error', {
+                    'messages': messages,
+                    'transcript': transcript,
+                    'reason': 'provider_error',
+                    'turns': turn_no,
+                    'elapsed_s': int(time.time() - _t_start),
+                    'status_text': '',
+                    'segment_tokens_input': tok_in_total,
+                    'segment_tokens_output': tok_out_total,
+                    'model_id': model_id,
+                    'max_turns': max_turns,
+                })
+
         def _force_final_text(mt=None):
             """One-shot forced synthesis when the loop ends without a usable final
             answer (either max_turns exhausted, or the model returned an empty
@@ -2211,7 +2440,10 @@ def _run_openai_tool_loop(*, provider_label, api_url, api_key, wire_model,
             """
             nonlocal tok_in_total, tok_out_total
             messages.append({'role': 'user', 'content': 'Based on all the information gathered above, provide your complete response now.'})
-            data = _post({'model': wire_model, 'messages': messages, 'max_tokens': mt if mt is not None else max_tokens})
+            # Pausable wrapper (RP-140): a provider failure here would also
+            # torch the whole checkpoint — convert it to a pause when the
+            # caller opted in.
+            data = _post_pausable({'model': wire_model, 'messages': messages, 'max_tokens': mt if mt is not None else max_tokens}, _turn_now[0])
             usage = data.get('usage', {})
             tok_in_total  += usage.get('prompt_tokens', 0) or 0
             tok_out_total += usage.get('completion_tokens', 0) or 0
@@ -2224,6 +2456,7 @@ def _run_openai_tool_loop(*, provider_label, api_url, api_key, wire_model,
 
         hit_turn_limit = False
         for turn in range(max_turns):
+            _turn_now[0] = turn  # for _force_final_text's provider-failure pause
             # Cancel check: the /cancel endpoint flips the execution row to
             # 'failed' and kills any child PID, but this loop runs in-process
             # (no child PID to signal). Without this check a cancelled
@@ -2249,7 +2482,10 @@ def _run_openai_tool_loop(*, provider_label, api_url, api_key, wire_model,
             if tools:
                 body['tools'] = tools
 
-            data = _post(body)
+            # Pausable wrapper (regression: RP-140, exec 20001493): a hard
+            # provider failure mid-loop must pause with a checkpoint, not
+            # torch ~$1.64 of in-memory work as a hard failure.
+            data = _post_pausable(body, turn)
 
             usage = data.get('usage', {})
             tok_in_total  += usage.get('prompt_tokens', 0) or 0
@@ -2326,7 +2562,9 @@ def _run_openai_tool_loop(*, provider_label, api_url, api_key, wire_model,
                     )
                     pre_retry_text = text
                     body2 = {**body, 'max_tokens': effective_mt}
-                    data2 = _post(body2)
+                    # Pausable wrapper (RP-140): same provider-failure →
+                    # pause conversion as the main call site above.
+                    data2 = _post_pausable(body2, turn)
                     u2 = data2.get('usage', {}) or {}
                     tok_in_total += u2.get('prompt_tokens', 0) or 0
                     tok_out_total += u2.get('completion_tokens', 0) or 0
@@ -2544,7 +2782,9 @@ def _enforce_eu_boundary(model_id, provider, prompt, project_path, caller):
 
 def route(model_id, prompt, max_tokens=4096, *, project_path=None,
           exec_id=None, force_anthropic_mode=None, force_mistral_mode=None,
-          caller='', policy_path=None, web_search=False):
+          caller='', policy_path=None, web_search=False,
+          no_upscale=False, max_attempts=None, timeout_ms=None,
+          reasoning_effort=None):
     """Route to the correct provider. Returns (text, tok_in, tok_out, cost_usd).
     `project_path` (keyword-only) is forwarded to the provider call so that
     subprocess-backed providers (claude CLI) can set cwd for per-project
@@ -2559,7 +2799,11 @@ def route(model_id, prompt, max_tokens=4096, *, project_path=None,
     deliberately passes `project_path=None` to disable tools (the large-file
     batch path) — the data still belongs to that project.
     `web_search` is forwarded to `call_mistral` only; the Conversations API
-    enables Mistral's web_search tool. Other providers absorb it via **_."""
+    enables Mistral's web_search tool. Other providers absorb it via **_.
+    `no_upscale`, `max_attempts`, `timeout_ms` and `reasoning_effort` are
+    forwarded to `call_mistral` only (skip the cap re-run, cap tenacity
+    attempts, set the SDK read timeout, set the reasoning effort for reasoning
+    models); other providers absorb them via **_."""
     m = MODELS.get(model_id)
 
     # Fallback: infer provider from model ID prefix for unregistered models
@@ -2618,7 +2862,9 @@ def route(model_id, prompt, max_tokens=4096, *, project_path=None,
         result = fn(model_id, prompt, max_tokens, project_path=project_path,
                     exec_id=exec_id,
                     force_anthropic_mode=force_anthropic_mode, force_mistral_mode=force_mistral_mode,
-                    web_search=web_search, caller=caller)
+                    web_search=web_search, caller=caller,
+                    no_upscale=no_upscale, max_attempts=max_attempts,
+                    timeout_ms=timeout_ms, reasoning_effort=reasoning_effort)
     except Exception as exc:
         # The choke point meters failed calls too — a provider call that
         # raised was still made and paid for (regression: a Scaleway run

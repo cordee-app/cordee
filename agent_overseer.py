@@ -506,8 +506,14 @@ def _has_file_extension(ref: str) -> bool:
 # map-task for a file the task itself was told to create). The gap check
 # still protects the noun use: "the output of `X.md`" keeps X an input.
 _OUTPUT_VERB_RE = re.compile(
-    r'\b(?:save|saved|saving|write|writing|create|created|creating|produce|'
-    r'generate|generated|export|store|output|outputs|outputting)\b(?P<gap>[^\n`"\']{0,60})$', re.I)
+    r'(?<!/)\b(?:save|saved|saving|write|writing|create|created|creating|produce|'
+    r'generate|generated|export|store|output|outputs|outputting)\b(?![/\\])'
+    r'(?P<gap>[^\n`"\']{0,60})$', re.I)
+# The lookbehind/lookahead guard path components: 'Artifacts/outputs/<id>/…' in
+# a resume or output-path mention must never read as the verb 'outputs'
+# (regression: exec 20001443 / task 10001301 — the pre-existing INPUT
+# contract_full.txt was flagged 'Deliverable not written' by H3 and the
+# executor's completion check because '/outputs/' preceded it on the line).
 # Imperative naming at the start of a sentence: "Name the output file … 'X.md'".
 # No input-word check: "using the decision number" there describes the name.
 # Only consulted for files that do not exist yet, so a renamed source is safe.
@@ -566,7 +572,7 @@ _LIST_MARKER_RE = re.compile(r'^\s*(?:[-*•+]|\d+[.)])\s+')
 # A parent line that announces outputs: imperative verb first, or an
 # "Output(s):" heading — after list markers and markdown emphasis.
 _OUTPUT_PARENT_RE = re.compile(
-    r'^(?:save|write|create|produce|generate|export|store)\b|^outputs?\b', re.I)
+    r'^(?:save|write|create|produce|generate|export|store)\b|^outputs?\b(?![/\\])', re.I)
 # A line that already names a file: "Save the report as `final.md`". A wrapped
 # reference on the next line is not that line's output (RP-099).
 _QUOTED_FILE_RE = re.compile(r'[`"\'][^`"\']+\.[A-Za-z0-9]{1,6}[`"\']')
@@ -720,6 +726,66 @@ def _scan_for_blocked_tools(output_text: str) -> List[str]:
 
 # ── H2 — Pre-run brief + completeness check (merged) ──────────────────────────
 
+# Local decision-model pre-filter (plan v1.2 §5.5). H2 is the gate; the
+# pre-filter is triage only, and the prompt says so — a local model must never
+# be given authority to hold a task on its own.
+_PREFILTER_H2_HEADER = 'Pre-filter triage (local decision model):'
+_PREFILTER_H2_NOT_AUTHORITY = (
+    'The pre-filter is local triage, not authority; verify before holding.')
+
+
+def _prefilter_h2_fragment(task: Dict[str, Any],
+                           project: Optional[Dict[str, Any]],
+                           project_path: str,
+                           route_facts: Optional[Dict[str, Any]] = None) -> str:
+    """H2 prompt fragment for the local pre-filter, or ``''``.
+
+    Returns nothing at all — leaving the prompt byte-identical to the
+    pre-prefilter behaviour — when the payload is absent/NULL, unparseable,
+    not ``status=='ok'``, the feature flag is off for this project, or the
+    renderer has no signal to report.
+
+    ``agent_decision`` is imported lazily (inside the function) so that
+    ``agent_overseer`` keeps its stdlib-only module-level imports and the
+    module DAG stays acyclic. Staleness (state-hash drift, plan v1.2 §5.4)
+    does NOT suppress the block: a slightly stale triage is still useful to
+    H2, but it is labelled so the gate model discounts it.
+    """
+    raw = (task or {}).get('prefilter_json')
+    if raw is None or raw == '':
+        return ''
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return ''
+    if not isinstance(payload, dict) or payload.get('status') != 'ok':
+        return ''
+    try:
+        import agent_decision
+    except Exception:
+        return ''
+    try:
+        if not agent_decision.prefilter_enabled(project_path):
+            return ''
+        block = agent_decision.render_h2_block(payload)
+    except Exception:
+        return ''
+    if not block:
+        return ''
+    stale = bool(payload.get('stale'))
+    if not stale:
+        try:
+            stale = bool(agent_decision.is_stale(
+                payload, task, project=project, route_facts=route_facts))
+        except Exception:
+            stale = False
+    header = _PREFILTER_H2_HEADER
+    if stale:
+        header += (' [stale: computed for an earlier description — '
+                   'verify freshness before relying on it]')
+    return f"{header}\n{block}\n{_PREFILTER_H2_NOT_AUTHORITY}\n"
+
+
 def pre_run_check(task: Dict[str, Any],
                   project: Dict[str, Any],
                   caught_files: List[str],
@@ -729,7 +795,8 @@ def pre_run_check(task: Dict[str, Any],
                   budget_snapshot: Optional[Dict[str, Any]] = None,
                   dep_outcomes: Optional[List[Dict[str, Any]]] = None,
                   rag_provenance: Optional[Dict[str, Any]] = None,
-                  dep_unmet: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                  dep_unmet: Optional[List[Dict[str, Any]]] = None,
+                  route_facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One medium-AI call that returns both strategic brief + completeness check.
 
     Returns a dict with keys:
@@ -858,18 +925,44 @@ def pre_run_check(task: Dict[str, Any],
     binary_unparsable = []
     capability_warnings = []
     vision = (model_caps or {}).get('vision', False)
+    # A vision cap alone is not enough: the route must deliver the image.
+    # Vibe's read_file returns bytes-as-text, and the API/batch routes have no
+    # tools (regression: CTIH task 10001302, execs 20001465/20001466). The
+    # executor computes this fact; fall back to the shared helper when the
+    # caller did not pass route_facts (never raises, fails open).
+    _route_images = None
+    if isinstance(route_facts, dict):
+        _route_images = route_facts.get('image_inputs')
+    if _route_images is None:
+        try:
+            from model_caps import route_delivers_images
+            _route_images = route_delivers_images(
+                (task or {}).get('model'),
+                (task or {}).get('work_session_slot'), 'inline')
+        except Exception:
+            _route_images = True
     # An OCR route (file_access 'api-ocr') has no chat vision but reads the
-    # referenced PDFs/images itself — agent_router._call_mistral_ocr.
-    ocr_reads = (('.pdf', '.png', '.jpg', '.jpeg') if file_access == 'api-ocr' else ())
+    # referenced PDFs/images itself — agent_router._call_mistral_ocr. Its
+    # /v1/ocr endpoint accepts PDF, png, jpg/jpeg and webp.
+    ocr_reads = (('.pdf', '.png', '.jpg', '.jpeg', '.webp')
+                 if file_access == 'api-ocr' else ())
     for bn in (noted_binary or []):
         ext = os.path.splitext(bn)[1].lower()
         if ext in ocr_reads:
             continue
-        if ext in ('.pdf', '.png', '.jpg', '.jpeg', '.gif') and not vision:
+        if ext in ('.pdf', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp') and not vision:
             binary_unparsable.append({
                 'name': bn,
                 'model_can_parse': False,
                 'reason': f'model has no vision capability; {ext} file cannot be read'
+            })
+        elif ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp') and not _route_images:
+            binary_unparsable.append({
+                'name': bn,
+                'model_can_parse': False,
+                'reason': ('vision-capable model, but this route cannot deliver image '
+                           'content — re-run on a tool-loop model (e.g. scw-*) or the '
+                           'Claude CLI')
             })
         elif ext in ('.db', '.sqlite', '.xlsx', '.xls', '.docx', '.pptx'):
             binary_unparsable.append({
@@ -1026,14 +1119,31 @@ def pre_run_check(task: Dict[str, Any],
     if rag_unwired:
         prompt += ("RAG: the description asks for the RAG library, but no retrieval is set up "
                    "for this run; the model cannot consult it.\n")
+    if route_facts:
+        # The route the prompt will actually be dispatched to (task 10001296:
+        # H2 was blind to a toolless batch route and passed a URL/folder task).
+        prompt += (f"Route for this run: {route_facts.get('route') or 'unknown'} — "
+                   f"file tools: {'yes' if route_facts.get('file_tools') else 'no'}; "
+                   f"web access: {'yes' if route_facts.get('web') else 'no'}.\n")
     prompt += f"Description:\n{desc}\n\n"
+    # Local pre-filter triage — after the Description it qualifies, before the
+    # gate rules. Empty (not even whitespace) when off/absent/unknown, so the
+    # prompt stays byte-identical to the pre-prefilter behaviour (plan §10).
+    _pf_fragment = _prefilter_h2_fragment(task, project, project_path, route_facts)
+    if _pf_fragment:
+        prompt += _pf_fragment
+    if route_facts and not route_facts.get('file_tools'):
+        _folder_rule = ("- run: every referenced file is inlined, OR the route is agentic and the file is inside the project (self-serve); no blocking binary mismatches. A folder listed above is NOT reachable on this route (no file tools) — if the description asks to read files from a folder, that is a gate=hold reason.\n")
+    else:
+        _folder_rule = ("- run: every referenced file is inlined, OR the route is agentic and the file is inside the project (self-serve); no blocking binary mismatches. A folder listed above as existing inside the project is reachable by an agentic model and is never a reason to hold.\n")
     prompt += (
         "Rules for `gate`:\n"
         "- If the Description ends with a 'User clarifications (Guide pre-run check):' "
         "block, those are the user's final answers to earlier review questions — the "
         "user has ALREADY answered them. Treat them as decided requirements when judging "
         "completeness and the gate; do NOT flag them as unresolved ambiguity.\n"
-        "- run: every referenced file is inlined, OR the route is agentic and the file is inside the project (self-serve); no blocking binary mismatches. A folder listed above as existing inside the project is reachable by an agentic model and is never a reason to hold.\n"
+        + _folder_rule
+        + "- A description that cites a URL requires web access; if the route has none, gate=hold.\n"
         + ("- run (OCR route): the model capabilities include `ocr`, so the referenced PDF/PNG/JPEG files are "
            "read by the OCR route itself — they need not be inlined and are not binary mismatches. Hold or "
            "skip only if the task asks for more than a transcription (filtering, analysis, other output files).\n"
@@ -1220,7 +1330,8 @@ def _rank_h2a_paths(paths: List[str], desc: str):
 
 def pre_check_questions(task: Dict[str, Any],
                         project: Dict[str, Any],
-                        file_names: List[str]) -> Dict[str, Any]:
+                        file_names: List[str],
+                        route_facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Lightweight pre-run clarification check (H2a) — runs at confirm time.
 
     Unlike ``pre_run_check`` (H2), this does NOT extract or inline any file
@@ -1274,6 +1385,13 @@ def pre_check_questions(task: Dict[str, Any],
             f"(not a definition file like READMEFIRST.md), ask ONE question proposing to move it to "
             f"Working Docs (reference material) or Artifacts/outputs/ (an earlier task's output).\n\n"
         )
+    route_block = ''
+    if route_facts:
+        route_block = (
+            f"Route for this run: {route_facts.get('route') or 'unknown'} — "
+            f"file tools: {'yes' if route_facts.get('file_tools') else 'no'}; "
+            f"web access: {'yes' if route_facts.get('web') else 'no'}.\n"
+        )
 
     prompt = (
         f"You are the Guide (project overseer) for the project \"{project.get('name','')}\". "
@@ -1292,12 +1410,16 @@ def pre_check_questions(task: Dict[str, Any],
         f"a folder listed here exists even if none of its files appear in the file list above):\n"
         f"{json.dumps(folder_list, ensure_ascii=False)}\n\n"
         f"{root_block}"
+        f"{route_block}"
         f"Description:\n{desc}\n\n"
         f"Rules:\n"
         f"- If the Description ends with a 'User clarifications (Guide pre-run check):' "
         f"block, those are questions the user has ALREADY answered — their answers are "
         f"final decisions. Do NOT re-ask anything already answered there; only ask about "
         f"genuinely new, different ambiguities.\n"
+        f"- If the route has no web access but the description cites a URL, or no file tools "
+        f"but it asks to read a folder, ask ONE question about how to proceed (or recommend "
+        f"an agentic route).\n"
         f"- The file list above is authoritative: it contains up to {len(file_list)} paths, "
         f"with files whose names most closely relate to the task description listed FIRST. "
         f"A file matching the description appears near the top if it exists. "
@@ -1678,7 +1800,9 @@ def _parts_line(execution: Dict[str, Any]) -> str:
     reason = (execution or {}).get('pause_reason') or ''
     if parts <= 1 and not reason:
         return ''
-    what = 'time' if reason == 'time' else 'turn'
+    # 'turns' → 'turn', 'time' → 'time', 'provider_error' → 'provider' (a
+    # provider hard-failure mid-run pauses like a limit does).
+    what = {'time': 'time', 'provider_error': 'provider'}.get(reason, 'turn')
     if parts <= 1:
         return f"Run parts: 1 — it paused at its {what} limit and the user stopped it there.\n"
     return (f"Run parts: {parts} — it paused at its {what} limit and the user continued it "

@@ -8,9 +8,13 @@ import { useStore } from '../store';
  */
 export function useProjectSSE(projectId: number | null) {
   const handleSSEEvent = useStore((s) => s.handleSSEEvent);
+  const termsRequired = useStore((s) => s.termsRequired);
 
   useEffect(() => {
     if (projectId === null) return;
+    // A gated SSE endpoint would 403 and EventSource would reconnect in a
+    // loop; stay closed until the T&C are accepted (flag cleared by loadAll).
+    if (termsRequired) return;
 
     const es = new EventSource(`/api/projects/${projectId}/events`);
 
@@ -31,5 +35,5 @@ export function useProjectSSE(projectId: number | null) {
     return () => {
       es.close();
     };
-  }, [projectId, handleSSEEvent]);
+  }, [projectId, handleSSEEvent, termsRequired]);
 }

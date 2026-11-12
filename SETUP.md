@@ -56,7 +56,7 @@ All variables go in `.env` (template: [.env.example](.env.example)).
 | `MISTRAL_VIBE_KEY` | | Pro/Vibe-scope key. Powers direct-API mode and the Vibe `mistral-vibe` provider. Optional: the Vibe CLI can log in through the browser instead; runs work without the key, but the admin readiness check (`/api/config/readiness`) then reports `vibe: false` (cosmetic only). |
 | `MISTRAL_ORG_KEY` | | PAYG/Org-scope key. Powers the Vibe `mistral-org` provider (Mistral Large). |
 | `MISTRAL_MODE` | `vibe` | `vibe` (CLI) or `api` (SDK) |
-| `VIBE_MODELS` | `mistral-large-latest,mistral-glm-5-3` | Mistral models allowed to use the Vibe CLI |
+| `VIBE_MODELS` | `mistral-large-4,mistral-small-latest,mistral-glm-5-3,mistral-glm-5-3-flash,mistral-deepseek-v4.1-flash` | Mistral models allowed to use the Vibe CLI |
 | `VIBE_MAX_PRICE` | `15.00` | Maximum cost in USD per Vibe task |
 | `SCALEWAY_API_KEY` | | Scaleway Generative APIs (`scw-*` models) |
 | `OPENAI_API_KEY` | | OpenAI models |

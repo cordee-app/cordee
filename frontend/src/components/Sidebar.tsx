@@ -4,7 +4,9 @@ import { taskChip } from '../utils/taskCode';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useProjectPermissions } from '../hooks/useProjectPermissions';
 import { MobileDrawer } from './MobileDrawer';
-import { ChevronDown, ChevronRight, X, Plus } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { ChevronDown, ChevronRight, X, Plus, Search } from 'lucide-react';
+import { matchesQuery, matchesTaskQuery } from '../utils/taskSearch';
 
 function projectColor(name: string): string {
   let hash = 0;
@@ -30,6 +32,34 @@ export const Sidebar = () => {
 
   const isMobile = useIsMobile();
   const perms = useProjectPermissions(activeProject);
+
+  const [taskSearch, setTaskSearch] = useState('');
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // The query is scoped to a project: clear it when the active project changes.
+  useEffect(() => {
+    setTaskSearch('');
+  }, [activeProject]);
+
+  // "/" focuses the sidebar search, as long as the user is not already typing
+  // somewhere and the full sidebar (with its input) is actually rendered.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (sidebarCollapsed && !isMobile) return;
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) return;
+      }
+      const input = searchInputRef.current;
+      if (!input) return;
+      e.preventDefault();
+      input.focus();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [sidebarCollapsed, isMobile]);
 
   if (activeProject === null) return null;
 
@@ -76,6 +106,27 @@ export const Sidebar = () => {
     if (numA !== numB) return numA - numB;
     return a.localeCompare(b);
   });
+
+  const search = taskSearch.trim();
+  const searching = search.length > 0;
+  // A selected phase scopes the search exactly like it scopes the board: while
+  // it is active only that phase's tasks are searchable. The count in the
+  // placeholder reflects the same scope.
+  const scopedPhaseName = activePhase?.phaseName ?? null;
+  const scopeCount = scopedPhaseName
+    ? (phases.get(scopedPhaseName)?.length ?? 0)
+    : projectTasks.length;
+  const searchScope = searching && scopedPhaseName
+    ? sortedPhases.filter(([phaseName]) => phaseName === scopedPhaseName)
+    : sortedPhases;
+  const visiblePhases = searchScope
+    .map(([phaseName, phaseTasks]) => {
+      if (!searching) return [phaseName, phaseTasks] as const;
+      // A query that matches the phase name surfaces the whole phase.
+      if (matchesQuery(phaseName, search)) return [phaseName, phaseTasks] as const;
+      return [phaseName, phaseTasks.filter((t) => matchesTaskQuery(t, search))] as const;
+    })
+    .filter(([, phaseTasks]) => !searching || phaseTasks.length > 0);
 
   if (sidebarCollapsed && !isMobile) {
     return (
@@ -176,10 +227,37 @@ export const Sidebar = () => {
         </button>
       )}
 
+      <div className="sidebar-search flex items-center gap-1.5 px-3 pb-2">
+        <Search size={13} className="text-text-faint dark:text-text-dark-faint shrink-0" aria-hidden="true" />
+        <div className="relative flex-1 flex items-center">
+          <input
+            ref={searchInputRef}
+            data-tip={scopedPhaseName ? `Search within ${scopedPhaseName}` : 'Search tasks by title, description, code, id, or phase'}
+            type="search"
+            aria-label="Search tasks"
+            placeholder={`Search ${scopeCount} task${scopeCount === 1 ? '' : 's'}\u2026`}
+            value={taskSearch}
+            onChange={(e) => setTaskSearch(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Escape') setTaskSearch(''); }}
+            className="w-full box-border py-1 pl-[8px] pr-[20px] text-sm+ border border-default rounded bg-surface-raised dark:bg-surface-dark-base dark:border-border-dark-default dark:text-text-dark"
+          />
+          {taskSearch && (
+            <button
+              data-tip="Clear the task search"
+              aria-label="Clear task search"
+              onClick={() => setTaskSearch('')}
+              className="absolute right-1.5 flex items-center justify-center cursor-pointer text-text-faint hover:text-ink"
+            >
+              <X size={12} />
+            </button>
+          )}
+        </div>
+      </div>
+
       <div className="sidebar-phases p-0">
-        {sortedPhases.map(([phaseName, phaseTasks]) => {
+        {visiblePhases.map(([phaseName, phaseTasks]) => {
           const phaseKey = `${activeProject}::${phaseName}`;
-          const isExpanded = expandedPhases.has(phaseKey);
+          const isExpanded = searching ? true : expandedPhases.has(phaseKey);
           const phaseRunning = phaseTasks.filter(t => t.status === 'running').length;
           const phasePending = phaseTasks.filter(t => norm(t.status) === 'pending' || t.status === 'confirmed').length;
           const phaseDone = phaseTasks.filter(t => t.status === 'done').length;
@@ -207,6 +285,8 @@ export const Sidebar = () => {
                   >
                     <X size={10} />
                   </button>
+                ) : searching ? (
+                  <span className="toggle-icon inline-flex items-center text-xs w-3.5" />
                 ) : (
                   <span
                     className="toggle-icon inline-flex items-center text-xs w-3.5 text-[#645c50] dark:text-text-dark-muted"
@@ -237,7 +317,7 @@ export const Sidebar = () => {
                         {groupTasks.map(t => (
                           <div
                             key={t.id}
-                            className={cn('sidebar-task-item flex items-center gap-1.5 px-1.5 py-1 text-sm cursor-pointer rounded-sm hover:bg-accent-soft dark:hover:bg-accent-dark-soft text-text-default dark:text-text-dark-default', `status-${norm(t.status)}`, selectedTaskId === t.id && 'bg-accent-soft dark:bg-accent-dark-soft')}
+                            className={cn('sidebar-task-item flex items-center gap-1.5 px-1.5 py-1 text-sm cursor-pointer rounded-sm hover:bg-accent-soft dark:hover:bg-accent-dark-soft text-text-default dark:text-text-dark-default', `status-${norm(t.status)}`, (selectedTaskId === t.id || (searching && matchesQuery(t.title, search))) && 'bg-accent-soft dark:bg-accent-dark-soft')}
                             title={`${taskChip(t)}: ${t.title}`}
                             onClick={() => {
                               setSelectedTaskId(selectedTaskId === t.id ? null : t.id);
@@ -270,6 +350,12 @@ export const Sidebar = () => {
 
       {projectTasks.length === 0 && (
         <div className="sidebar-empty px-4 py-4 text-sm text-muted dark:text-text-dark-muted text-center">No tasks yet. Click "+ Add Task" above to create one.</div>
+      )}
+
+      {projectTasks.length > 0 && searching && visiblePhases.length === 0 && (
+        <div className="sidebar-empty px-4 py-4 text-sm text-muted dark:text-text-dark-muted text-center">
+          No tasks match "{taskSearch.trim()}"{scopedPhaseName ? ` in ${scopedPhaseName}` : ''}.
+        </div>
       )}
 
 

@@ -15,6 +15,11 @@ interface NotifItem {
   unread: boolean;
 }
 
+// Pause reason → the limit label shown to the user; 'provider_error' means the
+// provider hard-failed mid-run, so the run paused at its provider limit.
+const pauseLimitLabel = (reason?: string | null) =>
+  reason === 'provider_error' ? 'provider' : reason === 'time' ? 'time' : 'turn';
+
 export const Notifications = () => {
   const {
     notifOpen, setNotifOpen,
@@ -69,7 +74,7 @@ export const Notifications = () => {
     for (const e of paused) {
       items.push({
         icon: '\u23F8',
-        title: `${execChip(e)} paused at its ${e.pause_reason === 'time' ? 'time' : 'turn'} limit`,
+        title: `${execChip(e)} paused at its ${pauseLimitLabel(e.pause_reason)} limit`,
         desc: `Continue or stop — ${(e.task_title || '').slice(0, 50)}`,
         time: String(e.last_heartbeat_at || e.started_at || ''),
         type: 'paused',

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useStore } from '../store';
-import { api } from '../api';
+import { api, isTimeoutError } from '../api';
 import type { Model } from '../types';
 
 const isVault = Boolean((typeof window !== 'undefined' && (window as unknown as { __AINGEL_VAULT__?: boolean }).__AINGEL_VAULT__) || false);
@@ -166,7 +166,11 @@ export const NewProjectModal = () => {
       setNpImprovedText(result.improved);
       setShowImproved(true);
     } catch (e) {
-      alert('Failed to improve: ' + (e instanceof Error ? e.message : 'unknown'));
+      if (isTimeoutError(e)) {
+        alert('The guide took too long to answer. Try again, or keep your pitch as it is.');
+      } else {
+        alert('Failed to improve: ' + (e instanceof Error ? e.message : 'unknown'));
+      }
     } finally {
       setImproving(false);
     }
@@ -297,7 +301,7 @@ export const NewProjectModal = () => {
           <select data-tip="Choose the model that scaffolds the project" className="w-full py-[7px] px-2.5 border border-default rounded text-base" value={scaffoldingModel} onChange={e => setScaffoldingModel(e.target.value)}>
             <option value="">{defaultScaffoldModelLabel ? `— Default (${defaultScaffoldModelLabel}) —` : '— Default —'}</option>
             {filteredScaffoldModels().map((m: Model) => (
-              <option key={m.id} value={m.id}>{m.label}</option>
+              <option key={m.id} value={m.id} disabled={m.available === false}>{m.label}{m.available === false ? ' (unavailable)' : ''}</option>
             ))}
           </select>
         </div>
@@ -350,7 +354,7 @@ export const NewProjectModal = () => {
           <select data-tip="Choose the AI model driving the guide" className="w-full py-[7px] px-2.5 border border-default rounded text-base" value={aingelModelVal} onChange={e => setAingelModelVal(e.target.value)}>
             <option value="">— None for now —</option>
             {filteredAingelModels().map((m: Model) => (
-              <option key={m.id} value={m.id}>{m.label}</option>
+              <option key={m.id} value={m.id} disabled={m.available === false}>{m.label}{m.available === false ? ' (unavailable)' : ''}</option>
             ))}
           </select>
         </div>

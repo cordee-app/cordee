@@ -1,4 +1,4 @@
-import { X } from 'lucide-react';
+import { X, DollarSign } from 'lucide-react';
 import { useStore } from '../store';
 import { api } from '../api';
 import { useQuery } from '@tanstack/react-query';
@@ -45,8 +45,14 @@ export const ProviderIndicators = () => {
     }
   }
 
-  const providers = [
-    { key: 'claude', label: 'Claude', readyKey: 'claude_code' as const },
+  type ReadinessKey = 'claude_code' | 'vibe' | 'openai_api' | 'scaleway' | 'ollama';
+  const providers: Array<{
+    key: string;
+    label: string;
+    readyKey: ReadinessKey;
+    degradedKey?: 'claude_degraded';
+  }> = [
+    { key: 'claude', label: 'Claude', readyKey: 'claude_code' as const, degradedKey: 'claude_degraded' as const },
     { key: 'mistral', label: 'Mistral', readyKey: 'vibe' as const },
     { key: 'openai', label: 'OpenAI', readyKey: 'openai_api' as const },
     { key: 'scaleway', label: 'Scaleway', readyKey: 'scaleway' as const },
@@ -55,13 +61,15 @@ export const ProviderIndicators = () => {
 
   return (
     <div className="provider-indicators flex items-center gap-1.5 ml-2">
-      {providers.map(({ key, label, readyKey }) => {
+      {providers.map(({ key, label, readyKey, degradedKey }) => {
         const active = runningProviders.has(key);
         // Tri-state: true/false when readiness is known (admins), undefined
         // when it isn't (non-admins never fetch readiness). Only assert
         // "unconfigured" on a known false — otherwise a working provider
         // shows a red X for users who simply can't see the readiness data.
         const configured = storedReadiness?.[readyKey];
+        // Claude can be configured yet unusable (e.g. out of credit).
+        const degraded = degradedKey ? storedReadiness?.[degradedKey] : undefined;
         const color = PROVIDER_COLORS[key];
 
         return (
@@ -72,7 +80,7 @@ export const ProviderIndicators = () => {
               'flex items-center gap-1 px-2 py-0.5 rounded-full text-sm transition-colors',
               active ? 'bg-white/[0.14]' : 'bg-white/[0.08]'
             )}
-            title={`${label}: ${active ? 'Active' : 'Idle'}${configured === false ? ' (unconfigured)' : ''}`}
+            title={`${label}: ${active ? 'Active' : 'Idle'}${configured === false ? ' (unconfigured)' : ''}${degraded ? ` (unusable: ${degraded})` : ''}`}
           >
             <span
               className={cn(
@@ -88,6 +96,15 @@ export const ProviderIndicators = () => {
             >
               {label}
             </span>
+            {degraded && configured !== false && (
+              <span
+                className="provider-degraded flex items-center ml-px"
+                style={{ color: '#c08a2e' }}
+                title={`Configured but unusable: ${degraded}`}
+              >
+                <DollarSign size={11} strokeWidth={3} />
+              </span>
+            )}
             {!configured && configured !== undefined && (
               <span
                 className="provider-unconfigured flex items-center text-[#a3402f] ml-px"

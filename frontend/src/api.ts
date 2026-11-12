@@ -8,7 +8,7 @@ import type {
   HfQueueGroup, GpuWindow, GpuWindowModel, GpuRunStatus,
   HfImportVerify, HfModelImport,
   MeResponse, ProjectMember, MemberRole, AdminUser, DirectoryUser,
-  ArchiveResult, ImportResult,
+  ArchiveResult, ImportResult, TermsDoc,
 } from './types';
 
 const BASE = '';
@@ -31,6 +31,20 @@ export class ApiError extends Error {
 }
 
 /**
+ * True when a failure is a gateway timeout rather than a real answer from the
+ * backend: Cloudflare answers a request that ran past ~100s with an HTML 524
+ * page, and nginx-style proxies use 504. Those are worth a "try again" message
+ * instead of leaking "524" or an HTML body to the user.
+ */
+export function isTimeoutError(e: unknown): boolean {
+  if (e instanceof ApiError && (e.status === 504 || e.status === 524)) return true;
+  const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : '';
+  if (/^(504|524)\b/.test(msg)) return true;
+  const lower = msg.toLowerCase();
+  return lower.includes('timeout') || lower.includes('timed out');
+}
+
+/**
  * Turn a failed response into an Error carrying the server's own explanation.
  *
  * Every API error route returns `{"error": "..."}` with the actual reason —
@@ -46,6 +60,12 @@ async function fail(res: Response): Promise<never> {
     detail = typeof body?.error === 'string' ? body.error : '';
   } catch {
     // Non-JSON body (proxy error page, empty 500) — fall back to the status.
+  }
+  // Terms gate: a gated endpoint refuses with 403 terms_acceptance_required.
+  // Announce it so App can show the acceptance page immediately (mid-session
+  // detection hook); the 30s /api/me poll is the backstop.
+  if (res.status === 403 && body?.error === 'terms_acceptance_required') {
+    window.dispatchEvent(new CustomEvent('aingel:terms-required', { detail: body.terms ?? null }));
   }
   throw new ApiError(detail || `${res.status} ${res.statusText}`, res.status, body);
 }
@@ -108,6 +128,12 @@ export const api = {
       put<{ user: AdminUser }>(`/api/admin/users/${userId}`, data),
     updatePlan: (userId: number, plan: string) => put<{ user: AdminUser }>(`/api/admin/users/${userId}`, { plan }),
     deleteUser: (userId: number) => del<{ ok: boolean; orphaned_projects: number }>(`/api/admin/users/${userId}`),
+  },
+  // ── Terms & Conditions ─────────────────────────────────────────────
+  terms: {
+    getCurrent: () => get<{ terms: TermsDoc | null }>('/api/terms/current'),
+    accept: (versionId: number) => post<{ ok: boolean; accepted_at: string; version_id: number; tag: string }>(
+      '/api/terms/accept', { version_id: versionId }),
   },
   // ── Project members ────────────────────────────────────────────────
   members: {
@@ -284,7 +310,14 @@ export const api = {
           .then(async r => {
             if (!r.ok) {
               let msg = 'upload failed';
-              try { const j = await r.json(); if (j?.error) msg = j.error; } catch {}
+              // Raw fetch bypasses fail(): surface the terms gate ourselves.
+              try {
+                const j = await r.json();
+                if (j?.error) msg = j.error;
+                if (r.status === 403 && j?.error === 'terms_acceptance_required') {
+                  window.dispatchEvent(new CustomEvent('aingel:terms-required', { detail: j.terms ?? null }));
+                }
+              } catch {}
               throw new Error(msg);
             }
             return r.json() as Promise<{ ok: boolean; key: string; size: number; synced?: number; sync_warning?: string }>;
@@ -336,7 +369,12 @@ export const api = {
       patch<{ ok: boolean; auto_promoted?: string; warning?: TaskUpdateWarning }>(`/api/tasks/${tid}`, data),
     delete: (tid: number) => del<{ ok: true }>(`/api/tasks/${tid}`),
     archive: (tid: number) => post<{ ok: true }>(`/api/tasks/${tid}/archive`),
+    unarchive: (tid: number) => post<{ ok: true }>(`/api/tasks/${tid}/unarchive`),
     redo: (tid: number) => post<Task>(`/api/tasks/${tid}/redo`),
+    // Restore the description saved before "Guide my prompt" was accepted
+    // (400 when no original exists, 409 while running / under review).
+    restoreOriginalPrompt: (tid: number) =>
+      post<{ ok: boolean; description: string }>(`/api/tasks/${tid}/restore-original-prompt`),
     copy: (tid: number, data: { title?: string; copy_deps?: boolean }) =>
       post<Task>(`/api/tasks/${tid}/copy`, data),
     import: () => post<{ project_name: string; tasks_imported: number }[]>('/api/tasks/import'),
@@ -374,7 +412,7 @@ export const api = {
 
   // ── Executions ──────────────────────────────────────────────────────
   executions: {
-    list: (limit?: number) => get<Execution[]>(`/api/executions?limit=${limit || 50}`),
+    list: (limit?: number, taskId?: number) => get<Execution[]>(`/api/executions?limit=${limit || 50}${taskId ? `&task_id=${taskId}` : ''}`),
     get: (eid: number) => get<Execution>(`/api/executions/${eid}`),
     output: (eid: number) => get<{ content: string; source?: string }>(`/api/execution/output/${eid}`),
     diff: (eid: number) => get<{ diff: string; base_branch: string; task_branch: string }>(`/api/executions/${eid}/diff`),
@@ -563,6 +601,16 @@ export const api = {
           form.append('keys', JSON.stringify(keys));
           const res = await fetch(BASE + `/api/projects/${pid}/files/upload`, { method: 'POST', body: form });
           if (!res.ok) {
+            // Raw fetch bypasses fail(): detect the terms gate from the body
+            // before falling back to the response text for the message.
+            let gate: Record<string, unknown> | null = null;
+            try {
+              const j = await res.clone().json();
+              if (res.status === 403 && j?.error === 'terms_acceptance_required') gate = j;
+            } catch { /* non-JSON body — keep the text fallback below */ }
+            if (gate) {
+              window.dispatchEvent(new CustomEvent('aingel:terms-required', { detail: gate.terms ?? null }));
+            }
             const err = await res.text().catch(() => res.statusText);
             throw new Error(err || `upload failed (${res.status})`);
           }

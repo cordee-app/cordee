@@ -6,11 +6,16 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 ### Changed
+- Model catalogue: retired Mistral Large 3, Medium 3.5 and Codestral; added Mistral Pro GLM-5.3 Flash and DeepSeek V4.1 Flash.
 - Rebranded AIngel → Cordée (UI, docs, theme). Internal identifiers unchanged.
 - Relicensed under AGPL-3.0 with a commercial-licence option and a contributor licence agreement (`CLA.md`).
 - Creating a confidential project now provisions its EU Scaleway session inside `POST /api/projects`, before scaffolding starts: a provisioning failure rolls the project back and returns a readable error instead of leaving a half-provisioned project that continues to scaffold.
 
 ### Fixed
+- Multi-select archive now asks for confirmation and can restore (de-archive) tasks in bulk.
+- Improve-prompt keeps verbatim payload blocks intact, pairs payload markers correctly when prose contains a stray delimiter, restores the original prompt in the scaffolding path, and uses `mistral-large-4` within the tunnel timeout.
+- Vibe runs that end without a final answer are flagged, not only runs stopped at the turn limit.
+- Image-view promises are route-aware (only offered when the model can read images), and a path containing "outputs" is no longer mistaken for the output verb.
 - A commit rejected by a repository hook no longer looks like success: the Execution Log shows a red **Commit blocked** badge with the failure, keeps the run's file links, and the badge persists until the commit succeeds.
 - Pre-run reviewers see answered clarifications and no longer re-ask questions the user has already answered.
 - Task prompts are never truncated on the Vibe route, and the H3 post-run analysis now receives the run's diffstat.
@@ -25,6 +30,13 @@ All notable changes to this project will be documented in this file. The format 
 - The "Create Project" modal keeps the typed name and pitch on a failed create and shows the server's error inline, instead of dismissing and continuing to scaffolding.
 
 ### Added
+- Versioned Terms & Conditions with automatic re-acceptance: `legal/terms/<tag>.<lang>.md` is seeded at boot, and publishing a new version makes every user accept it before using the API.
+- Route-aware pre-run checks that block *verified* impossibilities before a run starts, while the Guide's H2 check stays advisory elsewhere.
+- Provider failures pause a run like a limit does, with a resumable `provider_error` checkpoint and tool-history compaction.
+- Provider health detection: an unusable Claude subscription is detected, its models are greyed out, and paid routes carry a `$` badge.
+- Sidebar task search (title, description, code, id or phase; `/` to focus) and a task-scoped Execution Log that reaches runs beyond the global list window.
+- Live prompt-editor highlighting for `'''` payload blocks, `@file` references and web links.
+- Local Ollama decision-model pre-filter for the H2 pre-run check (advisory, async, kill-switchable).
 - Task runs on the Vibe and Claude CLI routes pause at the turn or time limit, with Continue/Stop controls in the Execution Log (Claude resumes its session; Vibe replays a capped continuation block of the steps already taken).
 - Execution Log gains a phase column, instruction search, and a taller panel.
 - Initial public release of Cordée — an AI-guided project management system with EU data sovereignty.

@@ -20,7 +20,7 @@ test('creates project, shows editable draft, applies guide, switches to board', 
 
   // Select a working scaffolding model.
   const scaffoldSelect = page.locator('label:has-text("Scaffolding model") + select');
-  await scaffoldSelect.selectOption('mistral-medium-latest');
+  await scaffoldSelect.selectOption('mistral-large-4');
 
   await page.click('button:has-text("Create Project")');
 

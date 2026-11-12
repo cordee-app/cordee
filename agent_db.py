@@ -131,7 +131,8 @@ def _init_project_db_schema(conn):
             created_at       TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at       TEXT DEFAULT CURRENT_TIMESTAMP,
             display_no       INTEGER,
-            display_code     TEXT
+            display_code     TEXT,
+            prefilter_json   TEXT
         );
         CREATE TABLE IF NOT EXISTS executions (
             id               INTEGER PRIMARY KEY,
@@ -254,6 +255,10 @@ def _init_project_db_schema(conn):
         # Internal integer ids stay authoritative everywhere.
         ('display_no', 'INTEGER'),
         ('display_code', 'TEXT'),
+        # Local decision-model pre-filter payload (JSON, H2-advisory only).
+        # Written by the dedicated update_task_prefilter() writer, never by
+        # update_task(); stripped from list payloads in the API.
+        ('prefilter_json', 'TEXT'),
     ]:
         _add_column_if_missing(conn, 'tasks', col, defn)
     for col, defn in [
@@ -823,6 +828,28 @@ def set_app_setting(key, value):
         conn.close()
 
 
+def increment_app_setting(key, delta=1):
+    """Atomically add *delta* to a numeric app_settings value.
+
+    ``value`` is TEXT, so the arithmetic is done with CAST(... AS INTEGER) in a
+    single UPSERT. A get_app_settings() + set_app_setting() read-modify-write
+    would lose increments when several Flask threads (or the prefilter worker)
+    hit the same counter concurrently. Used by the prefilter monitoring
+    counters (``prefilter:calls`` etc.). Returns None.
+    """
+    conn = get_db()
+    try:
+        conn.execute(
+            'INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) '
+            'ON CONFLICT(key) DO UPDATE SET '
+            "value = CAST(COALESCE(value, '0') AS INTEGER) + CAST(excluded.value AS INTEGER), "
+            'updated_at = CURRENT_TIMESTAMP',
+            (key, str(int(delta))))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def init_db():
     conn = get_db()
     # A brand-new DB has no projects table yet. Everything created below is
@@ -1063,6 +1090,31 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members(user_id);
         CREATE INDEX IF NOT EXISTS idx_usage_counters_month ON usage_counters(month);
+        -- Terms & Conditions versioning (see agent_terms.py + ops/publish_terms.py).
+        -- terms_versions is the permanent record of every published text; a row
+        -- that has been accepted is never modified or deleted (acceptance
+        -- evidence). terms_acceptances.version_id therefore has NO cascade:
+        -- SQLite refuses to delete a version that has acceptances.
+        CREATE TABLE IF NOT EXISTS terms_versions (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            version_tag  TEXT NOT NULL,
+            language     TEXT NOT NULL DEFAULT 'en',
+            audience     TEXT NOT NULL DEFAULT 'all',
+            title        TEXT DEFAULT '',
+            content      TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            created_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(version_tag, language, audience)
+        );
+        CREATE TABLE IF NOT EXISTS terms_acceptances (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            version_id  INTEGER NOT NULL REFERENCES terms_versions(id),
+            language    TEXT NOT NULL DEFAULT 'en',
+            accepted_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, version_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_terms_acceptances_user ON terms_acceptances(user_id);
     ''')
 
     # ── Project column migrations ─────────────────────────────────────────────
@@ -1323,12 +1375,12 @@ def init_db():
              'You are a market research specialist focused on competitive intelligence, '
              'sector analysis, consumer behavior, pricing dynamics, and strategic positioning. '
              'Synthesize multiple sources into actionable, well-structured insights.',
-             'mistral-large-latest', 'project'),
+             'mistral-glm-5-3-flash', 'project'),
             ('Documentation Writer',
              'You are a technical writer specializing in API references, compliance documents, '
              'user guides, and standard operating procedures. Write clear, precise, '
              'well-organized content following established style conventions.',
-             'mistral-large-latest', 'phase'),
+             'mistral-glm-5-3-flash', 'phase'),
             ('DevOps/Sysadmin',
              'You are a Linux systems engineer specializing in systemd services, LXC containers, '
              'network configuration, backup strategies, and infrastructure automation. '
@@ -2242,6 +2294,249 @@ def check_and_increment_usage(user_id, month, field, amount, limit, conn=None):
                 except Exception:
                     pass
         return ok
+    except Exception:
+        if own:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if own:
+            conn.close()
+
+
+# ── Terms & Conditions: versions + acceptances ───────────────────────────────
+# Two app_meta keys drive the gate (see agent_terms.py):
+#   terms_current_version_id — id of the version users must accept
+#   terms_gate_enabled       — '1' to enforce, '0' (or missing) to disable
+# Both are read per request; nothing here is cached at module scope, so
+# ops/publish_terms.py takes effect without a restart.
+#
+# Immutability: once a version has at least one acceptance row it is never
+# updated or deleted (it is the evidence of what the user agreed to). The
+# upsert helper enforces the update half; the schema (no ON DELETE CASCADE on
+# terms_acceptances.version_id) enforces the delete half.
+
+_TERMS_CURRENT_KEY = 'terms_current_version_id'
+_TERMS_GATE_KEY = 'terms_gate_enabled'
+
+
+def get_app_meta(key, default=None, conn=None):
+    """One app_meta value, or `default` when the key is missing."""
+    own = conn is None
+    if own:
+        conn = get_db()
+    try:
+        row = conn.execute('SELECT value FROM app_meta WHERE key=?', (key,)).fetchone()
+        return row['value'] if row else default
+    finally:
+        if own:
+            conn.close()
+
+
+def set_app_meta(key, value, conn=None):
+    """Upsert one app_meta value (None stored as NULL)."""
+    own = conn is None
+    if own:
+        conn = get_db()
+    try:
+        conn.execute(
+            'INSERT INTO app_meta (key, value) VALUES (?, ?) '
+            'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+            (key, None if value is None else str(value)))
+        if own:
+            conn.commit()
+    finally:
+        if own:
+            conn.close()
+
+
+def get_terms_version(version_id, conn=None):
+    """One terms_versions row as a dict, or None."""
+    if version_id is None:
+        return None
+    own = conn is None
+    if own:
+        conn = get_db()
+    try:
+        row = conn.execute(
+            'SELECT * FROM terms_versions WHERE id=?', (version_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        if own:
+            conn.close()
+
+
+def get_terms_version_by_tag(version_tag, language='en', audience='all', conn=None):
+    """The (tag, language, audience) terms_versions row as a dict, or None."""
+    own = conn is None
+    if own:
+        conn = get_db()
+    try:
+        row = conn.execute(
+            'SELECT * FROM terms_versions WHERE version_tag=? AND language=? '
+            'AND audience=?', (version_tag, language, audience)).fetchone()
+        return dict(row) if row else None
+    finally:
+        if own:
+            conn.close()
+
+
+def list_terms_versions(conn=None):
+    """Every terms_versions row, newest first (ops / tests)."""
+    own = conn is None
+    if own:
+        conn = get_db()
+    try:
+        rows = conn.execute(
+            'SELECT * FROM terms_versions ORDER BY id DESC').fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        if own:
+            conn.close()
+
+
+def count_terms_acceptances(version_id, conn=None):
+    """How many users have accepted this version (0 when unknown)."""
+    own = conn is None
+    if own:
+        conn = get_db()
+    try:
+        return int(conn.execute(
+            'SELECT COUNT(*) FROM terms_acceptances WHERE version_id=?',
+            (version_id,)).fetchone()[0] or 0)
+    finally:
+        if own:
+            conn.close()
+
+
+def upsert_terms_version(version_tag, language, audience, title, content,
+                         content_hash, conn=None):
+    """Insert or refresh one terms version. Returns the row as a dict.
+
+    * No row for (tag, language, audience) → INSERT.
+    * Row exists, same content_hash → returned untouched.
+    * Row exists, different hash, NO acceptances → title/content/hash updated.
+    * Row exists, different hash, ≥1 acceptance → NOT modified (immutability):
+      a warning is logged and the existing row is returned, so a re-worded
+      file under an already-accepted tag can never rewrite what users agreed
+      to. Publish a new tag instead.
+    """
+    own = conn is None
+    if own:
+        conn = get_db()
+    try:
+        if own:
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+            except Exception:
+                pass
+        existing = get_terms_version_by_tag(
+            version_tag, language, audience, conn=conn)
+        if existing is None:
+            conn.execute(
+                'INSERT INTO terms_versions '
+                '(version_tag, language, audience, title, content, content_hash) '
+                'VALUES (?,?,?,?,?,?)',
+                (version_tag, language, audience, title or '', content,
+                 content_hash))
+            row = get_terms_version_by_tag(
+                version_tag, language, audience, conn=conn)
+        elif existing.get('content_hash') == content_hash:
+            row = existing
+        elif count_terms_acceptances(existing['id'], conn=conn) > 0:
+            _log.warning(
+                'terms: refusing to modify accepted version %s (%s/%s/%s) — '
+                'content changed but users already agreed to it; publish a '
+                'new version tag instead',
+                existing['id'], version_tag, language, audience)
+            row = existing
+        else:
+            conn.execute(
+                'UPDATE terms_versions SET title=?, content=?, content_hash=? '
+                'WHERE id=?',
+                (title or '', content, content_hash, existing['id']))
+            row = get_terms_version(existing['id'], conn=conn)
+        if own:
+            conn.commit()
+        return row
+    except Exception:
+        if own:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if own:
+            conn.close()
+
+
+def get_current_terms_version(conn=None):
+    """The version the gate points at, or None.
+
+    None when the pointer is unset OR when it does not resolve to an existing
+    row (dangling pointer). Callers treat None as "gate off" — fail open, so a
+    bad pointer can never lock every user out.
+    """
+    raw = get_app_meta(_TERMS_CURRENT_KEY, conn=conn)
+    if raw in (None, ''):
+        return None
+    try:
+        vid = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return get_terms_version(vid, conn=conn)
+
+
+def terms_gate_active(conn=None):
+    """True iff the gate flag is '1' AND the pointer resolves to a row."""
+    if str(get_app_meta(_TERMS_GATE_KEY, conn=conn) or '') != '1':
+        return False
+    return get_current_terms_version(conn=conn) is not None
+
+
+def get_terms_acceptance(user_id, version_id, conn=None):
+    """This user's acceptance of this version as a dict, or None."""
+    if user_id is None or version_id is None:
+        return None
+    own = conn is None
+    if own:
+        conn = get_db()
+    try:
+        row = conn.execute(
+            'SELECT * FROM terms_acceptances WHERE user_id=? AND version_id=?',
+            (user_id, version_id)).fetchone()
+        return dict(row) if row else None
+    finally:
+        if own:
+            conn.close()
+
+
+def record_terms_acceptance(user_id, version_id, language='en', conn=None):
+    """Idempotently record that `user_id` accepted `version_id`.
+
+    Returns the acceptance row. A repeat accept returns the FIRST acceptance
+    (same ``accepted_at``) — DO NOTHING yields no RETURNING row, so the row is
+    re-selected afterwards.
+    """
+    if user_id is None or version_id is None:
+        raise ValueError('user_id and version_id are required')
+    own = conn is None
+    if own:
+        conn = get_db()
+    try:
+        conn.execute(
+            'INSERT INTO terms_acceptances (user_id, version_id, language) '
+            'VALUES (?,?,?) ON CONFLICT(user_id, version_id) DO NOTHING',
+            (user_id, version_id, language or 'en'))
+        if own:
+            conn.commit()
+        row = conn.execute(
+            'SELECT * FROM terms_acceptances WHERE user_id=? AND version_id=?',
+            (user_id, version_id)).fetchone()
+        return dict(row) if row else None
     except Exception:
         if own:
             try:
@@ -3262,6 +3557,8 @@ def upsert_task(project_id, external_id, title, description='',
         pconn.commit()
     finally:
         pconn.close()
+    # New imported task → queue a prefilter computation (inert when disabled).
+    _note_description_changed_for_prefilter(task_id, project_path)
     return task_id
 
 
@@ -3486,6 +3783,52 @@ def get_project_dependencies(project_id):
     return result
 
 
+def _note_description_changed_for_prefilter(task_id, project_path):
+    """Best-effort nudge to the local prefilter worker after a description change.
+
+    Imported lazily: agent_decision itself imports agent_db lazily, so a
+    module-level import here would close the cycle. A missing module, an
+    unavailable function, or a disabled feature are all silent no-ops — the
+    hook must never break the write that triggered it.
+    """
+    try:
+        import agent_decision
+        agent_decision.note_description_changed(task_id, project_path)
+    except Exception:
+        pass
+
+
+def update_task_prefilter(task_id, payload, project_path=None):
+    """Persist the local decision pre-filter payload on a task row.
+
+    Dedicated writer for agent_decision (one connection per call, never shared
+    across threads). Deliberately does NOT touch ``updated_at`` — the UI uses
+    that as the running-elapsed fallback — and emits no SSE event and no
+    GUIDE.md regeneration (which is why it bypasses update_task()). WAL makes a
+    kill mid-call leave either the old or the new value, never a torn row.
+    """
+    if not project_path:
+        project_path = _get_task_path(task_id)
+    if not project_path:
+        return
+    try:
+        blob = json.dumps(payload)
+    except (TypeError, ValueError):
+        return
+    try:
+        pconn = get_project_db(project_path)
+    except sqlite3.OperationalError as e:
+        _log.warning('update_task_prefilter(%s): %s', task_id, e)
+        return
+    try:
+        pconn.execute('UPDATE tasks SET prefilter_json=? WHERE id=?', (blob, task_id))
+        pconn.commit()
+    except sqlite3.OperationalError as e:
+        _log.warning('update_task_prefilter(%s): %s', task_id, e)
+    finally:
+        pconn.close()
+
+
 def update_task(task_id, project_path=None, **kwargs):
     allowed = {'title', 'description', 'status', 'model', 'priority',
                'estimated_tokens', 'estimated_cost', 'actual_cost',
@@ -3520,6 +3863,10 @@ def update_task(task_id, project_path=None, **kwargs):
     pconn.execute(f'UPDATE tasks SET {set_clause} WHERE id=?', vals)
     pconn.commit()
     pconn.close()
+    # Description changed → let the local decision prefilter recompute (inert
+    # unless the feature is enabled). Never changes this function's result.
+    if 'description' in fields:
+        _note_description_changed_for_prefilter(task_id, project_path)
     # Emit event for SSE subscribers
     proj_id = _resolve_project_id(task_id=task_id, project_path=project_path)
     if proj_id is not None:
@@ -3636,6 +3983,9 @@ def create_task(project_id, title, description='', model='claude-sonnet-5-5',
         pconn.commit()
     finally:
         pconn.close()
+    # New task with a description → queue a prefilter computation (inert when
+    # the feature is off; never changes the return value).
+    _note_description_changed_for_prefilter(task_id, project_path)
     # Lane B: store explicit context refs if provided
     if context_refs is not None:
         try:
@@ -3651,6 +4001,10 @@ def create_task(project_id, title, description='', model='claude-sonnet-5-5',
 
 def archive_task(task_id, project_path=None):
     update_task(task_id, project_path=project_path, archived=1)
+
+
+def unarchive_task(task_id, project_path=None):
+    update_task(task_id, project_path=project_path, archived=0)
 
 
 def redo_task(task_id, project_path=None):
@@ -4315,16 +4669,23 @@ def update_execution_context(exec_id, used_refs=None, noted_binary=None, review_
     pconn.close()
 
 
-def get_executions(limit=50):
+def get_executions(limit=50, task_id=None):
     """Aggregate recent executions across all project DBs (task runs only, not chat).
     Excludes e.output_summary (2.7M for OCR) from the list view — detail endpoint
-    fetches it separately. This was the 49s stall during 41-PDF OCR batches."""
+    fetches it separately. This was the 49s stall during 41-PDF OCR batches.
+
+    ``task_id`` narrows the list to one task's runs (the exec log's task scope).
+    The unfiltered list is capped at ``limit`` rows overall, so older tasks need
+    this filter to retrieve their own history."""
     pm = _projects_map()
     all_execs = []
+    # Static fragment + conditional params (never interpolate user input).
+    _task_clause = '' if task_id is None else ' AND e.task_id = ?'
+    _params = (limit,) if task_id is None else (task_id, limit)
     for pid, pp in _all_project_paths():
         try:
             pconn = get_project_db(pp)
-            rows = pconn.execute('''
+            rows = pconn.execute(f'''
                 SELECT e.id, e.task_id, e.model, e.status, e.cost_usd,
                        e.tokens_input, e.tokens_output, e.started_at, e.finished_at,
                        e.last_heartbeat_at, e.child_pid, e.chat_id, e.aingel_brief,
@@ -4340,9 +4701,9 @@ def get_executions(limit=50):
                        END AS exec_no
                 FROM executions e
                 LEFT JOIN tasks t ON e.task_id = t.id
-                WHERE e.chat_id IS NULL
+                WHERE e.chat_id IS NULL{_task_clause}
                 ORDER BY e.started_at DESC LIMIT ?
-            ''', (limit,)).fetchall()
+            ''', _params).fetchall()
             pconn.close()
             proj_info = pm.get(pid, {})
             for row in rows:

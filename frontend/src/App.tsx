@@ -34,6 +34,7 @@ import ChatModal from './components/ChatModal';
 import DependenciesModal from './components/DependenciesModal';
 import BudgetModal from './components/BudgetModal';
 import Notifications from './components/Notifications';
+import { TermsGate } from './components/TermsGate';
 
 const ScaffoldProgressApp = () => {
   const {
@@ -100,6 +101,7 @@ const App = () => {
     setChats, setRoles, setRoleTemplates, setWorkSessions, setConfig,
     setReadiness, setCostSummary, setDashboardData,
     user, setUser, setQuotas,
+    termsRequired, setTermsRequired,
     setCostToday, setCostWeek, setCostByModel, setKanbanTokenBudget,
     activeProject, activeChat, activeMainTab,
     settingsDirty, setShowSearch,
@@ -117,6 +119,14 @@ const App = () => {
       const me = await api.auth.me();
       setUser(me.user);
       setQuotas(me.quotas);
+      // Terms gate: everything below is gated server-side until accepted, so
+      // showing the acceptance page is the whole load. The 30s poll keeps
+      // running as the backstop that lifts the gate once accepted.
+      if (me.terms?.required && me.terms.version_id != null) {
+        setTermsRequired({ version_id: me.terms.version_id, tag: me.terms.tag ?? '' });
+        return;
+      }
+      setTermsRequired(null);
     } catch (e: any) {
       if (e?.status === 401) {
         if (justLoggedOut) {
@@ -262,12 +272,14 @@ const App = () => {
   useProjectSSE(activeProject);
 
   useEffect(() => {
+    // Gated: /api/dashboard would just 403 every 30s — wait for acceptance.
+    if (termsRequired) return;
     if (activeProject !== null && activeMainTab !== 'dashboard') return;
     const fetchDashboard = () => api.dashboard().then(setDashboardData).catch(() => {});
     fetchDashboard();
     const iv = setInterval(fetchDashboard, 30000);
     return () => clearInterval(iv);
-  }, [activeProject, activeMainTab]);
+  }, [activeProject, activeMainTab, termsRequired]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -341,6 +353,18 @@ const App = () => {
     };
   }, [setActiveChat, setChats]);
 
+  // Instant terms-gate detection: any gated endpoint answering 403
+  // terms_acceptance_required dispatches this (see api.ts fail()). The 30s
+  // /api/me poll in loadAll is the backstop.
+  useEffect(() => {
+    const onTermsRequired = (e: Event) => {
+      const d = (e as CustomEvent).detail;
+      if (d && d.version_id != null) setTermsRequired({ version_id: d.version_id, tag: d.tag ?? '' });
+    };
+    window.addEventListener('aingel:terms-required', onTermsRequired);
+    return () => window.removeEventListener('aingel:terms-required', onTermsRequired);
+  }, [setTermsRequired]);
+
   const isHome = activeProject === null;
   const isLoggedOut = new URLSearchParams(window.location.search).has('loggedout') && !user;
 
@@ -359,6 +383,19 @@ const App = () => {
           Log in
         </button>
       </div>
+    );
+  }
+
+  // Terms gate page: rendered instead of the whole app while the current user
+  // has not accepted the published version. loadAll clears the flag once
+  // /api/me reports `required: false`, so we never clear it here first (that
+  // would flash an empty board before the bulk fetch lands).
+  if (termsRequired) {
+    return (
+      <TermsGate
+        versionTag={termsRequired.tag}
+        onAccepted={async () => { await loadAll(); }}
+      />
     );
   }
 

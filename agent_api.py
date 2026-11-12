@@ -10,6 +10,7 @@ import sys
 import time
 import threading
 import queue
+import logging
 from datetime import datetime, timezone, timedelta as _timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -28,6 +29,17 @@ _running_slots_lock = threading.Lock()
 SLOT_LABELS = {1: 'Claude Pro', 2: 'Mistral Pro', 3: 'PAYG', 4: 'EU Scaleway', 5: 'Ollama Cloud'}
 _chat_execution_lock = threading.Lock()
 _active_chat_execution = None
+
+# Module logger — attach a stderr handler so INFO lines reach systemd/journald
+# (the root logger is unconfigured, and lastResort only emits WARNING+).
+# Guarded because the Flask reloader can import this module twice.
+_log = logging.getLogger('agent_api')
+if not _log.handlers:
+    _log_handler = logging.StreamHandler()
+    _log_handler.setFormatter(logging.Formatter('%(levelname)s:%(name)s:%(message)s'))
+    _log_handler.setLevel(logging.INFO)
+    _log.addHandler(_log_handler)
+    _log.setLevel(logging.INFO)
 
 
 def _safe_resolve(project_path, *parts):
@@ -88,6 +100,9 @@ from agent_auth import (
     init_auth, auth_enabled, get_user_project_ids, has_project_access,
     require_auth, require_admin, require_project_access,
 )
+# Terms & Conditions gate (versioning + acceptance). Off mode is a no-op;
+# must be registered after init_auth(app) — see agent_terms.register_terms.
+import agent_terms
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIR = os.path.join(BASE_DIR, 'frontend', 'dist')
@@ -102,6 +117,8 @@ app = Flask(__name__, static_folder=None)
 # only needs to be comfortably above a chunk, not above the largest file.
 app.config['MAX_CONTENT_LENGTH'] = int(getattr(agent_config, 'MAX_CONTENT_LENGTH', 128 * 1024 * 1024))
 init_auth(app)
+# After init_auth: the terms gate reads g.current_user (registration order).
+agent_terms.register_terms(app)
 
 # ── WebDAV (Lane C) ───────────────────────────────────────────────────────
 # Mounted at /dav/<slug>/<rel>. See agent_webdav.py for provider docs.
@@ -176,7 +193,12 @@ def serve_react_assets(filename):
 
 @app.route('/favicon.svg')
 def serve_react_favicon():
-    return send_file(os.path.join(FRONTEND_DIR, 'favicon.svg'))
+    path = os.path.join(FRONTEND_DIR, 'favicon.svg')
+    if not os.path.isfile(path):
+        # Source checkout without a frontend build (CI, exported tree): serve
+        # the tracked source asset instead of a 500.
+        path = os.path.join(os.path.dirname(FRONTEND_DIR), 'public', 'favicon.svg')
+    return send_file(path)
 
 # The legacy /old/ dashboard (agent_dashboard.{html,css,js}) was retired: it
 # duplicated the React UI, was untested, and used esc() inside onclick strings
@@ -409,6 +431,9 @@ def files_browser(subpath=''):
 @app.route('/api/models')
 @require_auth
 def get_models():
+    # User activity is the recovery trigger for a degraded provider: kick off
+    # an async re-check so a recovered Claude reappears in the model list.
+    agent_config.probe_claude_health(blocking=False)
     # Free-tier model whitelist annotation
     _is_free_model = None
     _user = g.get('current_user') if auth_enabled() else None
@@ -434,6 +459,11 @@ def get_models():
         }
         if _is_free_model is not None:
             entry['free_allowed'] = _is_free_model(model_id)
+        entry['available'] = agent_config.model_available(model_id)
+        if not entry['available']:
+            entry['unavailable_reason'] = (
+                agent_config.provider_degraded(agent_config.model_provider(model_id))
+                or 'not configured')
         out.append(entry)
     return jsonify(out)
 
@@ -523,6 +553,9 @@ _READINESS_TTL = 30  # seconds
 @require_admin
 def get_config_readiness():
     import shutil, os, subprocess, json as _json, time
+    # User activity is the recovery trigger: re-check a degraded Claude
+    # provider in the background so the next refresh sees fresh state.
+    agent_config.probe_claude_health(blocking=False)
     now = time.time()
     if _READINESS_CACHE['value'] is not None and now - _READINESS_CACHE['ts'] < _READINESS_TTL:
         return jsonify(_READINESS_CACHE['value'])
@@ -565,6 +598,7 @@ def get_config_readiness():
         'openai_api': bool(os.getenv('OPENAI_API_KEY')),
         'scaleway': agent_config.has_real_secret(agent_config.SCALEWAY_API_KEY),
         'ollama': agent_config.has_real_secret(agent_config.OLLAMA_API_KEY),
+        'claude_degraded': agent_config.provider_degraded('anthropic'),
     }
     _READINESS_CACHE['ts'] = now
     _READINESS_CACHE['value'] = value
@@ -3543,11 +3577,31 @@ def resolve_task_gate(tid):
                        gate_decided_at=datetime.utcnow().isoformat())
         return jsonify({'ok': True, 'gate_state': 'open', 'chat_id': chat_id})
 
-    new_state = 'closed' if action == 'acknowledge' else 'open'
+    # ── The override latch ────────────────────────────────────────────────
+    # 'override' does not just open the gate: it stamps gate_source
+    # 'user-override', which the executor's verified-impossibility pre-flight
+    # guards (agent_executor.run_task) consume to bypass ONCE — even in
+    # advisory mode, where a hold would otherwise not stop the run. The
+    # executor resets gate_source back to 'H2' as it consumes the latch, and
+    # any task content edit (PATCH, see update_task below) clears it too: the
+    # latch must never be sticky, or one override would silently disarm every
+    # future pre-flight guard for that task (regression: task 10001296).
+    # 'acknowledge' also stamps its source, but it does NOT bypass the
+    # pre-flight guards — it only records that the user saw the warning.
+    if action == 'override':
+        new_state = 'open'
+        extra = {'gate_source': 'user-override',
+                 'gate_reason': 'User overrode the pre-run gate'}
+    else:  # acknowledge
+        new_state = 'closed'
+        extra = {'gate_source': 'user-ack',
+                 'gate_reason': 'User acknowledged the pre-run warning'}
     db.update_task(tid, project_path=task.get('path'),
                    gate_state=new_state,
-                   gate_decided_at=datetime.utcnow().isoformat())
-    return jsonify({'ok': True, 'gate_state': new_state, 'chat_id': chat_id})
+                   gate_decided_at=datetime.utcnow().isoformat(),
+                   **extra)
+    return jsonify({'ok': True, 'gate_state': new_state,
+                    'gate_source': extra['gate_source'], 'chat_id': chat_id})
 
 
 @app.route('/api/projects/<int:pid>/aingel-overview', methods=['GET'])
@@ -3800,6 +3854,9 @@ def list_tasks():
             tasks = [t for t in tasks if t.get('project_id') in allowed]
     # Attach estimated_cost if not set
     for t in tasks:
+        # v1: the local prefilter payload is only consumed by the run path
+        # (get_task); keep it out of the refetched list payload.
+        t.pop('prefilter_json', None)
         if not t['estimated_cost']:
             t['estimated_cost'] = estimate_cost(t['model'], t['estimated_tokens'] or 50000)
         # Lane B: ensure context_refs is always a list (hydrate if DB returned JSON string)
@@ -3828,6 +3885,9 @@ def create_task():
     # the global DEFAULT_MODEL is Anthropic, so defaulting to it and *then*
     # guarding rejected every task created without an explicit model — blaming a
     # model the user never chose. Only an explicit non-EU choice is refused.
+    # Create Task is user activity, so probe Claude inline: the default-model
+    # substitution below must see fresh provider health, not a stale flag.
+    agent_config.probe_claude_health(blocking=True)
     model = (data.get('model') or '').strip() or agent_config.default_model_for(proj)
     ok, err = _eu_guard(proj, model)
     if not ok:
@@ -4058,6 +4118,94 @@ def _list_working_doc_names(project_path):
     return paths
 
 
+_H2A_URL_RE = re.compile(r'https?://[^\s<>"\'\)\]]+', re.IGNORECASE)
+_H2A_FOLDER_RE = re.compile(
+    r'(?:folder|directory|dir)\s*["\u201c\']([^"\u201d\']{2,60})["\u201d\']',
+    re.IGNORECASE)
+
+
+def _h2a_route_questions(description, project_path, route_facts,
+                         existing_questions=None, max_questions=3):
+    """Deterministic H2a questions for a route that cannot reach the source.
+
+    H2a used to see only file NAMES, never the route: task 10001296 cited a URL
+    and two folders, ran in toolless batch mode, and the clarification check
+    could not see that neither was reachable. This is code, not an LLM call —
+    if the description needs the web (an http(s) URL) or the filesystem (a
+    quoted folder that exists under the project) and ``route_facts`` says the
+    assigned route has neither, ask the user how to proceed.
+
+    ``route_facts`` is the executor's dict (``web`` / ``file_tools`` booleans);
+    ``None`` or a missing key means "unknown" and injects nothing, so a
+    missing helper in a concurrent checkout never invents a question.
+
+    Returns a NEW list (existing questions + at most one injected question,
+    capped at ``max_questions``). A question is skipped when one already
+    mentions the URL/folder, or when the user already answered a route
+    question in a previous round.
+    """
+    existing = list(existing_questions or [])
+    if not route_facts or len(existing) >= max_questions:
+        return existing
+    desc = description or ''
+    if not desc.strip():
+        return existing
+    # The user already answered a route question — do not re-ask it (the
+    # answers block is appended to the description by resolve_task_gate).
+    if 'agentic route' in desc.lower():
+        return existing
+
+    needs = []  # (kind, needle, label)
+    url = _H2A_URL_RE.search(desc)
+    if url and route_facts.get('web') is False:
+        needs.append(('web', url.group(0), url.group(0)))
+    if route_facts.get('file_tools') is False and project_path:
+        for m in _H2A_FOLDER_RE.finditer(desc):
+            folder = m.group(1).strip().strip('/\\')
+            if not folder:
+                continue
+            try:
+                exists = os.path.isdir(os.path.join(project_path, folder))
+            except Exception:
+                exists = False
+            if exists:
+                needs.append(('folder', folder, folder))
+                break
+    if not needs:
+        return existing
+
+    # Already covered by a question the overseer asked?
+    haystack = ' '.join((q.get('question') or '') + ' ' + (q.get('why') or '')
+                        for q in existing if isinstance(q, dict)).lower()
+    needs = [n for n in needs if n[1].lower() not in haystack]
+    if not needs:
+        return existing
+
+    route = route_facts.get('route') or route_facts.get('mode') or 'assigned'
+    parts = []
+    for kind, _needle, label in needs:
+        if kind == 'web':
+            parts.append(f'web access to {label}')
+        else:
+            parts.append(f'to read folder "{label}"')
+    need_text = ' and '.join(parts)
+    question = (
+        f'This task needs {need_text}, but the assigned route ({route}) has none. '
+        f'Should I switch the task to an agentic route (Claude/Mistral vibe or a '
+        f'toolchain model)?'
+    )
+    out = existing + [{
+        'id': f'q{len(existing) + 1}',
+        'question': question,
+        'why': ('The assigned route cannot reach the web or the project files, so '
+                'the run would be blind to the source this task depends on.'),
+        'options': ['Switch to an agentic route',
+                    'Proceed anyway — the source is not needed'],
+        'source': 'route_facts',
+    }]
+    return out[:max_questions]
+
+
 def _run_h2a_precheck_async(tid, project_path):
     """Background H2a clarification check for a just-confirmed task.
 
@@ -4092,7 +4240,42 @@ def _run_h2a_precheck_async(tid, project_path):
             pass
         import agent_overseer as overseer
         file_names = _list_working_doc_names(project_path)
-        result = overseer.pre_check_questions(task, proj, file_names)
+        # Route facts: H2a must know whether this run can reach the web and the
+        # filesystem, or it can only ask about scope (regression: task 10001296 —
+        # a URL + two folders in the description, a toolless batch route, and a
+        # clarification check that could not see either).
+        route_facts = None
+        try:
+            from agent_executor import _task_route_facts
+            # H2a runs before the prompt is built: assume inline (agentic) unless
+            # the model is provably toolless; the executor's pre-flight guards
+            # catch the batch case at run time.
+            route_facts = _task_route_facts(task, 'inline')
+        except Exception as _rf_err:
+            app.logger.warning('H2a route facts unavailable for task %s: %s', tid, _rf_err)
+        try:
+            result = overseer.pre_check_questions(task, proj, file_names,
+                                                  route_facts=route_facts)
+        except TypeError:
+            # Older/parallel overseer without the route_facts parameter.
+            result = overseer.pre_check_questions(task, proj, file_names)
+        if not isinstance(result, dict):
+            result = {'questions': [], 'gate_state': 'open', 'reason': ''}
+        # Deterministic route check on top of the LLM's questions: code, not
+        # opinion. The injected question flows into the same gate_state logic
+        # below, so it holds the task exactly like an overseer question.
+        try:
+            _rq = _h2a_route_questions(task.get('description'), project_path,
+                                       route_facts, result.get('questions') or [])
+            if _rq != (result.get('questions') or []):
+                result['questions'] = _rq
+                if _rq:
+                    result['gate_state'] = 'hold'
+                    if not result.get('reason'):
+                        result['reason'] = ('The assigned route cannot reach a source '
+                                            'this task needs')
+        except Exception as _rq_err:
+            app.logger.warning('H2a route question failed for task %s: %s', tid, _rq_err)
         questions = result.get('questions') or []
         gate_state = result.get('gate_state') or ('hold' if questions else 'open')
         reason = result.get('reason') or ('Clarifying questions pending' if questions else '')
@@ -4208,6 +4391,20 @@ def update_task(tid):
             data['execution_type'] = _norm_task_execution_type(data['execution_type'])
         except ValueError as e:
             return jsonify({'error': str(e)}), 400
+
+    # The 'user-override' latch (see resolve_task_gate) is one-shot and must
+    # never survive an edit of what the task actually asks for: a stale latch
+    # would let the executor's pre-flight guards bypass on content the user
+    # never overrode. Any content change clears it unless the client is
+    # explicitly setting the gate columns itself. Skipped while H2a holds the
+    # task — that path is already refused above with a 409, and the gate
+    # columns belong to the review there.
+    if not _task_in_review(task) \
+            and not ({'gate_state', 'gate_source', 'gate_reason'} & set(data)) \
+            and (set(data) - _TASK_REVIEW_PATCH_ALLOWED):
+        data['gate_source'] = ''
+        if task.get('gate_source') == 'user-override':
+            data['gate_reason'] = ''
 
     # Lane B: handle context_refs update via normalized helper
     if 'context_refs' in data:
@@ -4359,6 +4556,44 @@ def update_task(tid):
 
     db.update_task(tid, **data)
     return jsonify({'ok': True})
+
+
+@app.route('/api/tasks/<int:tid>/restore-original-prompt', methods=['POST'])
+@require_project_access('member')
+def restore_original_prompt(tid):
+    """Restore the task's description to the stored ``original_description``.
+
+    Lets the client revert an AI-rewritten prompt to what the user first typed.
+    ``original_description`` itself is left untouched so the restore stays
+    repeatable. Refused while the Guide reviews the task (the report it is
+    about to produce would be invalidated) or while the task is running (the
+    runner has already read the prompt).
+    """
+    task = db.get_task(tid)
+    if not task:
+        return jsonify({'error': 'Task not found'}), 404
+    if _task_in_review(task):
+        return jsonify({'error': 'Task is under review; wait for the review to finish.'}), 409
+    if task.get('status') == 'running':
+        return jsonify({'error': 'Task is running; wait for it to finish before restoring the prompt.'}), 409
+    orig = (task.get('original_description') or '').strip()
+    if not orig:
+        return jsonify({'error': 'No original prompt stored for this task.'}), 400
+
+    # Stored value as-is (not re-stripped): the DB helper persists it verbatim.
+    data = {'description': task.get('original_description')}
+
+    # Mirror update_task's content-change invalidation: a queued handoff
+    # described the old prompt, and the one-shot 'user-override' gate latch
+    # must never survive an edit of what the task actually asks for.
+    if (task.get('handoff_context') or '').strip():
+        db.clear_task_handoff(tid)
+    data['gate_source'] = ''
+    if task.get('gate_source') == 'user-override':
+        data['gate_reason'] = ''
+
+    db.update_task(tid, **data)
+    return jsonify({'ok': True, 'description': orig})
 
 
 @app.route('/api/tasks/<int:tid>', methods=['DELETE'])
@@ -5160,7 +5395,8 @@ def list_executions():
     import time as _t
     _t0 = _t.time()
     limit = request.args.get('limit', 50, type=int)
-    executions = db.get_executions(limit)
+    task_id = request.args.get('task_id', type=int)
+    executions = db.get_executions(limit, task_id=task_id)
     # Phase 3B: in auth mode, scope to the caller's member projects. The
     # `WHERE chat_id IS NULL` invariant lives in db.get_executions() and is
     # untouched — this only ADDs project filtering. Admins see all.
@@ -8171,6 +8407,81 @@ def _slot_scheduler_tick():
         _kick_run_seq(slot, [t['id'] for t in confirmed])
 
 
+def _prefilter_idle_sweep():
+    """Enqueue stale local-prefilter work for open tasks (idle sweep).
+
+    Reads the 3-state flag once per pass, walks enabled projects' pending /
+    confirmed tasks, and enqueues those whose ``prefilter_json`` is missing or
+    stale, in batches of at most 20 with a small yield between batches. All
+    failures are swallowed: the scheduler tick must never die, and the actual
+    inference happens on agent_decision's worker thread, not here.
+    """
+    try:
+        import agent_decision as ad
+    except Exception:
+        return
+    try:
+        mode = int(ad.prefilter_mode())
+    except Exception:
+        return
+    if mode == 0:
+        return
+    enabled_ids = None
+    if mode == 1:
+        try:
+            raw = db.get_app_settings().get('prefilter_project_ids') or ''
+        except Exception:
+            return
+        enabled_ids = {int(x) for x in str(raw).split(',') if x.strip().isdigit()}
+        if not enabled_ids:
+            return
+    try:
+        projects = db.get_projects()
+    except Exception:
+        return
+    is_stale = getattr(ad, 'is_stale', None)
+    stale = []
+    for p in projects:
+        if enabled_ids is not None and p.get('id') not in enabled_ids:
+            continue
+        path = p.get('path')
+        if not path:
+            continue
+        try:
+            tasks = db.get_tasks(project_id=p['id'], include_archived=False,
+                                 project_path=path)
+        except Exception:
+            continue
+        for t in tasks:
+            if t.get('status') not in ('pending', 'confirmed'):
+                continue
+            payload = t.get('prefilter_json')
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = None
+            if payload:
+                # Without is_stale there is no way to judge freshness; skip
+                # rather than re-enqueue every payload on each pass.
+                if is_stale is None:
+                    continue
+                try:
+                    if not is_stale(payload, t, project=path):
+                        continue
+                except Exception:
+                    continue
+            stale.append((t.get('id'), path))
+    for i in range(0, len(stale), 20):
+        for task_id, path in stale[i:i + 20]:
+            try:
+                ad.note_description_changed(task_id, path)
+            except Exception:
+                pass
+        # Yield so a large backlog never monopolises the scheduler thread.
+        time.sleep(0.2)
+
+
 def _slot_scheduler_loop():
     import time
     _sweep_counter = 0
@@ -8178,6 +8489,7 @@ def _slot_scheduler_loop():
     _uploads_counter = 0
     _ptrash_counter = 0
     _archive_counter = 0
+    _prefilter_counter = 0
     while True:
         try:
             _slot_scheduler_tick()
@@ -8240,6 +8552,15 @@ def _slot_scheduler_loop():
                         print(f'[project-trash-reaper] reaped {_ptreaped} expired per-project trash entr(ies)')
                 except Exception as _pte:
                     print(f'[project-trash-reaper] error: {_pte}', file=sys.stderr)
+            # Local decision prefilter idle sweep: boot pass on the second tick
+            # (~60 s after start), then every 360 ticks (~6 h). No-op when the
+            # 3-state flag is 0; enqueues only, never computes inline.
+            _prefilter_counter += 1
+            if _prefilter_counter == 2 or _prefilter_counter % 360 == 0:
+                try:
+                    _prefilter_idle_sweep()
+                except Exception as _pfe:
+                    print(f'[prefilter-sweep] error: {_pfe}', file=sys.stderr)
         except Exception as e:
             print(f'[slot-scheduler] tick error: {e}', file=sys.stderr)
         time.sleep(60)
@@ -8492,7 +8813,7 @@ def _kick_run_seq(slot, task_ids):
                 # handled BEFORE `previous_result = result`: a dep_blocked
                 # dict has no exec_id/output, and feeding it to
                 # generate_queue_handoff on the next iteration would make a
-                # real mistral-medium-latest LLM call (agent_executor:1314)
+                # real mistral-glm-5-3-flash LLM call (agent_executor:1465)
                 # on garbage. Other statuses keep their exact prior
                 # behaviour (quota_paused / quota-failed break out).
                 if result.get('status') == 'dep_blocked':
@@ -8579,6 +8900,16 @@ def archive_task_route(tid):
     return jsonify({'ok': True})
 
 
+@app.route('/api/tasks/<int:tid>/unarchive', methods=['POST'])
+@require_project_access('member')
+def unarchive_task_route(tid):
+    task = db.get_task(tid)
+    if not task:
+        return jsonify({'error': 'Task not found'}), 404
+    db.unarchive_task(tid)
+    return jsonify({'ok': True})
+
+
 # ── Phases ────────────────────────────────────────────────────────────────────
 
 @app.route('/api/phases')
@@ -8597,6 +8928,167 @@ def get_phases():
 
 
 # ── Improve prompt ────────────────────────────────────────────────────────────
+
+# Any token-like text already in the description disables extraction, so the
+# re-injection pass can never rewrite user text it did not create.
+_PAYLOAD_TOKEN_RE = re.compile(r'\[\[\s*PAYLOAD_', re.IGNORECASE)
+_PAYLOAD_BLOCK_RE = re.compile(r"'''(.*?)'''|```(.*?)```", re.DOTALL)
+_PAYLOAD_TOKEN_FMT = '[[PAYLOAD_{}]]'
+
+_PAYLOAD_SENTINEL_QUOTE = '\x00PMQ\x00'   # masks a stray ''' occurrence
+_PAYLOAD_SENTINEL_FENCE = '\x00PMF\x00'   # masks a stray ``` occurrence
+
+
+def _scan_payloads(text):
+    """Return [(start, end, raw_match)] for non-empty ''' / ``` blocks, in order."""
+    spans = []
+    for m in _PAYLOAD_BLOCK_RE.finditer(text):
+        content = m.group(1) if m.group(1) is not None else m.group(2)
+        if content is None or not content.strip():
+            continue
+        spans.append((m.start(), m.end(), m.group(0)))
+    return spans
+
+
+def _is_block_style(payload):
+    """True when the delimiters sit on their own lines: '''\\n...\\n'''."""
+    body = payload[3:-3]
+    return body.startswith('\n') and body.endswith('\n')
+
+
+def _payload_score(spans):
+    """Lexicographic (block-style count, total payload bytes)."""
+    return (sum(1 for _s, _e, p in spans if _is_block_style(p)),
+            sum(len(p) for _s, _e, p in spans))
+
+
+def _mask_occurrence(text, delim, k, sentinel):
+    """Replace the k-th (1-based) occurrence of delim with sentinel; None if absent."""
+    pos = -1
+    for _ in range(k):
+        pos = text.find(delim, pos + 1)
+        if pos < 0:
+            return None
+    return text[:pos] + sentinel + text[pos + len(delim):]
+
+
+def _resolve_odd_markers(text):
+    """Mask one stray marker per delimiter type that has an odd count.
+
+    A mask is adopted ONLY if it strictly increases the number of block-style
+    payloads (markers on their own lines). This fixes prose mentions like
+    "the ''' below" without changing behaviour for genuinely ambiguous inline
+    cases — those keep the conservative current pairing.
+    """
+    for delim, sentinel in (("'''", _PAYLOAD_SENTINEL_QUOTE), ('```', _PAYLOAD_SENTINEL_FENCE)):
+        n = text.count(delim)
+        if n < 3 or n % 2 == 0:
+            continue
+        base_score = _payload_score(_scan_payloads(text))
+        best = None  # (score, k, masked_text)
+        for k in range(1, n + 1):
+            cand = _mask_occurrence(text, delim, k, sentinel)
+            if cand is None:
+                continue
+            score = _payload_score(_scan_payloads(cand))
+            if score[0] > base_score[0] and (best is None or score > best[0]):
+                best = (score, k, cand)
+        if best:
+            text = best[2]
+    return text
+
+
+# NOTE: frontend/src/utils/payloadSpans.ts mirrors this pairing logic for the
+# live editor highlighting — keep both sides in lockstep when changing either.
+def _extract_payload_blocks(text):
+    """Replace verbatim payload blocks (''' … ''' or ``` … ```) with tokens.
+
+    Returns ``(stripped_text, payloads)`` where ``payloads`` holds the raw
+    matched slices (delimiters INCLUDED) in order of appearance. Blocks whose
+    content is empty/whitespace-only are left in place and not numbered.
+    """
+    if not text:
+        return text, []
+    if _PAYLOAD_TOKEN_RE.search(text):
+        _log.info("improve-prompt: existing payload token in description; extraction skipped")
+        return text, []
+
+    # Odd marker counts mean a stray delimiter in prose (e.g. "the ''' below").
+    # Masking it restores the intended block pairing instead of letting the
+    # prose marker pair with the real opener and leave the body inline.
+    scan_text = _resolve_odd_markers(text)
+
+    spans = _scan_payloads(scan_text)
+    payloads = []
+    out = []
+    pos = 0
+    for start, end, raw in spans:
+        payloads.append(raw)
+        out.append(scan_text[pos:start])
+        out.append(_PAYLOAD_TOKEN_FMT.format(len(payloads)))
+        pos = end
+    out.append(scan_text[pos:])
+    stripped = ''.join(out)
+
+    # Restore any masked stray marker in both the stripped text and the payloads.
+    def _unmask(s):
+        return s.replace(_PAYLOAD_SENTINEL_QUOTE, "'''").replace(
+            _PAYLOAD_SENTINEL_FENCE, '```')
+
+    return _unmask(stripped), [_unmask(p) for p in payloads]
+
+
+def _reinject_payloads(text, payloads):
+    """Substitute payload tokens back into ``text`` byte-exactly.
+
+    Returns ``(final_text, missing_indices)``. A payload whose token the model
+    dropped is appended verbatim at the end (and reported in missing_indices)
+    unless its exact bytes already appear in the text.
+    """
+    if not payloads:
+        return text, []
+
+    n_payloads = len(payloads)
+    present = set()
+
+    # 1. Substitute each payload at its first token occurrence, drop duplicates.
+    for n, payload in enumerate(payloads, 1):
+        tok_re = re.compile(r'\[\[\s*PAYLOAD_%d\s*\]\]' % n)
+        first = tok_re.search(text)
+        if not first:
+            continue
+        present.add(n)
+        text = text[:first.start()] + payload + tok_re.sub('', text[first.end():])
+
+    # 2. Drop tokens with out-of-range numbers (model invented or renumbered).
+    for m in list(re.finditer(r'\[\[\s*PAYLOAD_(\d+)\s*\]\]', text)):
+        try:
+            n = int(m.group(1))
+        except (TypeError, ValueError):
+            n = -1
+        if n < 1 or n > n_payloads:
+            _log.info("improve-prompt: dropping out-of-range payload token %s", m.group(0))
+            text = text.replace(m.group(0), '')
+
+    # 3. Strip leftover partial fragments (only now that valid tokens are gone).
+    #    A literal "[[PAYLOAD_n]]" mention (letter n, not a number) is preserved.
+    text = re.sub(r'\[\[\s*PAYLOAD_(?:\d+\s*\]{0,2}|(?!\w)\s*\]{0,2})', '', text)
+
+    # 4. Restore payloads the model omitted entirely.
+    missing = []
+    for n, payload in enumerate(payloads, 1):
+        if n in present:
+            continue
+        if payload in text:
+            _log.info("improve-prompt: payload %d already present verbatim", n)
+            continue
+        _log.info("improve-prompt: payload %d token missing; appending verbatim", n)
+        text += ("\n\n---\n[Verbatim payload %d restored automatically — the improved "
+                 "text omitted its placeholder.]\n\n" % n) + payload
+        missing.append(n)
+
+    return text, missing
+
 
 @app.route('/api/improve-prompt', methods=['POST'])
 @require_auth
@@ -8675,16 +9167,25 @@ def improve_prompt():
             "made-up article numbers or legal references.\n"
         )
 
+    payloads = []  # verbatim payload blocks extracted from the description (both paths)
     if project_id and not files:
         # Existing task improvement path
+        desc_meta, payloads = _extract_payload_blocks(description)
+        payload_annex = ''
+        if payloads:
+            lines = ["\nVerbatim payload blocks (context only — do NOT copy them into your output):\n"]
+            for i, p in enumerate(payloads, 1):
+                lines.append(f"[[PAYLOAD_{i}]] contains:\n{p}\n")
+            payload_annex = '\n'.join(lines) + '\n'
         meta = (
             "You are an expert AI task instruction writer. "
             "A user has a task they want an AI to complete. "
             "Improve their instructions to be specific, actionable, and produce the best possible output.\n\n"
             f"Task title: {title}\n\n"
-            f"Current instructions:\n{description or '(none provided)'}\n\n"
+            f"Current instructions:\n{desc_meta or '(none provided)'}\n\n"
             f"{full_context}"
             f"{rag_context}"
+            f"{payload_annex}"
             "Write improved instructions. Be concrete: what to produce, what sources to use, "
             "what format, what success looks like.\n\n"
             "Rules:\n"
@@ -8696,29 +9197,62 @@ def improve_prompt():
             "task output in the task's own folder under Artifacts/outputs/. Never tell the task to "
             "save in the project root or in Working Docs / Working Documents (reference material).\n"
             "- Keep input file paths exactly as the user wrote them, with plain spaces (never "
-            "URL-encode them as %20).\n\n"
-            "Return ONLY the improved instructions text, no preamble, no explanation."
+            "URL-encode them as %20).\n"
+            "- Verbatim payload tokens: the description may contain [[PAYLOAD_n]] tokens. Each token "
+            "stands for the raw payload block INCLUDING its ''' or ``` delimiters — never tell the "
+            "user to re-add markers. Where the improved instructions need that payload, place its "
+            "token at that exact position; the full text is substituted automatically afterwards. "
+            "Emit each token exactly once, never paraphrase, shorten or omit a payload, and treat "
+            "positional phrases like 'the message below' or 'the text between the markers' as "
+            "referring to the token. The ~300-word cap applies only to your own instruction text, "
+            "not to tokens.\n\n"
+            "Return ONLY the improved instructions text, no preamble, no explanation. "
+            "Return at most ~300 words (about 2,500 characters)."
         )
     else:
         # Project scaffolding path (no project exists yet)
+        desc_meta, payloads = _extract_payload_blocks(description)
+        payload_annex = ''
+        if payloads:
+            lines = ["\nVerbatim payload blocks (context only — do NOT copy them into your output):\n"]
+            for i, p in enumerate(payloads, 1):
+                lines.append(f"[[PAYLOAD_{i}]] contains:\n{p}\n")
+            payload_annex = '\n'.join(lines) + '\n'
         meta = (
             "You are an expert AI project architect. A user is creating a new project and wants a clear, "
             "well-structured project pitch/description that will be used to scaffold the project roadmap.\n\n"
             f"Project name: {title}\n\n"
-            f"Current pitch:\n{description or '(none provided)'}\n\n"
+            f"Current pitch:\n{desc_meta or '(none provided)'}\n\n"
             f"Tech stack hints: {stack or '(none provided)'}\n\n"
             f"{full_context}"
+            f"{payload_annex}"
             "Write an improved project pitch. Be specific: what the project does, who it's for, "
             "key features, tech choices, and success criteria. Keep it to one well-crafted paragraph "
-            "(3-6 sentences). Return ONLY the improved pitch text, no preamble, no explanation."
+            "(3-6 sentences). Return ONLY the improved pitch text, no preamble, no explanation. "
+            "If the current pitch contains [[PAYLOAD_n]] tokens, place each token where its verbatim "
+            "content belongs; never paraphrase, shorten or omit a payload — the text is substituted "
+            "automatically afterwards and does not count toward the sentence/word guidance. "
+            "Return at most ~300 words (about 2,500 characters)."
         )
 
     try:
         from agent_router import route
-        text, tok_in, tok_out, cost = route("mistral-medium-latest", meta, max_tokens=2048,
+        text, tok_in, tok_out, cost = route("mistral-large-4", meta, max_tokens=2048,
                                             force_mistral_mode="api",
-                                            policy_path=_imp_proj_path)
-        return jsonify({'improved': text.strip(), 'cost_usd': cost})
+                                            policy_path=_imp_proj_path,
+                                            no_upscale=True, max_attempts=1, timeout_ms=90_000,
+                                            reasoning_effort='low')
+        final_text, missing = _reinject_payloads(text.strip(), payloads)
+        if payloads:
+            try:
+                from agent_router import TRUNCATION_MARKER
+                if TRUNCATION_MARKER in final_text:
+                    final_text = final_text.replace(TRUNCATION_MARKER, '').rstrip() + TRUNCATION_MARKER
+            except Exception:
+                pass
+            _log.info("improve-prompt: %d payload block(s), %d chars; missing tokens: %d",
+                      len(payloads), sum(len(p) for p in payloads), len(missing))
+        return jsonify({'improved': final_text, 'cost_usd': cost})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -8969,6 +9503,8 @@ def _apply_saved_app_settings():
 
 if __name__ == '__main__':
     db.init_db()
+    # Failure-driven provider health is persisted across restarts.
+    agent_config.restore_provider_health()
     _apply_saved_app_settings()
     # Bootstrap: generate aingel.json for any project that doesn't have one yet.
     try:
@@ -8989,6 +9525,15 @@ if __name__ == '__main__':
             print(f'[startup] Reset {_reset} orphaned execution(s) to failed/pending')
     except Exception as _e:
         print(f'[startup] WARNING: orphan sweep failed, continuing anyway: {_e}')
+    # Seed legal/terms/*.md into terms_versions. Never blocks boot: seeding is
+    # idempotent and the gate fails open when the table is empty.
+    try:
+        _seeded = agent_terms.seed_terms()
+        if _seeded.get('seeded') or _seeded.get('updated'):
+            print(f"[startup] Terms: {_seeded['seeded']} new version(s), "
+                  f"{_seeded['updated']} updated")
+    except Exception as _e:
+        print(f'[startup] WARNING: terms seeding failed, continuing anyway: {_e}')
     # Reap expired .trash/ entries (non-EU projects past their retention window).
     try:
         _reaped = _reap_trash()
@@ -9027,6 +9572,13 @@ if __name__ == '__main__':
     except Exception as _e:
         print(f'[startup] WARNING: global permission provisioning failed: {_e}')
     _start_slot_scheduler_once()
+    # Local decision prefilter: one bounded daemon worker for async compute.
+    # Lazy import so a missing/old agent_decision never blocks boot.
+    try:
+        import agent_decision as _agent_decision
+        _agent_decision.start_worker()
+    except Exception as _de:
+        print(f'[startup] WARNING: prefilter worker not started: {_de}')
     _bind_host = os.environ.get('AINGEL_BIND_HOST', '127.0.0.1')
     print(f'SuperAgent running → http://{_bind_host}:{API_PORT}/')
     # Production WSGI server when available. Flask's app.run() is a development

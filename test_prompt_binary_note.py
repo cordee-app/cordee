@@ -21,6 +21,7 @@ from prompt_builder import binary_note, build  # noqa: E402
 
 VISION = 'scw-deepseek-v4.1-flash'   # vision: true in model_caps.json
 TEXT_ONLY = 'scw-deepseek-v4-flash'  # vision: false
+MISTRAL_VISION = 'mistral-large-4'   # vision: true, but routes via Vibe (read_file → bytes)
 
 
 class BinaryNoteTests(unittest.TestCase):
@@ -29,6 +30,32 @@ class BinaryNoteTests(unittest.TestCase):
         self.assertIn('VIEW it', note)
         self.assertIn('read_file', note)
         self.assertNotIn('code-execution model', note)
+
+    def test_vibe_route_vision_model_gets_honest_note(self):
+        # CTIH 10001302: a vision-capable Mistral model received the JPEG as
+        # raw bytes from Vibe's read_file — the VIEW promise is false there.
+        for name in ('PKP_map.png', 'PKP_map.jpg', 'PKP_map.jpeg', 'PKP_map.webp'):
+            note = binary_note(name, MISTRAL_VISION)
+            self.assertIn('cannot deliver image content', note, name)
+            self.assertNotIn('VIEW it', note, name)
+            self.assertNotIn('code-execution model', note, name)
+
+    def test_batch_mode_never_promises_image_view(self):
+        # Batch is chunk-and-aggregate: no tools at all, even for a Scaleway
+        # tool-loop model.
+        note = binary_note('PKP_map.png', VISION, mode='batch')
+        self.assertIn('cannot deliver image content', note)
+        self.assertNotIn('VIEW it', note)
+
+    def test_scaleway_vision_with_slot_keeps_view_hint(self):
+        note = binary_note('PKP_map.png', VISION, slot=4)
+        self.assertIn('VIEW it', note)
+
+    def test_claude_native_route_keeps_view_hint(self):
+        # call_anthropic always goes through the Claude CLI, whose Read
+        # returns image blocks — preserve today's promise.
+        note = binary_note('PKP_map.png', 'claude-sonnet-5-5')
+        self.assertIn('VIEW it', note)
 
     def test_text_only_model_gets_old_advice_for_image(self):
         note = binary_note('PKP_map.png', TEXT_ONLY)
@@ -85,6 +112,15 @@ class BuildIntegrationTests(unittest.TestCase):
                     self.proj)
         self.assertIn('code-execution model', out['prompt'])
         self.assertNotIn('VIEW it', out['prompt'])
+
+    def test_build_vibe_vision_prompt_is_honest(self):
+        # Vision cap true, Vibe route cannot deliver the image: the prompt must
+        # not promise read_file-as-image (CTIH 10001302, execs 20001465/66).
+        out = build(self._task('Analyze the attached image file PKP_map.png',
+                              MISTRAL_VISION), self.proj)
+        self.assertIn('cannot deliver image content', out['prompt'])
+        self.assertNotIn('VIEW it', out['prompt'])
+        self.assertIn('PKP_map.png', out['noted_binary'])
 
     def test_build_mixed_binaries_get_each_the_right_note(self):
         out = build(self._task('Analyze the attached image file PKP_map.png and the data.xlsx spreadsheet',

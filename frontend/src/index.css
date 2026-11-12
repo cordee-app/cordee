@@ -1440,6 +1440,13 @@ body {
 body { font-family: var(--c-font-body); color: var(--c-text); background: var(--c-bg); }
 ::selection { background: var(--c-accent-200); }
 :focus-visible { outline: 2px solid var(--c-accent); outline-offset: 2px; border-radius: 6px; }
+/* Inputs that draw their own clear button (e.g. the board task search) hide
+   the native WebKit/Blink one so Chromium and Safari don't show two. */
+input[type="search"]::-webkit-search-cancel-button,
+input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
 ::-webkit-scrollbar-thumb { background-color: var(--c-border-strong); }
 ::-webkit-scrollbar-thumb:hover { background-color: #a19786; }
 code, pre, .dash-exec-cost { font-family: var(--c-font-mono); }
@@ -1646,3 +1653,60 @@ code, pre, .dash-exec-cost { font-family: var(--c-font-mono); }
 .dark .form-group input, .dark .form-group textarea, .dark .form-group select,
 .dark .chat-input-area input, .dark .search-input { background-color: var(--bg-base); }
 .dark .graph-viewport { background: radial-gradient(circle at 50% 50%, #221f1b 0%, #1b1916 100%); }
+
+/* ── Live recognition overlay (Prompt / Description) ────────────────
+   The textarea text is transparent; an absolutely positioned <pre> behind it
+   paints the highlighted text. Metrics MUST match the textarea's computed
+   style (font-size 14px, line-height 21px, padding 7px 10px, 1px border,
+   radius 12px). `.form-group textarea` outranks a bare `.desc-input`, hence
+   the qualified selectors; `scrollbar-gutter: stable` keeps the overlay's
+   wrap width identical to the textarea's when its 10px scrollbar appears. */
+.form-group textarea.desc-input {
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 21px;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--c-text);
+  resize: none;
+  scrollbar-gutter: stable;
+  /* Keep the field's box tight to the overlay (no inline-block descender gap)
+     and paint it above the overlay so the caret/selection stay visible. */
+  display: block;
+  position: relative;
+  z-index: 1;
+}
+.form-group textarea.desc-input::placeholder { color: var(--c-text-faint); }
+.desc-highlight-layer {
+  position: absolute; inset: 0; margin: 0;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  font-family: inherit; font-size: 14px; line-height: 21px;
+  white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word;
+  overflow: hidden; pointer-events: none;
+  scrollbar-gutter: stable;
+  color: var(--c-text);
+  background: #fff;
+}
+.dark .form-group textarea.desc-input {
+  background: transparent;
+  color: transparent;
+  caret-color: var(--text-primary);
+}
+.dark .form-group textarea.desc-input::placeholder { color: var(--text-faint); }
+.dark .desc-highlight-layer { color: var(--text-primary); background: var(--bg-base); }
+
+.hl-payload { background: rgba(198,113,57,.16); color: #8c491a; border-radius: 3px; }
+.dark .hl-payload { background: rgba(198,113,57,.28); color: #f0c9a8; }
+.hl-file { background: rgba(59,108,244,.14); color: #1d4ed8; border-radius: 3px; }
+.dark .hl-file { background: rgba(110,160,220,.25); color: #bcd4f2; }
+.hl-file-unknown { background: rgba(120,120,130,.12); color: var(--c-text-faint); border-radius: 3px; }
+.dark .hl-file-unknown { background: rgba(160,160,170,.16); color: var(--text-faint); }
+/* Web links — the theme's done/success green family: a URL in the prompt
+   means the run will use web_search / web_fetch (or be held without web
+   access). */
+.hl-url { background: rgba(22,163,74,.13); color: #15803d; border-radius: 3px; }
+.dark .hl-url { background: rgba(174,191,146,.20); color: #b8cc96; }
+.hl-marker-unpaired { background: rgba(220,38,38,.22); color: #b91c1c; border-radius: 3px; text-decoration: underline wavy #dc2626; }
+.dark .hl-marker-unpaired { background: rgba(231,154,138,.25); color: #f0b0a0; text-decoration: underline wavy #e79a8a; }

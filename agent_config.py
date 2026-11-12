@@ -1,5 +1,8 @@
+import json
+import logging
 import os
 import threading
+import time
 from datetime import datetime, timezone
 
 # Load .env if present (no external dependency needed)
@@ -159,7 +162,13 @@ CLAUDE_CODE_SKIP_PERMISSIONS = parse_bool_env('CLAUDE_CODE_SKIP_PERMISSIONS')
 # 'vibe' = route through the Vibe CLI (full tool support, billed to Le Chat Pro subscription)
 MISTRAL_MODE = os.getenv('MISTRAL_MODE', 'vibe')
 VIBE_SKIP_PERMISSIONS = parse_bool_env('VIBE_SKIP_PERMISSIONS')
-VIBE_MODELS = [m.strip() for m in os.getenv('VIBE_MODELS', 'mistral-large-latest,mistral-large-4,mistral-medium-latest,mistral-small-latest,codestral-latest,mistral-glm-5-3').split(',') if m.strip()]
+# `mistral-large-latest` (Large 3) and `mistral-medium-latest` (Medium 3.5) were
+# deprecated by Mistral on 2026-10-31 (retire 2027-04-30). They were dropped from
+# this allowlist, then retired from MODELS entirely on 2026-11-10 — their task
+# rows were migrated to `mistral-large-4`. The API aliases stay valid until
+# retirement, so an old row that still names one routes via the prefix fallback
+# in agent_router.route(). See READMEFIRST.md §Available Models.
+VIBE_MODELS = [m.strip() for m in os.getenv('VIBE_MODELS', 'mistral-large-4,mistral-small-latest,mistral-glm-5-3,mistral-glm-5-3-flash,mistral-deepseek-v4.1-flash').split(',') if m.strip()]
 CODEX_SKIP_PERMISSIONS = parse_bool_env('CODEX_SKIP_PERMISSIONS')
 
 # Max USD to spend per Vibe CLI call (0 = no limit)
@@ -211,31 +220,12 @@ MODELS = {
         'label': 'Claude Haiku 4.5', 'provider': 'anthropic',
         'cost_input': 1.0, 'cost_output': 5.0,
     },
-    'mistral-large-latest': {
-        # Covered by the Mistral Pro subscription since 2026-08 — billed as a flat
-        # subscription, not per token, so priced at 0 like the oll-* models. Both
-        # AIngel API paths already use MISTRAL_VIBE_KEY (the Pro key), so this is a
-        # pricing correction, not a routing change. Leaving it at the old $2/$6
-        # meant the Counselor, which ranks cost-weighted, would never recommend a
-        # model the subscription already pays for — the same failure as the 4x
-        # scw-qwen3.5-397b overprice, in the opposite direction.
-        'label': 'Mistral Large', 'provider': 'mistral',
-        'cost_input': 0.0, 'cost_output': 0.0,
-    },
     # Aligned to PRICING. All Mistral `-latest` models route through the Vibe CLI
     # and are covered by the Le Chat Pro subscription (flat, not per-token), so
     # priced at 0 like the oll-* models. tests/test_model_metadata.py fails if
     # MODELS and PRICING diverge.
     'mistral-small-latest': {
         'label': 'Mistral Small', 'provider': 'mistral',
-        'cost_input': 0.0, 'cost_output': 0.0,
-    },
-    'mistral-medium-latest': {
-        'label': 'Mistral Medium', 'provider': 'mistral',
-        'cost_input': 0.0, 'cost_output': 0.0,
-    },
-    'codestral-latest': {
-        'label': 'Codestral', 'provider': 'mistral',
         'cost_input': 0.0, 'cost_output': 0.0,
     },
     'mistral-large-4': {
@@ -261,6 +251,34 @@ MODELS = {
         'cost_input': 0.0, 'cost_output': 0.0,
         'context_window': 1000000,
         'best_for': 'code, agentic, long context',
+    },
+    'mistral-glm-5-3-flash': {
+        # Z.ai GLM-5.3 Flash, hosted unmodified by Mistral (wire ID
+        # `zai-glm-5-3-flash`). Multimodal, 1M context. Covered by the Mistral
+        # Pro subscription (flat, not per-token) like the other mistral-* models,
+        # so priced at 0. EU-operated (Mistral, Paris) — is_eu_model() returns
+        # True for the mistral- prefix. The `mistral-` prefix also makes it
+        # slot-2 (Mistral Pro) eligible and EU-visible in the frontend with zero
+        # extra changes. Wire ID is mapped in agent_router._MISTRAL_WIRE_ID_MAP
+        # (Vibe + API paths).
+        'label': 'GLM-5.3 Flash (Mistral Pro)', 'provider': 'mistral',
+        'cost_input': 0.0, 'cost_output': 0.0,
+        'context_window': 1000000,
+        'best_for': 'code, agentic, vision, speed, long context',
+    },
+    'mistral-deepseek-v4.1-flash': {
+        # DeepSeek V4.1 Flash, hosted unmodified by Mistral (wire ID
+        # `deepseek-v4-1-flash-1017`). Multimodal, 1M context. Covered by the
+        # Mistral Pro subscription (flat, not per-token) like the other
+        # mistral-* models, so priced at 0. EU-operated (Mistral, Paris) —
+        # is_eu_model() returns True for the mistral- prefix. The `mistral-`
+        # prefix also makes it slot-2 (Mistral Pro) eligible and EU-visible in
+        # the frontend with zero extra changes. Wire ID is mapped in
+        # agent_router._MISTRAL_WIRE_ID_MAP (Vibe + API paths).
+        'label': 'DeepSeek V4.1 Flash (Mistral Pro)', 'provider': 'mistral',
+        'cost_input': 0.0, 'cost_output': 0.0,
+        'context_window': 1000000,
+        'best_for': 'code, agentic, reasoning, vision, speed',
     },
     'mistral-ocr-latest': {
         # Mistral OCR — Document AI / OCR-4.1. Billed per-page via Mistral API credits,
@@ -527,14 +545,221 @@ def eu_guard(proj, model_id):
                    f"choose a Mistral or Scaleway (scw-*) model.")
 
 
+# ── Provider health (failure-driven) ─────────────────────────────────────────
+# Readiness used to be a pure "credentials present" check: `claude auth status`
+# reports loggedIn=true whenever ANTHROPIC_API_KEY is in the env — even when the
+# API key has no credit or the org has disabled Claude Code subscription access.
+# Those only surface on a real call. So we learn from real failures (classified
+# in agent_router) and keep the last known reason here, persisted in
+# app_settings so a restart keeps it. `probe_claude_health()` re-checks a
+# degraded provider on user activity (Create Task / model-list refresh), never
+# on a timer — a healthy provider is never probed and costs nothing.
+
+_PROVIDER_HEALTH = {}              # provider -> reason (non-empty = unusable)
+_PROVIDER_HEALTH_LOCK = threading.Lock()
+CLAUDE_PROBE_MODEL = 'claude-haiku-4-5-20251001'
+CLAUDE_PROBE_TIMEOUT_SECS = 30
+CLAUDE_PROBE_TTL_SECS = 60         # at most one recovery probe per minute
+_CLAUDE_PROBE_CACHE = {'ts': 0.0, 'running': False}
+
+
+def classify_auth_error(text):
+    """Return a short human reason when a CLI error looks like a billing/auth
+    failure (the provider is unusable, not a transient task error), else None."""
+    low = (text or '').lower()
+    if 'credit balance is too low' in low:
+        return 'out of credit'
+    if 'subscription access' in low:
+        return 'Claude Code subscription access disabled'
+    if 'invalid x-api-key' in low or 'authentication_error' in low:
+        return 'invalid API key'
+    if 'billing' in low:
+        return 'billing problem'
+    return None
+
+
+def mark_provider_degraded(provider, reason=''):
+    """Record that a provider is configured but unusable (billing/auth)."""
+    reason = (reason or 'unavailable').strip()[:300]
+    with _PROVIDER_HEALTH_LOCK:
+        changed = _PROVIDER_HEALTH.get(provider) != reason
+        _PROVIDER_HEALTH[provider] = reason
+    if changed:
+        try:
+            import agent_db
+            agent_db.set_app_setting(f'{provider}_degraded', reason)
+        except Exception:
+            pass
+
+
+def clear_provider_degraded(provider):
+    with _PROVIDER_HEALTH_LOCK:
+        had = _PROVIDER_HEALTH.pop(provider, None) is not None
+    if had:
+        try:
+            import agent_db
+            agent_db.set_app_setting(f'{provider}_degraded', '')
+        except Exception:
+            pass
+
+
+def provider_degraded(provider):
+    """Reason string when the provider is known-unusable, else None."""
+    with _PROVIDER_HEALTH_LOCK:
+        return _PROVIDER_HEALTH.get(provider)
+
+
+def restore_provider_health():
+    """Load persisted degradation at boot (called from the API startup)."""
+    try:
+        import agent_db
+        settings = agent_db.get_app_settings() or {}
+        reason = (settings.get('anthropic_degraded') or '').strip()
+        if reason:
+            with _PROVIDER_HEALTH_LOCK:
+                _PROVIDER_HEALTH['anthropic'] = reason
+    except Exception:
+        pass
+
+
+def model_provider(model_id):
+    """Provider key for a model id: the MODELS entry first, then the prefix."""
+    m = MODELS.get(model_id) or {}
+    provider = m.get('provider') or ''
+    if not provider:
+        mid = model_id or ''
+        if mid.startswith('claude-'):
+            provider = 'anthropic'
+        elif mid.startswith(('mistral-', 'open-mistral', 'codestral', 'devstral')):
+            provider = 'mistral'
+        elif mid.startswith(('gpt-', 'o1', 'o3', 'o4', 'codex-')):
+            provider = 'openai'
+        elif mid.startswith('scw-'):
+            provider = 'scaleway'
+        elif mid.startswith('oll-'):
+            provider = 'ollama'
+    return provider
+
+
+def provider_available(provider):
+    """True when there is no evidence the provider is unusable.
+
+    Credentials presence mirrors /api/config/readiness; a failure-driven
+    degraded flag always wins."""
+    p = (provider or '').lower()
+    if provider_degraded(p) or provider_degraded('anthropic' if p == 'claude' else p):
+        return False
+    if p in ('anthropic', 'claude'):
+        import shutil
+        if not shutil.which('claude'):
+            return False
+        # The effective auth path: API key when ANTHROPIC_MODE='api', otherwise
+        # the CLI's own login (checked in readiness; failures mark degraded).
+        if ANTHROPIC_MODE == 'api':
+            return has_real_secret(ANTHROPIC_API_KEY)
+        return True
+    if p == 'mistral':
+        return bool(has_real_secret(MISTRAL_VIBE_KEY)
+                    or has_real_secret(MISTRAL_ORG_KEY))
+    if p == 'openai':
+        return has_real_secret(OPENAI_API_KEY)
+    if p == 'scaleway':
+        return has_real_secret(SCALEWAY_API_KEY)
+    if p == 'ollama':
+        return has_real_secret(OLLAMA_API_KEY)
+    return True
+
+
+def model_available(model_id):
+    return provider_available(model_provider(model_id))
+
+
+def _claude_probe_once():
+    """One tiny real call mirroring the production auth path. True = healthy."""
+    import shutil
+    import subprocess
+    with _PROVIDER_HEALTH_LOCK:
+        if _CLAUDE_PROBE_CACHE['running']:
+            return False
+        _CLAUDE_PROBE_CACHE['running'] = True
+    ok = False
+    try:
+        if not shutil.which('claude'):
+            return False
+        extra = ({'ANTHROPIC_API_KEY': ANTHROPIC_API_KEY}
+                 if ANTHROPIC_MODE == 'api' else None)
+        res = subprocess.run(
+            ['claude', '--print', '--model', CLAUDE_PROBE_MODEL,
+             '--output-format', 'json', '--no-session-persistence',
+             'Reply with exactly: OK'],
+            capture_output=True, text=True, timeout=CLAUDE_PROBE_TIMEOUT_SECS,
+            env=cli_subprocess_env(extra),
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        if res.returncode == 0:
+            try:
+                data = json.loads(res.stdout or '{}')
+            except ValueError:
+                data = {}
+            ok = not data.get('is_error') and bool(data.get('result'))
+    except Exception:
+        ok = False
+    finally:
+        with _PROVIDER_HEALTH_LOCK:
+            _CLAUDE_PROBE_CACHE['ts'] = time.time()
+            _CLAUDE_PROBE_CACHE['running'] = False
+    if ok:
+        clear_provider_degraded('anthropic')
+    return ok
+
+
+def probe_claude_health(blocking=False):
+    """Re-check a degraded Claude provider (recovery detection only).
+
+    Runs only while the provider is marked degraded, at most once per
+    CLAUDE_PROBE_TTL_SECS. blocking=True (Create Task) runs inline so the
+    caller sees the fresh state; otherwise a daemon thread does it and the
+    next model-list refresh picks up the result."""
+    if not provider_degraded('anthropic'):
+        return False
+    if time.time() - _CLAUDE_PROBE_CACHE['ts'] < CLAUDE_PROBE_TTL_SECS:
+        return False
+    if blocking:
+        return _claude_probe_once()
+    threading.Thread(target=_claude_probe_once, name='claude-health-probe',
+                     daemon=True).start()
+    return False
+
+
 def default_model_for(proj=None, *, cheap=False):
     """Resolve the fallback model, honouring the EU boundary.
 
     Every `or DEFAULT_MODEL` fallback should go through this so an EU-only
-    project silently lands on a Scaleway model instead of Claude."""
+    project silently lands on a Scaleway model instead of Claude. When the
+    preferred default sits on an unavailable provider (e.g. Claude out of
+    credit) we substitute the first available model that honours the EU
+    boundary, rather than handing every new task a model that cannot run."""
     if eu_only_for(proj):
-        return EU_BRIEF_MODEL if cheap else EU_DEFAULT_MODEL
-    return DEFAULT_MODEL
+        prefer = EU_BRIEF_MODEL if cheap else EU_DEFAULT_MODEL
+    else:
+        prefer = DEFAULT_MODEL
+    if model_available(prefer):
+        return prefer
+    # Prefer a capable, EU-hosted substitute over whatever happens to be first
+    # in MODELS (index order would pick Mistral Small).
+    _fallbacks = ('mistral-glm-5-3-flash', 'mistral-large-4', 'mistral-glm-5-3')
+    for model_id in (*_fallbacks, *MODELS):
+        if model_id not in MODELS or model_id.startswith('scw-dep-'):
+            continue
+        if eu_only_for(proj) and not is_eu_model(model_id):
+            continue
+        if model_available(model_id):
+            logging.getLogger(__name__).warning(
+                'default model %s unavailable (%s); substituting %s',
+                prefer, provider_degraded(model_provider(prefer)) or 'not configured',
+                model_id)
+            return model_id
+    return prefer
 
 
 # ── Egress audit log ─────────────────────────────────────────────────────────
@@ -602,15 +827,17 @@ PRICING = {
     # by the Le Chat Pro subscription (flat, not per-token), so priced at 0 like
     # the oll-* models. Must stay in step with MODELS. The `-3` legacy aliases
     # keep their published PAYG rates for the fuzzy get_pricing() fallback.
-    'mistral-large-latest':      {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
+    'mistral-large-latest':      {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},  # legacy only — retired from MODELS 2026-11-10; kept so historical task rows price correctly
     'mistral-large-4':           {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
     'mistral-large-3':           {'input':  0.50, 'output':  1.50, 'cache_write': 0, 'cache_read': 0},
-    'mistral-medium-latest':     {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
+    'mistral-medium-latest':     {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},  # legacy only — retired from MODELS 2026-11-10; kept so historical task rows price correctly
     'mistral-medium-3':          {'input':  0.40, 'output':  2.00, 'cache_write': 0, 'cache_read': 0},
     'mistral-small-latest':      {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
     'mistral-small-3':           {'input':  0.10, 'output':  0.30, 'cache_write': 0, 'cache_read': 0},
-    'codestral-latest':          {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
+    'codestral-latest':          {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},  # legacy only — retired from MODELS 2026-11-03; kept so historical task rows price correctly
     'mistral-glm-5-3':           {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
+    'mistral-glm-5-3-flash':     {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
+    'mistral-deepseek-v4.1-flash': {'input': 0.00, 'output': 0.00, 'cache_write': 0, 'cache_read': 0},
     'mistral-ocr-latest':        {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
     'mistral-ocr-2503':          {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},
     'mistral-ocr-2505':          {'input':  0.00, 'output':  0.00, 'cache_write': 0, 'cache_read': 0},

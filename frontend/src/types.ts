@@ -68,6 +68,8 @@ export interface Model {
   cost_output?: number;
   default?: boolean;
   free_allowed?: boolean;
+  available?: boolean;
+  unavailable_reason?: string | null;
 }
 
 export type TaskStatus = 'pending' | 'confirmed' | 'running' | 'paused' | 'done' | 'failed' | 'skip' | 'cancelled';
@@ -100,6 +102,8 @@ export interface Task {
   requires_rag?: boolean | number;
   context_refs?: string[];
   execution_type?: string | null;
+  /** Text saved before "Guide my prompt" was accepted; restorable from the editor. */
+  original_description?: string;
 }
 
 export type ExecutionStatus = 'pending' | 'running' | 'paused' | 'done' | 'failed' | 'rejected' | 'skipped';
@@ -119,7 +123,7 @@ export interface Execution {
   started_at?: string;
   finished_at?: string;
   last_heartbeat_at?: string;
-  /** Pause at the limit (TODO item 16): 'turns' | 'time'; kept after the run ends. */
+  /** Pause at the limit (TODO item 16): 'turns' | 'time' | 'provider_error'; kept after the run ends. */
   pause_reason?: string | null;
   /** Parts (blocks of turns) the run has used. */
   segments?: number | null;
@@ -383,6 +387,7 @@ export interface ProviderReadiness {
   scaleway?: boolean;
   ollama?: boolean;
   api?: boolean;
+  claude_degraded?: string | null;
 }
 
 export interface User {
@@ -437,6 +442,31 @@ export interface QuotaStatus {
   };
 }
 
+/**
+ * Terms & Conditions acceptance state for the current user, as returned by
+ * GET /api/me. `required` is true while the user has not accepted the
+ * currently published version.
+ */
+export interface TermsInfo {
+  required: boolean;
+  version_id: number | null;
+  tag: string | null;
+  accepted_at: string | null;
+}
+
+/** Full Terms & Conditions version from GET /api/terms/current. */
+export interface TermsDoc {
+  version_id: number;
+  tag: string;
+  language: string;
+  title: string;
+  /** Markdown body — rendered by utils/markdown.ts. */
+  content: string;
+  content_hash: string;
+  created_at: string;
+  accepted_at: string | null;
+}
+
 export interface MeResponse {
   user: User;
   month: string;
@@ -450,6 +480,8 @@ export interface MeResponse {
     gpu_minutes: number;
   };
   quotas: QuotaStatus | null;
+  /** Optional: older backends omit it entirely. */
+  terms?: TermsInfo | null;
 }
 
 export interface ModelRecommendation {

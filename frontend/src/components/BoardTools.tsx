@@ -25,22 +25,67 @@ export const BoardTools = ({ variant }: { variant: 'tabbar' | 'mobile' }) => {
   const [archiving, setArchiving] = useState(false);
 
   const toArchive = tasks.filter((t) => selectedTasks.has(t.id) && !t.archived);
+  const toUnarchive = tasks.filter((t) => selectedTasks.has(t.id) && t.archived);
+  const selectedCount = toArchive.length + toUnarchive.length;
+
+  const plural = (n: number) => (n === 1 ? 'task' : 'tasks');
+
+  const confirmMessage = (): string => {
+    const archivePart = `${toArchive.length} ${plural(toArchive.length)}`;
+    const unarchivePart = `${toUnarchive.length} ${plural(toUnarchive.length)}`;
+    if (toArchive.length > 0 && toUnarchive.length > 0) {
+      return `Archive ${archivePart} and unarchive ${unarchivePart}?`;
+    }
+    if (toArchive.length > 0) {
+      return `Archive ${archivePart}? Archived tasks are hidden unless "Show archived" is enabled.`;
+    }
+    return `Unarchive ${unarchivePart}? They will reappear on the board.`;
+  };
 
   const handleArchive = async () => {
-    if (toArchive.length === 0 || archiving) return;
+    if (selectedCount === 0 || archiving) return;
+    if (!window.confirm(confirmMessage())) return;
     setArchiving(true);
     try {
       for (const t of toArchive) {
         await api.tasks.archive(t.id);
       }
-      const ids = new Set(toArchive.map((t) => t.id));
-      setTasks((prev) => prev.map((t) => (ids.has(t.id) ? { ...t, archived: 1 } : t)));
+      for (const t of toUnarchive) {
+        await api.tasks.unarchive(t.id);
+      }
+      const archivedIds = new Set(toArchive.map((t) => t.id));
+      const unarchivedIds = new Set(toUnarchive.map((t) => t.id));
+      setTasks((prev) => prev.map((t) => {
+        if (archivedIds.has(t.id)) return { ...t, archived: 1 };
+        if (unarchivedIds.has(t.id)) return { ...t, archived: 0 };
+        return t;
+      }));
       exitSelectionMode();
     } catch (e) {
-      console.error('Bulk archive failed:', e);
+      console.error('Bulk archive/unarchive failed:', e);
     } finally {
       setArchiving(false);
     }
+  };
+
+  const actionLabel = (withCounts: boolean): string => {
+    if (archiving) return 'Updating…';
+    const a = toArchive.length;
+    const u = toUnarchive.length;
+    if (a > 0 && u > 0) {
+      return withCounts ? `Archive ${a} · Unarchive ${u}` : 'Archive / Unarchive';
+    }
+    if (u > 0) return `Unarchive${withCounts ? ` (${u})` : ''}`;
+    return `Archive${withCounts && a > 0 ? ` (${a})` : ''}`;
+  };
+
+  const actionTitle = (): string => {
+    const parts: string[] = [];
+    if (toArchive.length > 0) parts.push(`archive ${toArchive.length} ${plural(toArchive.length)}`);
+    if (toUnarchive.length > 0) parts.push(`unarchive ${toUnarchive.length} ${plural(toUnarchive.length)}`);
+    if (parts.length === 0) return 'Select tasks first';
+    const title = parts.join(' and ');
+    return title.charAt(0).toUpperCase() + title.slice(1);
   };
 
   if (variant === 'tabbar') {
@@ -81,14 +126,12 @@ export const BoardTools = ({ variant }: { variant: 'tabbar' | 'mobile' }) => {
             </button>
             {perms.canEdit && (
               <button
-                data-tip={`Archive ${toArchive.length} task${toArchive.length === 1 ? '' : 's'}`}
+                data-tip={actionTitle()}
                 className="board-tools-btn board-tools-btn-danger"
                 onClick={handleArchive}
-                disabled={archiving || toArchive.length === 0}
+                disabled={archiving || selectedCount === 0}
               >
-                {archiving
-                  ? 'Archiving…'
-                  : `Archive${toArchive.length > 0 ? ` (${toArchive.length})` : ''}`}
+                {actionLabel(true)}
               </button>
             )}
           </span>
@@ -126,10 +169,10 @@ export const BoardTools = ({ variant }: { variant: 'tabbar' | 'mobile' }) => {
           </button>
           {perms.canEdit && (
             <button
-              data-tip={`Archive ${toArchive.length} task${toArchive.length === 1 ? '' : 's'}`}
+              data-tip={actionTitle()}
               className="btn-xs"
               onClick={handleArchive}
-              disabled={archiving || toArchive.length === 0}
+              disabled={archiving || selectedCount === 0}
               style={{
                 background: 'rgba(163,64,47,0.25)',
                 border: '1px solid #a3402f',
@@ -139,9 +182,7 @@ export const BoardTools = ({ variant }: { variant: 'tabbar' | 'mobile' }) => {
                 cursor: archiving ? 'not-allowed' : 'pointer',
               }}
             >
-              {archiving
-                ? 'Archiving…'
-                : `Archive${toArchive.length > 0 ? ` ${toArchive.length}` : ''}`}
+              {actionLabel(false)}
             </button>
           )}
         </span>
